@@ -59,7 +59,8 @@ client version derives it from here."
 
 (defun pai-anthropic--content-blocks (content)
   "Translate unified CONTENT blocks to Anthropic request blocks."
-  (mapcar
+  (delq nil
+   (mapcar
    (lambda (b)
      (pcase (pai-block-type b)
        ('text (list :type "text" :text (or (plist-get b :text) "")))
@@ -68,16 +69,22 @@ client version derives it from here."
                                    :media_type (plist-get b :mime-type)
                                    :data (plist-get b :data))))
        ('thinking
-        (if (pai-truthy (plist-get b :redacted))
-            (list :type "redacted_thinking" :data (plist-get b :thinking-signature))
-          (list :type "thinking"
-                :thinking (or (plist-get b :thinking) "")
-                :signature (or (plist-get b :thinking-signature) ""))))
+        ;; Unsigned thinking blocks (a stream that ended right after a
+        ;; thinking block started) are rejected by the API with
+        ;; `each thinking block must contain thinking'; drop them.
+        (let ((sig (plist-get b :thinking-signature)))
+          (cond
+           ((or (null sig) (equal sig "")) nil)
+           ((pai-truthy (plist-get b :redacted))
+            (list :type "redacted_thinking" :data sig))
+           (t (list :type "thinking"
+                    :thinking (or (plist-get b :thinking) "")
+                    :signature sig)))))
        ('tool-call
         (list :type "tool_use" :id (plist-get b :id) :name (plist-get b :name)
               :input (or (plist-get b :arguments) (pai-json-empty-object))))
        (_ nil)))
-   (pai-normalize-content content)))
+   (pai-normalize-content content))))
 
 (defun pai-anthropic--tool-result-block (message)
   "Translate a unified tool-result MESSAGE to an Anthropic tool_result block."

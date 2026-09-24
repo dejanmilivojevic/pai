@@ -99,6 +99,24 @@ Return the list of emitted unified events."
     (should (equal (plist-get (car blocks) :type) "image"))
     (should (equal (plist-get (plist-get (car blocks) :source) :media_type) "image/png"))))
 
+(ert-deftest pai-anthropic-unsigned-thinking-dropped ()
+  ;; An assistant turn persisted with only an empty, unsigned thinking
+  ;; block (stream ended right after thinking started) must not be sent:
+  ;; the API rejects it with `each thinking block must contain thinking'.
+  (should (null (pai-anthropic--content-blocks (list (pai-thinking "" "")))))
+  (should (null (pai-anthropic--content-blocks (list (pai-thinking "" nil)))))
+  ;; Signed blocks with empty (omitted) thinking are still sent.
+  (let ((b (car (pai-anthropic--content-blocks (list (pai-thinking "" "SIG"))))))
+    (should (equal (plist-get b :type) "thinking"))
+    (should (equal (plist-get b :signature) "SIG")))
+  (let ((out (pai-anthropic--messages
+              (list (pai-user-message "hi")
+                    (pai-assistant-message :content (list (pai-thinking "" "")))
+                    (pai-user-message "again")))))
+    (should (= (length out) 1))
+    (should (equal (plist-get (car out) :role) "user"))
+    (should (= (length (plist-get (car out) :content)) 2))))
+
 ;;;; SSE parsing
 
 (defconst pai-anthropic-test--frames
