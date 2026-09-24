@@ -11,3 +11,5 @@
 # scratch produced by demo/subagent runs
 /demo/hello-from-subagent.txt
 /demo/subagents/
+# separate checkout of github.com/dejanmilivojevic/pai-extensions
+/extensions/
