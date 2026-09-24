@@ -33,7 +33,11 @@
   streamfn handle on-complete
   (finished nil)
   origin-buffer
-  (aborted nil))
+  (aborted nil)
+  ;; partial assistant message of the stream in flight, or nil
+  partial
+  ;; processes / functions to kill / call when the run is aborted
+  (abort-handlers '()))
 
 ;;;; Hook dispatch
 
@@ -57,13 +61,17 @@ Asynchronous continuations (provider stream events, tool callbacks) may fire
 while an unrelated buffer is current; wrapping them keeps buffer-local agent
 state (registries, settings) reachable.  If the origin buffer has been killed
 the continuation is not run at all: the run is marked aborted and finished
-without invoking callbacks in an unrelated buffer."
+without invoking callbacks in an unrelated buffer.  Once RUN is aborted or
+finished, late continuations (a killed stream's final event, a tool that
+completes after an interrupt) are dropped so the loop cannot resume."
   (let ((buf (pai-run-origin-buffer run)))
     (lambda (value)
-      (if (buffer-live-p buf)
-          (with-current-buffer buf (funcall fn value))
-        (setf (pai-run-aborted run) t
-              (pai-run-finished run) t)))))
+      (cond
+       ((or (pai-run-aborted run) (pai-run-finished run)) nil)
+       ((buffer-live-p buf)
+        (with-current-buffer buf (funcall fn value)))
+       (t (setf (pai-run-aborted run) t
+                (pai-run-finished run) t))))))
 
 ;;;; Message bookkeeping
 
@@ -105,10 +113,54 @@ major mode.  If that buffer is killed, further callbacks are discarded."
     (pai-agent--inner-iterate run)
     run))
 
+(defun pai-agent-on-abort (run handler)
+  "Register HANDLER to stop work of RUN when it is aborted.
+HANDLER is a process (deleted) or a function of no arguments (called).
+Tools reach RUN via the `:run' key of their context."
+  (when (and run handler)
+    (push handler (pai-run-abort-handlers run))))
+
+(defun pai-agent--record-partial (run)
+  "Record the partial assistant message of RUN's aborted stream, if any.
+Only its text is kept (tool calls may be truncated, thinking unsigned)."
+  (let* ((partial (pai-run-partial run))
+         (text (and partial
+                    (seq-filter (lambda (b)
+                                  (and (eq (pai-block-type b) 'text)
+                                       (not (string-empty-p
+                                             (string-trim (or (plist-get b :text) ""))))))
+                                (pai-message-content partial)))))
+    (setf (pai-run-partial run) nil)
+    (when text
+      (let ((msg (plist-put (plist-put (copy-sequence partial) :content (copy-sequence text))
+                            :stop-reason 'aborted)))
+        (pai-agent--emit run (list :type 'message-end :message msg))
+        (setf (pai-run-new-messages run) (append (pai-run-new-messages run) (list msg)))
+        (pai-agent--push-context run msg)))))
+
 (defun pai-agent-abort (run)
-  "Abort RUN: stop the current provider stream and mark it aborted."
-  (setf (pai-run-aborted run) t)
-  (pai-provider-abort (pai-run-handle run)))
+  "Abort RUN immediately.
+Kill the provider stream and running tools (see `pai-agent-on-abort'),
+keep the text streamed so far, and emit `agent-end' with `:aborted t'.
+No further events are emitted and ON-COMPLETE is not called: whoever aborts
+owns the completion."
+  (unless (or (pai-run-aborted run) (pai-run-finished run))
+    ;; Mark first: killing a process runs its sentinel synchronously, and
+    ;; the continuations it triggers must see the run is over.
+    (setf (pai-run-aborted run) t)
+    (let ((handle (pai-run-handle run)))
+      (setf (pai-run-handle run) nil)
+      (ignore-errors (pai-provider-abort handle)))
+    (dolist (h (prog1 (pai-run-abort-handlers run)
+                 (setf (pai-run-abort-handlers run) nil)))
+      (condition-case err
+          (cond ((processp h) (when (process-live-p h) (delete-process h)))
+                ((functionp h) (funcall h)))
+        (error (message "pai: abort handler failed: %s" (error-message-string err)))))
+    (pai-agent--record-partial run)
+    (setf (pai-run-finished run) t)
+    (pai-agent--emit run (list :type 'agent-end :messages (pai-run-new-messages run)
+                               :aborted t))))
 
 (defun pai-agent-aborted-p (run)
   "Return non-nil if RUN has been aborted."
@@ -193,6 +245,10 @@ Deferred tools are declared as stable stubs (see `pai-tool-declaration')."
           (funcall (pai-run-streamfn run) model ctx options
                    (pai-agent--deferred run (lambda (ev)
                      (pcase (plist-get ev :type)
+                       ((or 'done 'error) (setf (pai-run-partial run) nil))
+                       (_ (when (plist-get ev :partial)
+                            (setf (pai-run-partial run) (plist-get ev :partial)))))
+                     (pcase (plist-get ev :type)
                        ('start
                         (setq started t)
                         (pai-agent--emit run (list :type 'message-start
@@ -252,11 +308,15 @@ An error after the tool finished (e.g. while the batch continues inside
 a synchronous ON-DONE) is not the tool's and is signalled again."
   (let ((done nil))
     (condition-case err
-        (funcall (plist-get tool :execute) (pai-tool-coerce-args tool args) ctx on-update
-                 (lambda (result)
-                   (unless done
-                     (setq done t)
-                     (funcall on-done result))))
+        (let ((ret (funcall (plist-get tool :execute) (pai-tool-coerce-args tool args)
+                            ctx on-update
+                            (lambda (result)
+                              (unless done
+                                (setq done t)
+                                (funcall on-done result))))))
+          ;; A tool returning its process (e.g. bash) is killed on abort.
+          (when (and (not done) (processp ret))
+            (pai-agent-on-abort (plist-get ctx :run) ret)))
       (error
        (if done
            (signal (car err) (cdr err))

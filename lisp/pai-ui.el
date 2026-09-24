@@ -325,7 +325,12 @@ prompt is re-pinned to the bottom of the window."
      (setq pai--working-message nil)
      (pai--refresh-context-tokens)
      (pai--schedule-usage-refresh)
-     (pai--render-note "— ready —")
+     (if (plist-get event :aborted)
+         (progn (when pai--assistant-open
+                  (pai--ensure-fresh-line)
+                  (setq pai--assistant-open nil pai--assistant-content-start nil))
+                (pai--render-note "— interrupted —" 'pai-error-face))
+       (pai--render-note "— ready —"))
      (unless pai--steering-queue
        (pai-ext-emit 'agent-settled (pai--ext-context))))
     (_ nil)))
@@ -1673,10 +1678,13 @@ Moving past the newest entry restores the input you were typing."
   "Abort the active run, if any."
   (interactive)
   (if pai--active
-      (progn (when pai--run (pai-agent-abort pai--run))
-             (setq pai--active nil pai--run nil)
-             (pai--set-status "idle")
-             (pai--render-note "— interrupted —" 'pai-error-face))
+      (let ((run pai--run))
+        ;; Aborting emits `agent-end' (:aborted t), which resets the UI.
+        (when run (pai-agent-abort run))
+        (when pai--active               ; no run, or its buffer sink is gone
+          (setq pai--active nil pai--run nil)
+          (pai--set-status "idle")
+          (pai--render-note "— interrupted —" 'pai-error-face)))
     (message "No active run")))
 
 (defun pai-set-model (id)

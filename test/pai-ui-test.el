@@ -65,6 +65,28 @@
         (should (string-match-p "=> 3" content))
         (should (string-match-p "The answer is 3." content))))))
 
+(ert-deftest pai-ui-interrupt-stops-run-immediately ()
+  "C-c C-c mid-tool kills the tool and nothing streams in afterwards."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "bash" :arguments (:command "sleep 30")))
+                  :stop-reason tool-use)
+                 '(:text "SHOULD NOT APPEAR" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--type-and-send "run it")
+      (should pai--active)
+      (let ((procs (seq-filter (lambda (p) (string-prefix-p "pai-bash" (process-name p)))
+                               (process-list))))
+        (should procs)
+        (pai-interrupt)
+        (should-not (seq-some #'process-live-p procs)))
+      (accept-process-output nil 0.2)
+      (should-not pai--active)
+      (let ((content (buffer-string)))
+        (should (string-match-p "— interrupted —" content))
+        (should-not (string-match-p "— ready —" content))
+        (should-not (string-match-p "SHOULD NOT APPEAR" content))))))
+
 (ert-deftest pai-ui-skill-slash-command ()
   "Discovered skills are /skill:NAME commands that send the skill to the agent."
   (pai-faux-reset)

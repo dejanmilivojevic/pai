@@ -399,5 +399,100 @@
             (should-not completed))
         (when (buffer-live-p origin) (kill-buffer origin))))))
 
+;;;; Interrupt
+
+(ert-deftest pai-agent-abort-mid-stream-stops-immediately ()
+  "Killing the stream runs its sentinel synchronously; the final event it
+produces (here with a tool call) must not resume the loop."
+  (let* ((events '()) (executed nil) (streams 0) (completed nil)
+         (partial (pai-assistant-message :content (list (pai-text "half an answ"))))
+         (tool (list :name "echo" :deferred nil :parameters '(:type "object")
+                     :execute (lambda (_a _c _u done)
+                                (setq executed t)
+                                (funcall done (pai-tool-ok-result "x")))))
+         (run (pai-agent-run
+               (list (pai-user-message "go"))
+               (pai-context nil (list tool))
+               (list :model (pai-model "faux")
+                     :stream-fn
+                     (lambda (_m _c _o emit)
+                       (cl-incf streams)
+                       (funcall emit (list :type 'start :partial partial))
+                       (funcall emit (list :type 'text-delta :delta "half an answ"
+                                           :partial partial))
+                       (make-process
+                        :name "pai-test-stream" :command '("sleep" "30") :noquery t
+                        :sentinel
+                        (lambda (_p _e)
+                          (funcall emit
+                                   (list :type 'done :message
+                                         (pai-assistant-message
+                                          :content (list (pai-text "half an answ")
+                                                         (pai-tool-call "c1" "echo" nil))
+                                          :stop-reason 'tool-use)))))))
+               (lambda (ev) (push ev events))
+               (lambda (_m) (setq completed t)))))
+    (pai-agent-abort run)
+    (accept-process-output nil 0.1)
+    (should (pai-agent-aborted-p run))
+    (should (pai-run-finished run))
+    (should-not executed)
+    (should (= streams 1))
+    (should-not completed)
+    (let ((ends (seq-filter (lambda (e) (eq (plist-get e :type) 'agent-end)) events)))
+      (should (= (length ends) 1))
+      (should (plist-get (car ends) :aborted)))
+    (should (eq (plist-get (car events) :type) 'agent-end))
+    ;; the streamed text is kept, marked aborted, without tool calls
+    (let ((last (car (last (pai-run-new-messages run)))))
+      (should (eq (plist-get last :stop-reason) 'aborted))
+      (should (equal (pai-content-text (pai-message-content last)) "half an answ"))
+      (should-not (pai-message-tool-calls last)))))
+
+(ert-deftest pai-agent-abort-mid-tool-kills-and-stops ()
+  (let* ((events '()) (proc nil) (tool-done nil) (streams 0)
+         (tool (list :name "slow" :deferred nil :parameters '(:type "object")
+                     :execute (lambda (_a _c _u done)
+                                (setq tool-done done
+                                      proc (make-process :name "pai-test-tool"
+                                                         :command '("sleep" "30")
+                                                         :noquery t))
+                                proc)))
+         (run (pai-agent-run
+               (list (pai-user-message "go"))
+               (pai-context nil (list tool))
+               (list :model (pai-model "faux")
+                     :stream-fn
+                     (lambda (_m _c _o emit)
+                       (cl-incf streams)
+                       (funcall emit
+                                (list :type 'done :message
+                                      (pai-assistant-message
+                                       :content (list (pai-tool-call "c1" "slow" nil))
+                                       :stop-reason 'tool-use)))
+                       nil))
+               (lambda (ev) (push ev events))
+               nil)))
+    (should (process-live-p proc))
+    (pai-agent-abort run)
+    (should-not (process-live-p proc))
+    (let ((before events))
+      ;; the tool reporting late must not resume the loop
+      (funcall tool-done (pai-tool-ok-result "late"))
+      (should (eq events before)))
+    (should (= streams 1))
+    (should (plist-get (car events) :aborted))))
+
+(ert-deftest pai-agent-abort-calls-handlers-once ()
+  (let* ((calls 0)
+         (run (pai-agent-run nil (pai-context nil nil)
+                             (list :model (pai-model "faux")
+                                   :stream-fn (lambda (&rest _) nil))
+                             #'ignore)))
+    (pai-agent-on-abort run (lambda () (cl-incf calls)))
+    (pai-agent-abort run)
+    (pai-agent-abort run)
+    (should (= calls 1))))
+
 (provide 'pai-agent-test)
 ;;; pai-agent-test.el ends here
