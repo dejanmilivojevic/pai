@@ -1,0 +1,7341 @@
+;;; vui.el --- Declarative, component-based UI library -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025-2026 Free Software Foundation, Inc.
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; Author: Boris Buliga <boris@d12frosted.io>
+;; Maintainer: Boris Buliga <boris@d12frosted.io>
+;; URL: https://github.com/d12frosted/vui.el
+;; Version: 1.4.0
+;; Package-Requires: ((emacs "29.1"))
+;; Keywords: ui, widgets, tools
+
+;; This file is NOT part of GNU Emacs.
+
+;;; Commentary:
+
+;; vui.el (Virtual UI) is a declarative, component-based UI library for Emacs.
+;; It brings React-like patterns to buffer-based interfaces: define components
+;; as functions of state, compose them into trees, and let the library handle
+;; efficient updates through reconciliation.
+;;
+;; Built on top of `widget.el' for battle-tested input handling, vui.el adds
+;; state management, automatic re-rendering, cursor preservation, and layout
+;; primitives for building complex, interactive UIs in Emacs buffers.
+;;
+;; Core Philosophy:
+;; - Declarative: Describe the UI as a function of state
+;; - Component-based: Build complex UIs from small, reusable pieces
+;; - Unidirectional data flow: Data flows down through props; events flow up
+;; - Predictable: Same props + state always produces the same output
+;; - Emacs-native: Respect Emacs conventions (point, markers, keymaps, faces)
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'widget)
+(require 'wid-edit)
+(require 'button)
+(require 'vui-layout)
+
+;;; Forward Declarations
+
+(defvar vui--root-instance)
+(defvar vui--inline-instances)
+
+;;; Custom Variables
+
+(defgroup vui nil
+  "Declarative, component-based UI library for Emacs."
+  :group 'tools
+  :prefix "vui-")
+
+(defcustom vui-lifecycle-error-handler 'warn
+  "How to handle errors in lifecycle hooks (on-mount, on-update, on-unmount).
+Possible values:
+  `warn'    - Display warning message (default)
+  `message' - Display message in echo area
+  `signal'  - Re-signal the error (let it propagate)
+  `ignore'  - Silently ignore errors
+  function  - Call function with (hook-name error instance)"
+  :type '(choice (const :tag "Display warning" warn)
+          (const :tag "Display message" message)
+          (const :tag "Re-signal error" signal)
+          (const :tag "Ignore silently" ignore)
+          (function :tag "Custom handler"))
+  :group 'vui)
+
+(defcustom vui-event-error-handler 'warn
+  "How to handle errors in event callbacks (on-click, on-change, etc.).
+Same options as `vui-lifecycle-error-handler'."
+  :type '(choice (const :tag "Display warning" warn)
+          (const :tag "Display message" message)
+          (const :tag "Re-signal error" signal)
+          (const :tag "Ignore silently" ignore)
+          (function :tag "Custom handler"))
+  :group 'vui)
+
+(defcustom vui-width-mode 'char
+  "Specify the measurement mode for width calculations in the vui package.
+This variable allows choosing between character-based (char) and
+pixel-based (pixel) methods for handling text width."
+  :type '(choice (const :tag "character-based mode" char)
+                 (const :tag "pixel-based mode" pixel))
+
+  :group 'vui)
+
+(defvar vui-last-error nil
+  "The most recent error caught by vui's error handling.
+Stored as (TYPE ERROR CONTEXT) where TYPE is `lifecycle' or `event',
+ERROR is the error object, and CONTEXT is additional information.")
+
+;;; Faces
+
+(defface vui-field-placeholder '((t :inherit shadow))
+  "Face for placeholder text shown in empty fields."
+  :group 'vui)
+
+(defface vui-table-header '((t :inherit bold))
+  "Face for table header cells.
+Override per table with the :header-face property of `vui-table'."
+  :group 'vui)
+
+(defface vui-table-border '((t nil))
+  "Face for table border and separator characters.
+Has no attributes by default; customize it to theme all table
+borders, or override per table with the :border-face property of
+`vui-table'."
+  :group 'vui)
+
+;;; Timing Instrumentation
+
+(defcustom vui-timing-enabled nil
+  "When non-nil, collect timing data for render phases.
+This has a small performance cost, so only enable for profiling."
+  :type 'boolean
+  :group 'vui)
+
+(defvar vui--timing-data nil
+  "List of timing records.
+Each record is a plist with :phase, :component, :duration, :timestamp.")
+
+(defvar vui--timing-max-entries 100
+  "Maximum number of timing entries to keep.")
+
+(defvar vui--timing-start-time nil
+  "Start time of current timing measurement.")
+
+(defun vui--timing-start ()
+  "Start timing a phase.  Does nothing if timing is disabled."
+  (when vui-timing-enabled
+    (setq vui--timing-start-time (float-time))))
+
+(defun vui--timing-record (phase component)
+  "Record timing for PHASE of COMPONENT.
+PHASE is a symbol like `render', `commit', `mount', `update', `unmount'.
+Does nothing if timing is disabled or no timing was started."
+  (when (and vui-timing-enabled vui--timing-start-time)
+    (let ((duration (- (float-time) vui--timing-start-time)))
+      (push (list :phase phase
+                  :component component
+                  :duration duration
+                  :timestamp (current-time))
+            vui--timing-data)
+      ;; Trim to max entries
+      (when (> (length vui--timing-data) vui--timing-max-entries)
+        (setq vui--timing-data (cl-subseq vui--timing-data 0 vui--timing-max-entries))))
+    (setq vui--timing-start-time nil)))
+
+(defun vui-get-timing ()
+  "Return the collected timing data."
+  vui--timing-data)
+
+(defun vui-clear-timing ()
+  "Clear all collected timing data."
+  (setq vui--timing-data nil)
+  (setq vui--timing-start-time nil))
+
+;;; Render Cycle Debugging
+
+(defcustom vui-debug-enabled nil
+  "When non-nil, log debug information during render cycles.
+Debug output goes to the *vui-debug* buffer."
+  :type 'boolean
+  :group 'vui)
+
+(defcustom vui-debug-log-phases '(render mount update unmount state-change)
+  "List of phases to log when debugging.
+Possible values: render, commit, mount, update, unmount, reconcile,
+state-change."
+  :type '(repeat symbol)
+  :group 'vui)
+
+(defvar vui--debug-buffer-name "*vui-debug*"
+  "Name of the buffer for debug output.")
+
+(defvar vui--debug-indent 0
+  "Current indentation level for debug output.")
+
+(defun vui--debug-log (phase format-string &rest args)
+  "Log debug message for PHASE with FORMAT-STRING and ARGS.
+Only logs if `vui-debug-enabled' is non-nil and PHASE is in
+`vui-debug-log-phases'."
+  (when (and vui-debug-enabled (memq phase vui-debug-log-phases))
+    (let ((indent (make-string (* vui--debug-indent 2) ?\s))
+          (timestamp (format-time-string "%H:%M:%S.%3N")))
+      (with-current-buffer (get-buffer-create vui--debug-buffer-name)
+        (goto-char (point-max))
+        (insert (format "[%s] %s%s: %s\n"
+                        timestamp
+                        indent
+                        phase
+                        (apply #'format format-string args)))))))
+
+(defun vui-debug-clear ()
+  "Clear the debug log buffer."
+  (interactive)
+  (when (get-buffer vui--debug-buffer-name)
+    (with-current-buffer vui--debug-buffer-name
+      (let ((inhibit-read-only t))
+        (erase-buffer)))))
+
+(defun vui-debug-show ()
+  "Show the debug log buffer."
+  (interactive)
+  (display-buffer (get-buffer-create vui--debug-buffer-name)))
+
+(defmacro vui--with-debug-indent (&rest body)
+  "Execute BODY with increased debug indentation."
+  `(let ((vui--debug-indent (1+ vui--debug-indent)))
+    ,@body))
+
+(defun vui-report-timing (&optional last-n)
+  "Display a timing report for the last LAST-N entries (default all).
+Groups by component and shows total time per phase."
+  (interactive "P")
+  (let* ((data (if last-n
+                   (cl-subseq vui--timing-data 0 (min last-n (length vui--timing-data)))
+                 vui--timing-data))
+         (by-component (make-hash-table :test 'eq))
+         (total-render 0)
+         (total-commit 0)
+         (total-mount 0)
+         (total-update 0)
+         (total-unmount 0))
+    ;; Group by component
+    (dolist (entry data)
+      (let* ((component (plist-get entry :component))
+             (phase (plist-get entry :phase))
+             (duration (plist-get entry :duration))
+             (existing (gethash component by-component))
+             (phase-key (intern (format ":%s" phase))))
+        (unless existing
+          (setq existing (list :render 0 :commit 0 :mount 0 :update 0 :unmount 0 :count 0))
+          (puthash component existing by-component))
+        (plist-put existing phase-key (+ (plist-get existing phase-key) duration))
+        (plist-put existing :count (1+ (plist-get existing :count)))
+        ;; Totals
+        (cl-case phase
+          (render (cl-incf total-render duration))
+          (commit (cl-incf total-commit duration))
+          (mount (cl-incf total-mount duration))
+          (update (cl-incf total-update duration))
+          (unmount (cl-incf total-unmount duration)))))
+    ;; Display report
+    (with-current-buffer (get-buffer-create "*vui-timing*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "VUI Timing Report\n")
+        (insert (make-string 60 ?=) "\n\n")
+        (insert (format "Total entries: %d\n\n" (length data)))
+        (insert "Totals by Phase:\n")
+        (insert (format "  render:  %.4fs\n" total-render))
+        (insert (format "  commit:  %.4fs\n" total-commit))
+        (insert (format "  mount:   %.4fs\n" total-mount))
+        (insert (format "  update:  %.4fs\n" total-update))
+        (insert (format "  unmount: %.4fs\n" total-unmount))
+        (insert (format "  TOTAL:   %.4fs\n\n"
+                        (+ total-render total-commit total-mount total-update total-unmount)))
+        (insert "By Component:\n")
+        (insert (make-string 60 ?-) "\n")
+        (maphash (lambda (component times)
+                   (insert (format "\n%s (renders: %d)\n"
+                                   component (plist-get times :count)))
+                   (when (> (plist-get times :render) 0)
+                     (insert (format "  render:  %.4fs\n" (plist-get times :render))))
+                   (when (> (plist-get times :commit) 0)
+                     (insert (format "  commit:  %.4fs\n" (plist-get times :commit))))
+                   (when (> (plist-get times :mount) 0)
+                     (insert (format "  mount:   %.4fs\n" (plist-get times :mount))))
+                   (when (> (plist-get times :update) 0)
+                     (insert (format "  update:  %.4fs\n" (plist-get times :update))))
+                   (when (> (plist-get times :unmount) 0)
+                     (insert (format "  unmount: %.4fs\n" (plist-get times :unmount)))))
+                 by-component))
+      (goto-char (point-min))
+      (special-mode)
+      (display-buffer (current-buffer)))))
+
+;;; Component Inspector
+
+(defvar vui-inspector-buffer-name "*vui-inspector*"
+  "Name of the buffer for the component inspector.")
+
+(defun vui--format-plist (plist &optional indent)
+  "Format PLIST for display with INDENT spaces."
+  (let ((indent-str (make-string (or indent 0) ?\s))
+        (result ""))
+    (when plist
+      (cl-loop for (key val) on plist by #'cddr
+               do (setq result
+                        (concat result
+                                (format "%s%s: %S\n"
+                                        indent-str
+                                        key
+                                        (if (functionp val)
+                                            "#<function>"
+                                          val))))))
+    result))
+
+(defun vui--inspect-instance-recursive (instance depth)
+  "Return inspection string for INSTANCE at DEPTH level."
+  (let* ((def (vui-instance-def instance))
+         (name (vui-component-def-name def))
+         (props (vui-instance-props instance))
+         (state (vui-instance-state instance))
+         (children (vui-instance-children instance))
+         (indent (make-string (* depth 2) ?\s))
+         (result ""))
+    ;; Component header
+    (setq result (concat result
+                         (format "%s[%s] (id: %d)\n"
+                                 indent
+                                 name
+                                 (vui-instance-id instance))))
+    ;; Props (exclude children and functions for brevity)
+    (when props
+      (let ((display-props (copy-sequence props)))
+        (cl-remf display-props :children)
+        (when display-props
+          (setq result (concat result
+                               (format "%s  Props:\n" indent)
+                               (vui--format-plist display-props (+ (* depth 2) 4)))))))
+    ;; State
+    (when state
+      (setq result (concat result
+                           (format "%s  State:\n" indent)
+                           (vui--format-plist state (+ (* depth 2) 4)))))
+    ;; Children
+    (when children
+      (setq result (concat result
+                           (format "%s  Children:\n" indent)))
+      (dolist (child children)
+        (setq result (concat result
+                             (vui--inspect-instance-recursive child (1+ depth))))))
+    result))
+
+(defun vui--inspectable-instances (instance)
+  "Return the instances to inspect.
+When INSTANCE is non-nil, just that one; otherwise the current
+buffer's mounted instances: the `vui-mount' root followed by any
+inline instances."
+  (if instance
+      (list instance)
+    (delq nil (cons vui--root-instance
+                    (copy-sequence vui--inline-instances)))))
+
+(defun vui--inspect-instance-location (instance)
+  "Return a short location label for INSTANCE.
+Names the buffer, plus the managed region for inline instances."
+  (let ((start (vui-instance-region-start instance))
+        (end (vui-instance-region-end instance)))
+    (format "Buffer: %s%s"
+            (or (buffer-name (vui-instance-buffer instance)) "(no buffer)")
+            (if (and start (marker-position start))
+                (format " (inline at %d..%d)"
+                        (marker-position start) (marker-position end))
+              ""))))
+
+(defun vui-inspect (&optional instance)
+  "Display the component inspector.
+Shows the component tree with props and state for each component of
+INSTANCE - or, when INSTANCE is nil, of every instance mounted in
+the current buffer: the `vui-mount' root and any instances mounted
+via `vui-mount-inline'."
+  (interactive)
+  (let ((instances (vui--inspectable-instances instance)))
+    (if (null instances)
+        (message "No VUI instance mounted. Use vui-mount to mount a component.")
+      (with-current-buffer (get-buffer-create vui-inspector-buffer-name)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "VUI Component Inspector\n")
+          (insert (make-string 60 ?=) "\n")
+          (dolist (inst instances)
+            (insert "\n" (vui--inspect-instance-location inst) "\n\n")
+            (insert "Component Tree:\n")
+            (insert (make-string 60 ?-) "\n")
+            (insert (vui--inspect-instance-recursive inst 0))))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer))))))
+
+(defun vui-inspect-state (&optional instance)
+  "Display the state viewer.
+Shows a focused view of all component state in INSTANCE's tree - or,
+when INSTANCE is nil, in every instance mounted in the current
+buffer: the `vui-mount' root and any instances mounted via
+`vui-mount-inline'."
+  (interactive)
+  (let ((instances (vui--inspectable-instances instance)))
+    (if (null instances)
+        (message "No VUI instance mounted. Use vui-mount to mount a component.")
+      (with-current-buffer (get-buffer-create "*vui-state*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "VUI State Viewer\n")
+          (insert (make-string 60 ?=) "\n")
+          (dolist (inst instances)
+            (insert "\n" (vui--inspect-instance-location inst) "\n\n")
+            (vui--collect-state-recursive inst 0)))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer))))))
+
+(defun vui--collect-state-recursive (instance depth)
+  "Insert state for INSTANCE at DEPTH level."
+  (let* ((def (vui-instance-def instance))
+         (name (vui-component-def-name def))
+         (state (vui-instance-state instance))
+         (children (vui-instance-children instance))
+         (indent (make-string (* depth 2) ?\s)))
+    ;; Only show components with state
+    (when state
+      (insert (format "%s%s (id: %d):\n" indent name (vui-instance-id instance)))
+      (insert (vui--format-plist state (+ (* depth 2) 2)))
+      (insert "\n"))
+    ;; Recurse to children
+    (dolist (child children)
+      (vui--collect-state-recursive child (1+ depth)))))
+
+(defun vui-get-instance-by-id (id &optional instance)
+  "Find instance with ID starting from INSTANCE or root."
+  (let* ((inst (or instance vui--root-instance))
+         (found nil))
+    (when inst
+      (if (= (vui-instance-id inst) id)
+          (setq found inst)
+        (dolist (child (vui-instance-children inst))
+          (unless found
+            (setq found (vui-get-instance-by-id id child))))))
+    found))
+
+(defun vui-get-component-instances (component-type &optional instance)
+  "Find all instances of COMPONENT-TYPE starting from INSTANCE or root.
+Returns a list of instances."
+  (let* ((inst (or instance vui--root-instance))
+         (result nil))
+    (when inst
+      (when (eq (vui-component-def-name (vui-instance-def inst)) component-type)
+        (push inst result))
+      (dolist (child (vui-instance-children inst))
+        (setq result (append result (vui-get-component-instances component-type child)))))
+    result))
+
+;;; Major Mode
+
+(defun vui-quit ()
+  "Quit window unless point is in a widget field.
+When in a widget field, insert `q' instead."
+  (interactive)
+  (if (widget-field-at (point))
+      (self-insert-command 1)
+    (quit-window)))
+
+(defun vui-refresh ()
+  "Refresh the VUI buffer unless point is in a widget field.
+When in a widget field, insert `g' instead.
+Triggers a re-render of the mounted component with current state."
+  (interactive)
+  (if (widget-field-at (point))
+      (self-insert-command 1)
+    (when vui--root-instance
+      (vui--schedule-render))))
+
+(defun vui--tabable-positions ()
+  "Sorted start positions of interactive elements reachable by TAB.
+Elements whose `:vui-tab-order' is -1 are skipped (matching the old
+widget behaviour)."
+  (sort (delq nil
+              (mapcar (lambda (elt)
+                        (unless (eql (vui--elt-get elt :vui-tab-order) -1)
+                          (car (vui--widget-bounds elt))))
+                      (vui--collect-widgets)))
+        #'<))
+
+(defun vui-forward (&optional n)
+  "Move point to the Nth next interactive element (button or field).
+Movement wraps around the buffer, and a negative N moves backward.  This
+is vui's unified replacement for `widget-forward': it stops on text
+buttons (vui buttons, checkboxes, selects) as well as editable fields.
+Interactively, N is the prefix argument."
+  (interactive "p")
+  (let ((n (or n 1)))
+    (if (< n 0)
+        (vui-backward (- n))
+      (let ((positions (vui--tabable-positions)))
+        (when positions
+          (let* ((len (length positions))
+                 (i (or (seq-position positions (point)
+                                      (lambda (p pt) (> p pt)))
+                        len))
+                 (idx (mod (+ i (1- n)) len)))
+            (goto-char (nth idx positions))))))))
+
+(defun vui-backward (&optional n)
+  "Move point to the Nth previous interactive element (button or field).
+Movement wraps around the buffer, and a negative N moves forward.  See
+`vui-forward'.  Interactively, N is the prefix argument."
+  (interactive "p")
+  (let ((n (or n 1)))
+    (if (< n 0)
+        (vui-forward (- n))
+      (let ((positions (vui--tabable-positions)))
+        (when positions
+          (let* ((len (length positions))
+                 (pt (point))
+                 (below (seq-filter (lambda (p) (< p pt)) positions))
+                 (i (if below (1- (length below)) -1))
+                 (idx (mod (- i (1- n)) len)))
+            (goto-char (nth idx positions))))))))
+
+(defvar vui--field-nav-keymap (make-sparse-keymap)
+  "Keymap merged over `widget-field-keymap' on vui editable fields.
+It makes TAB and S-TAB use vui's unified navigation (which also stops on
+text buttons) from inside a field; field editing keys fall through to
+`widget-field-keymap'.  Bindings are installed by
+`vui--install-keymap-keys'.")
+
+(defvar vui--button-keymap
+  ;; `button-map' inherits `button-buffer-map', which binds TAB/backtab to
+  ;; `forward-button'/`backward-button' - a button-only walk that skips fields
+  ;; and ignores vui's tab-order.  This keymap rebinds them to vui's unified
+  ;; navigation (via `vui--install-keymap-keys') so TAB behaves the same on a
+  ;; button as anywhere else, while RET/mouse activation still comes from
+  ;; `button-map' underneath.
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map button-map)
+    map)
+  "Keymap for vui text buttons: `button-map' with TAB/S-TAB rebound to
+vui's unified navigation.")
+
+(defvar vui-mode-map (make-sparse-keymap)
+  "Keymap for `vui-mode'.
+This keymap is active in all VUI buffers.  Users and packages can
+add bindings here for functionality like `ace-link'.  Its bindings are
+installed by `vui--install-keymap-keys'.")
+
+(defun vui--install-keymap-keys ()
+  "Install vui's key bindings on its keymaps.
+Run as a top-level form (below), not inside the `defvar's above, so that
+reloading vui.el re-installs the bindings: `defvar' does not re-evaluate
+a keymap once the variable is bound, which would otherwise leave a stale
+`vui-mode-map' without TAB/S-TAB after a reload."
+  (define-key vui-mode-map (kbd "q") #'vui-quit)
+  (define-key vui-mode-map (kbd "g") #'vui-refresh)
+  ;; `widget-keymap' (in vui-mode-map's parent chain) binds down-mouse-1,
+  ;; down-mouse-2 and touchscreen-begin to `widget-button-click', which
+  ;; treats any `button' char property as a widget button - and signals
+  ;; "Wrong type argument: overlayp, nil" on vui's button.el text buttons.
+  ;; vui buffers activate buttons through button.el (`push-button' on
+  ;; RET/mouse-2 via `button-map', mouse-1 via the
+  ;; `mouse-1-click-follows-link' translation), so mouse presses keep
+  ;; their plain global semantics: drag/set point on mouse-1, nothing on
+  ;; the (globally unbound) mouse-2 press.
+  (define-key vui-mode-map [down-mouse-1] #'mouse-drag-region)
+  (define-key vui-mode-map [down-mouse-2] #'ignore)
+  ;; Taps go through the same broken `widget-button-click' path; hand
+  ;; them to the normal touchscreen translator instead (Emacs 30+).
+  (when (fboundp 'touch-screen-handle-touch)
+    (define-key vui-mode-map [touchscreen-begin] #'touch-screen-handle-touch))
+  ;; Unified navigation across text buttons and editable fields.  On
+  ;; `vui-mode-map' it shadows `widget-keymap's widget-only TAB/S-TAB; on the
+  ;; button/field keymaps it shadows button.el's `button-buffer-map'.
+  (dolist (map (list vui-mode-map vui--field-nav-keymap vui--button-keymap))
+    (define-key map (kbd "TAB") #'vui-forward)
+    (define-key map (kbd "<tab>") #'vui-forward)
+    (define-key map (kbd "<backtab>") #'vui-backward)
+    (define-key map (kbd "S-TAB") #'vui-backward)
+    ;; Shift+Tab (and Tab) reach Emacs as different events per platform
+    ;; (<backtab>, S-TAB, <S-tab>, <S-iso-lefttab>...).  Rather than bind every
+    ;; representation, remap widget.el's and button.el's own navigation
+    ;; commands to vui's, so ANY key that would invoke them (via a keymap in
+    ;; the parent chain - `widget-keymap', `button-buffer-map') navigates the
+    ;; vui way instead.  This matters because e.g. `widget-backward' jumps to
+    ;; point-max when it finds no widgets, stranding point.
+    (define-key map [remap widget-forward] #'vui-forward)
+    (define-key map [remap widget-backward] #'vui-backward)
+    (define-key map [remap forward-button] #'vui-forward)
+    (define-key map [remap backward-button] #'vui-backward)))
+
+(vui--install-keymap-keys)
+
+(define-derived-mode vui-mode special-mode "VUI"
+  "Major mode for VUI buffers.
+Provides a base mode for all VUI-rendered content.  Packages that
+use VUI can derive their own modes from this one to add custom
+keybindings while preserving VUI and widget functionality.
+
+\\{vui-mode-map}"
+  :group 'vui
+  ;; Parent: widget-keymap (editable-field editing keys and mouse
+  ;; activation) beneath special-mode-map (h for help, etc.).  vui-mode-map
+  ;; itself rebinds TAB/S-TAB to vui's unified navigation, shadowing
+  ;; widget-keymap's widget-only `widget-forward'/`widget-backward'.
+  (set-keymap-parent vui-mode-map
+                     (make-composed-keymap widget-keymap special-mode-map))
+  ;; Disable buffer-read-only; widget-setup installs before-change-functions
+  ;; that prevent editing outside of editable fields
+  (setq-local buffer-read-only nil))
+
+;;; Core Data Structures - Virtual Nodes
+
+;; Base structure for all virtual nodes
+(cl-defstruct (vui-vnode (:constructor nil))
+  "Base type for virtual tree nodes."
+  key)
+
+;; Primitive: raw text
+(cl-defstruct (vui-vnode-text (:include vui-vnode)
+                              (:constructor vui-vnode-text--create))
+  "Virtual node representing plain text."
+  content
+  face
+  properties)
+
+;; Container: sequence of children
+(cl-defstruct (vui-vnode-fragment (:include vui-vnode)
+                                  (:constructor vui-vnode-fragment--create))
+  "Virtual node that groups children without wrapper."
+  children)
+
+;; Primitive: newline
+(cl-defstruct (vui-vnode-newline (:include vui-vnode)
+                                 (:constructor vui-vnode-newline--create))
+  "Virtual node representing a line break.")
+
+;; Primitive: horizontal space
+(cl-defstruct (vui-vnode-space (:include vui-vnode)
+                               (:constructor vui-vnode-space--create))
+  "Virtual node representing whitespace."
+  width)
+
+;; Primitive: clickable button
+(cl-defstruct (vui-vnode-button (:include vui-vnode)
+                                (:constructor vui-vnode-button--create))
+  "Virtual node representing a clickable button."
+  label
+  on-click
+  face
+  disabled-p
+  max-width       ; For truncation in constrained spaces
+  no-decoration   ; When t, render without [ ] brackets
+  (help-echo :default) ; :default = widget default, nil = disabled, string = custom
+  tab-order       ; nil=normal, -1=non-tabable
+  keymap)         ; custom keymap for this button
+
+;; Primitive: editable text field
+(cl-defstruct (vui-vnode-field (:include vui-vnode)
+                               (:constructor vui-vnode-field--create))
+  "Virtual node representing an editable text field.
+This is a simple string-based primitive.  For typed fields with
+parsing and validation, use `vui-typed-field' from vui-components.el."
+  value
+  size
+  placeholder
+  on-change
+  on-submit       ; Called with value when user presses RET
+  face
+  secret-p)       ; Hide input for passwords
+
+;; Primitive: checkbox
+(cl-defstruct (vui-vnode-checkbox (:include vui-vnode)
+                                  (:constructor vui-vnode-checkbox--create))
+  "Boolean checkbox."
+  checked-p
+  on-change
+  label)
+
+;; Primitive: select (dropdown)
+(cl-defstruct (vui-vnode-select (:include vui-vnode)
+                                (:constructor vui-vnode-select--create))
+  "Selection from options."
+  value        ; Current selection
+  options      ; List of choices
+  on-change
+  prompt)      ; Minibuffer prompt
+
+;; Layout: horizontal stack
+(cl-defstruct (vui-vnode-hstack (:include vui-vnode)
+                                (:constructor vui-vnode-hstack--create))
+  "Horizontal layout container."
+  children   ; List of child vnodes
+  spacing    ; Spaces between children (default 1)
+  indent     ; Inherited indent from parent (for multi-line children)
+  face       ; Face applied beneath the children's own faces
+  keymap)    ; Keymap cascading beneath the children's own keymaps
+
+;; Layout: vertical stack
+(cl-defstruct (vui-vnode-vstack (:include vui-vnode)
+                                (:constructor vui-vnode-vstack--create))
+  "Vertical layout container."
+  children   ; List of child vnodes
+  spacing    ; Blank lines between children (default 0)
+  indent     ; Left indent for all children (default 0)
+  skip-first-indent  ; When t, skip indent for first child (used inside hstack)
+  face       ; Face applied beneath the children's own faces
+  keymap)    ; Keymap cascading beneath the children's own keymaps
+
+;; Layout: fixed-width box
+(cl-defstruct (vui-vnode-box (:include vui-vnode)
+                             (:constructor vui-vnode-box--create))
+  "Fixed-width container with alignment."
+  child      ; Single child vnode
+  width      ; Width in characters
+  align      ; :left, :center, :right
+  padding-left
+  padding-right
+  face       ; Face applied beneath the child's own faces
+  keymap)    ; Keymap cascading beneath the child's own keymaps
+
+;; Layout: table
+(cl-defstruct (vui-vnode-table (:include vui-vnode)
+                               (:constructor vui-vnode-table--create))
+  "Table layout with rows and columns."
+  columns     ; List of column specs (plists with :header :width :align :min-width)
+  rows        ; List of rows, each row is list of cell content (strings or vnodes)
+  border      ; nil, :ascii, :unicode
+  sticky-header ; When non-nil, pin the header row in the header line while scrolled into the body
+  header-face ; Face for header cells (default `vui-table-header')
+  border-face); Face for border characters (default `vui-table-border')
+
+;; Styling wrapper: face/keymap over the children's extent
+(cl-defstruct (vui-vnode-region (:include vui-vnode)
+                                (:constructor vui-vnode-region--create))
+  "Virtual node that applies face and keymap to its children's extent."
+  children   ; List of child vnodes
+  face       ; Face applied beneath the children's own faces
+  keymap)    ; Keymap cascading beneath the children's own keymaps
+
+;; Layout: flexible-width horizontal row
+(cl-defstruct (vui-vnode-flex (:include vui-vnode)
+                              (:constructor vui-vnode-flex--create))
+  "Horizontal layout that distributes a total width among children."
+  children   ; List of child vnodes and vui-vnode-flex-item wrappers
+  spacing    ; Spaces between children (default 1)
+  width      ; Total width: number, function, `fill-column', `window'
+  justify    ; :start (default), :center, :end, :space-between
+  indent     ; Inherited indent from parent (subtracted from width)
+  wrap       ; Non-nil: children wrap into rows (see vui--render-flex-wrap)
+  face       ; Face applied beneath the children's own faces
+  keymap)    ; Keymap cascading beneath the children's own keymaps
+
+;; Layout: responsive equal-track grid
+(cl-defstruct (vui-vnode-grid (:include vui-vnode)
+                              (:constructor vui-vnode-grid--create))
+  "Responsive grid: equal tracks, column count falls with the width."
+  children         ; List of cell vnodes, or functions of the track width
+  columns          ; Requested (maximum) column count
+  min-column-width ; Smallest acceptable track (chars), or nil
+  width            ; Total width: number, function, `fill-column', `window'
+  spacing          ; Gap between tracks (default 1)
+  row-spacing      ; Blank lines between rows (default 0)
+  indent           ; Inherited indent from parent (subtracted from width)
+  face             ; Face applied beneath the cells' own faces
+  keymap)          ; Keymap cascading beneath the cells' own keymaps
+
+;; Wrapper marking a flex child that takes a share of leftover width
+(cl-defstruct (vui-vnode-flex-item (:include vui-vnode)
+                                   (:constructor vui-vnode-flex-item--create))
+  "Wrapper marking a `vui-flex' child that grows into leftover width."
+  child      ; Vnode, or function called with the allotted width
+  grow       ; Proportional weight (default 1)
+  min-width) ; Floor the child may shrink to under :wrap (chars), or nil
+
+;; Component reference in vtree
+(cl-defstruct (vui-vnode-component (:include vui-vnode)
+                                   (:constructor vui-vnode-component--create))
+  "Virtual node representing a component instantiation."
+  type       ; Symbol - the component type name
+  props      ; Plist of props to pass
+  children)  ; List of child vnodes (passed as :children prop)
+
+;;; Context System
+
+;; Context definition
+(cl-defstruct (vui-context (:constructor vui-context--create))
+  "A context definition."
+  name              ; Symbol identifying this context
+  default-value)    ; Value when no provider found
+
+;; Context provider vnode
+(cl-defstruct (vui-vnode-provider (:include vui-vnode)
+                                  (:constructor vui-vnode-provider--create))
+  "A context provider vnode."
+  context           ; The vui-context being provided
+  value             ; The value to provide
+  children)         ; Child vnodes
+
+;; Runtime context binding
+(cl-defstruct (vui-context-binding (:constructor vui-context-binding--create))
+  "Runtime binding of a context to a value."
+  context           ; The vui-context
+  value)            ; Current provided value
+
+;; Error boundary vnode - catches errors in children
+(cl-defstruct (vui-vnode-error-boundary (:include vui-vnode)
+                                        (:constructor vui-vnode-error-boundary--create))
+  "Virtual node that catches errors from children."
+  children          ; Child vnodes to render
+  fallback          ; (lambda (error) vnode) to render on error
+  on-error          ; Optional (lambda (error)) callback when error caught
+  id)               ; Unique identifier for this boundary (for state tracking)
+
+;; Stream vnode - anchors an append-only region (see "Streaming" below)
+(cl-defstruct (vui-vnode-stream (:include vui-vnode)
+                                (:constructor vui-vnode-stream--create))
+  "Virtual node that anchors a `vui-stream' handle's managed region.
+The handle owns the region's markers and item list; rendering this
+vnode (re-)emits the items and binds the region around them."
+  handle)           ; The vui-stream-handle this node anchors
+
+;; Error boundary state lives on the root instance of a mounted tree
+;; (see `vui-instance-boundary-errors').  This buffer-local table is
+;; the fallback for static `vui-render' trees, which have no instance.
+(defvar-local vui--error-boundary-errors nil
+  "Buffer-local error boundary table for static `vui-render' trees.
+Maps boundary keys to caught errors.  Lazily initialized by
+`vui--error-boundary-table'.")
+
+;;; Component System
+
+;; Component definition - the template
+(cl-defstruct (vui-component-def (:constructor vui-component-def--create))
+  "Definition of a component type."
+  name              ; Symbol identifying this component type
+  docstring         ; Optional documentation string
+  props-spec        ; List of prop names (symbols)
+  initial-state-fn  ; (lambda (props) state) or nil
+  render-fn         ; (lambda (props state) vnode)
+  on-mount          ; (lambda ()) called after first render
+  on-update         ; (lambda (prev-props prev-state)) called after re-render
+  on-unmount        ; (lambda ()) called before removal
+  should-update)    ; (lambda (new-props new-state old-props old-state)) -> bool or nil
+
+;; Component instance - a live component
+(cl-defstruct (vui-instance (:constructor vui-instance--create))
+  "A live instance of a component in the tree."
+  id          ; Unique identifier
+  def         ; Reference to vui-component-def
+  props       ; Current props plist
+  state       ; Current state plist (mutable)
+  vnode       ; The vui-vnode-component that created this
+  parent      ; Parent vui-instance or nil for root
+  children    ; Child vui-instances
+  buffer      ; Buffer this instance is rendered into
+  cached-vtree  ; Last rendered vtree (for should-update optimization)
+  mounted-p   ; Has this been mounted?
+  mount-cleanup ; Cleanup function returned from on-mount, called during unmount
+  effects     ; Alist of (effect-id . (deps . cleanup-fn)) for vui-use-effect
+  refs        ; Hash table of ref-id -> (value . nil) for vui-use-ref
+  callbacks   ; Hash table of callback-id -> (deps . fn) for vui-use-callback
+  memos       ; Hash table of memo-id -> (deps . value) for let-memo
+  asyncs      ; Hash table of async-id -> (key status data error timer) for vui-use-async
+  prev-props  ; Props from previous render (for on-update)
+  prev-state  ; State from previous render (for on-update)
+  render-timer ; Pending deferred-render timer (only used on root instances)
+  boundary-errors ; Hash of error-boundary key -> caught error (root instances)
+  region-start ; Marker: start of managed region (inline instances only)
+  region-end   ; Marker: end of managed region (inline instances only)
+  render-record ; Incremental-render bookkeeping for the root (see vui--commit-root)
+  consumed-contexts ; Alist (context . value) read by this instance and its subtree
+  r-len)       ; Rendered length in chars (component-list incremental patching)
+
+;; Registry of component definitions
+(defvar vui--component-registry (make-hash-table :test 'eq)
+  "Hash table mapping component names to definitions.")
+
+;; Current render context
+(defvar vui--current-instance nil
+  "The component instance currently being rendered.")
+
+(defvar vui--instance-counter 0
+  "Counter for generating unique instance IDs.")
+
+(defvar vui--child-index 0
+  "Index counter for child components during render (for keyless reconciliation).")
+
+(defvar vui--consumed-contexts nil
+  "Accumulator for contexts read during the current instance's own render.
+Bound per instance by `vui--render-instance'; each `vui--consume-context'
+call pushes a (CONTEXT . VALUE) pair.  Used to decide whether an instance
+may bail out of re-rendering (its consumed context values are unchanged).")
+
+(defvar vui--new-children nil
+  "Accumulator for child instances created during render.")
+
+(defvar vui--reconcile-lookup nil
+  "O(1) lookup over the current parent's existing children during render.
+Bound per instance by `vui--render-instance' to the result of
+`vui--build-reconcile-lookup', and consulted by `vui--find-matching-child'
+so reconciling a list of S children is O(S) rather than O(S^2).  Nil when
+no lookup was built (e.g. measurement passes), in which case
+`vui--find-matching-child' falls back to a linear scan.")
+
+(defvar vui--render-path nil
+  "Current vnode path during rendering.
+A list of indices from root to current position, e.g., (0 1 2) means
+child 0 of root, then child 1 of that, then child 2 of that.
+Used for stable cursor preservation across re-renders.")
+
+(defvar vui--pending-effects nil
+  "List of effects to run after commit: ((instance effect-id deps effect-fn) ...).")
+
+(defvar vui--effect-index 0
+  "Counter for auto-generating effect IDs within a component render.")
+
+(defvar vui--ref-index 0
+  "Counter for auto-generating ref IDs within a component render.")
+
+(defvar vui--callback-index 0
+  "Counter for auto-generating callback IDs within a component render.")
+
+(defvar vui--memo-index 0
+  "Counter for auto-generating memo IDs within a component render.")
+
+(defvar vui--async-index 0
+  "Counter for auto-generating async IDs within a component render.")
+
+(defvar vui--rendering-p nil
+  "Non-nil while a render is in progress (including commit and effects).
+While set, re-render requests are queued in `vui--queued-rerenders'
+instead of starting a nested render that would erase the buffer
+mid-walk.")
+
+(defvar vui--queued-rerenders nil
+  "Roots whose re-render was requested while a render was in progress.
+Drained by `vui--flush-queued-rerenders' after the in-progress render
+commits and runs its effects.")
+
+(defvar vui--flushing-rerenders-p nil
+  "Non-nil while `vui--flush-queued-rerenders' drains the queue.
+Prevents nested drains so the top-level loop can detect runaway
+state-update cycles.")
+
+(defvar vui--rerender-queue-limit 100
+  "Maximum consecutive queued re-renders before assuming a loop.
+A lifecycle hook that unconditionally calls `vui-set-state' with a
+fresh value on every render never settles; rather than looping
+forever, vui signals an error once this many queued re-renders have
+run back-to-back.")
+
+(defvar vui--measuring-p nil
+  "Non-nil while rendering into a temp buffer to measure content width.
+Layout containers (tables, boxes) render their content twice: once to
+measure, once for real.  During the measure pass, component lifecycle
+hooks are skipped, effect registrations are discarded, and async
+loaders are not started, so the measurement has no side effects.")
+
+(defvar vui--measure-reconcile nil
+  "Reconciliation cursor carried into measure passes, or nil.
+A cons (PARENT . INDEX) bound by a layout container around the
+measurement of its children, where PARENT is the live instance whose
+children the measured vnodes will reconcile against and INDEX the
+`vui--child-index' the next component vnode would receive.  Measure
+passes advance INDEX exactly as the real render will, so a component
+measured mid-sequence still matches its own live instance.  Nil (the
+default) measures with throwaway instances only, as before.")
+
+(defvar vui--measure-live-parent nil
+  "During a measure pass, the live instance the walk is measuring under.
+Component vnodes encountered while it is non-nil reconcile against its
+children (key or index, like `vui--reconcile-component'), and a match
+measures as its live instance's render over CURRENT state (see
+`vui--measure-instance-vtree') instead of a throwaway initial-state
+render.  Bound from `vui--measure-reconcile' at the measure entry and
+rebound to each matched instance while descending its vtree; nil
+across unmatched (genuinely new) subtrees, which keep throwaway
+rendering.")
+
+(defvar vui--context-stack nil
+  "Stack of context bindings during render.
+Each entry is a vui-context-binding.")
+
+(defvar vui--text-pixel-cache nil
+  "Memo of pixel widths for `pixel' width mode, or nil until first use.
+Two levels: the outer table is keyed by a buffer's `face-remapping-alist'
+\(the face context a string is measured in: `text-scale-mode' and
+`variable-pitch-mode' both live there), the inner by string content.
+Cleared wholesale by `vui--reset-text-pixel-cache' when the frame font
+changes.  See `vui--string-pixel-width'.")
+
+(defvar vui--space-pixel-memo nil
+  "One-entry memo for `vui--space-pixel-width': (CONTEXT . WIDTH).
+CONTEXT is the measuring buffer's `face-remapping-alist'.  Cleared with
+the main cache by `vui--reset-text-pixel-cache'.")
+
+(defvar vui--measure-buffer nil
+  "The buffer whose face context pixel measurements should use.
+Layout containers measure content by rendering it into a temp buffer,
+which has no face remappings, so a table inside a `variable-pitch-mode'
+or `text-scale-mode' buffer would otherwise be measured in the frame's
+default font and laid out for the wrong widths.  Bound to the render
+target around those temp-buffer passes; nil means the current buffer.
+Honoured on Emacs 31 and later, where `string-pixel-width' takes the
+buffer whose remappings to use.")
+
+(defconst vui--string-pixel-width-takes-buffer
+  (>= (or (cdr (func-arity #'string-pixel-width)) 1) 2)
+  "Non-nil when `string-pixel-width' accepts a BUFFER argument (Emacs 31+).")
+
+(add-hook 'after-setting-font-hook #'vui--reset-text-pixel-cache)
+
+(defun vui--register-component (def)
+  "Register component definition DEF in the registry."
+  (puthash (vui-component-def-name def) def vui--component-registry))
+
+(defun vui--get-component (name)
+  "Get component definition by NAME."
+  (or (gethash name vui--component-registry)
+      (error "Unknown component: %s" name)))
+
+(defun vui--shallow-equal-plist (a b)
+  "Non-nil if plists A and B have the same keys with equal values.
+Used by `:memo' components to decide whether props are unchanged.
+Values are compared with `vui--vnode-equal', so strings that differ
+only in text properties (same characters, different face) count as
+changed; functions keep plain `equal' semantics, so a fresh closure
+with an `equal' captured environment does not defeat the memo."
+  (and (= (length a) (length b))
+       (cl-loop for (k v) on a by #'cddr
+                always (and (plist-member b k)
+                            (vui--vnode-equal v (plist-get b k) t)))))
+
+(defmacro vui-defcomponent (name args &rest body)
+  "Define a component named NAME.
+
+ARGS is a list of prop names the component accepts.
+BODY may optionally start with a documentation string, followed by
+keyword sections:
+  :state ((var initial) ...) - local state variables
+  :on-mount FORM - called after first render (optional).  A function
+    returned from FORM is stored as the unmount cleanup, so a FORM
+    ending in a `setq' of a lambda hands that lambda to vui by
+    accident; end it with nil or with the real cleanup.
+  :on-update FORM - called after re-render (optional)
+  :on-unmount FORM - called before removal (optional)
+  :should-update FORM - return t to re-render, nil to skip (optional)
+  :memo BOOL - when non-nil, a shorthand for a `:should-update' that
+    skips the re-render while props are shallow-equal and state is
+    unchanged (like React.memo).  Ignored when `:should-update' is
+    also given, which always wins.  `:children' counts as a prop, so
+    a memo component with nested content re-renders whenever its
+    parent does (its children are freshly built each render).
+  :render FORM - the render expression (required)
+
+All forms have access to props as variables, state variables,
+and `children' for nested content.  on-update and should-update
+have access to `prev-props' and `prev-state'.
+
+Example:
+  (vui-defcomponent greeting (name)
+    \"A greeting component that displays a name with a counter.\"
+    :state ((count 0))
+    :on-mount (message \"Mounted: %s\" name)
+    :on-update (when (not (equal prev-props --props--))
+                 (message \"Props changed!\"))
+    :should-update (or (not (equal name (plist-get prev-props :name)))
+                       (not (equal count (plist-get prev-state :count))))
+    :on-unmount (message \"Unmounted\")
+    :render
+    (vui-fragment
+      (vui-text (format \"Hello, %s! Count: %d\" name count))
+      (vui-button \"+\" :on-click (lambda () (vui-set-state \\='count (1+ count))))))"
+  (declare (indent 2))
+  (let* ((docstring (when (stringp (car body)) (car body)))
+         (body-rest (if docstring (cdr body) body))
+         (state-spec nil)
+         (render-form nil)
+         (on-mount-form nil)
+         (on-update-form nil)
+         (on-unmount-form nil)
+         (should-update-form nil)
+         (should-update-provided nil)
+         (memo-flag nil)
+         (rest body-rest))
+    ;; Parse keyword arguments
+    (while rest
+      (pcase (car rest)
+        (:state (setq state-spec (cadr rest)
+                      rest (cddr rest)))
+        (:memo (setq memo-flag (cadr rest)
+                     rest (cddr rest)))
+        (:on-mount (setq on-mount-form (cadr rest)
+                         rest (cddr rest)))
+        (:on-update (setq on-update-form (cadr rest)
+                          rest (cddr rest)))
+        (:on-unmount (setq on-unmount-form (cadr rest)
+                           rest (cddr rest)))
+        (:should-update (setq should-update-form (cadr rest)
+                              should-update-provided t
+                              rest (cddr rest)))
+        (:render (setq render-form (cadr rest)
+                       rest (cddr rest)))
+        (_ (error "Unknown vui-defcomponent keyword: %s" (car rest)))))
+    (unless render-form
+      (error "vui-defcomponent %s: :render is required" name))
+    ;; `:memo t' is a shorthand for the most common `:should-update' - skip
+    ;; the re-render when props are shallow-equal and state is unchanged
+    ;; (React.memo).  An explicit `:should-update' always wins.
+    (when (and memo-flag (not should-update-provided))
+      (setq should-update-form
+            '(not (and (vui--shallow-equal-plist --props-- --prev-props--)
+                       (vui--vnode-equal --state-- --prev-state-- t)))
+            should-update-provided t))
+    (let ((state-vars (mapcar #'car state-spec))
+          (state-inits (mapcar #'cadr state-spec)))
+      (cl-flet ((make-body-fn (form)
+                  `(lambda (--props-- --state--)
+                     (ignore --props-- --state--)
+                     (let (,@(mapcar (lambda (arg)
+                                       `(,arg (plist-get --props-- ,(intern (format ":%s" arg)))))
+                              args)
+                           ,@(mapcar (lambda (var)
+                                       `(,var (plist-get --state-- ,(intern (format ":%s" var)))))
+                              state-vars)
+                           (children (plist-get --props-- :children)))
+                      (ignore children ,@args ,@state-vars)
+                      ,form)))
+                (make-update-fn (form)
+                  ;; Expose the raw `props'/`state' plists too, as documented
+                  ;; for :on-update and :should-update, unless a prop or state
+                  ;; var of that exact name already claims the binding.
+                  (let ((bind-props (not (or (memq 'props args)
+                                             (memq 'props state-vars))))
+                        (bind-state (not (or (memq 'state args)
+                                             (memq 'state state-vars)))))
+                    `(lambda (--props-- --state-- --prev-props-- --prev-state--)
+                       (ignore --props-- --state-- --prev-props-- --prev-state--)
+                       (let (,@(mapcar (lambda (arg)
+                                         `(,arg (plist-get --props-- ,(intern (format ":%s" arg)))))
+                                args)
+                             ,@(mapcar (lambda (var)
+                                         `(,var (plist-get --state-- ,(intern (format ":%s" var)))))
+                                state-vars)
+                             (children (plist-get --props-- :children))
+                             ,@(when bind-props '((props --props--)))
+                             ,@(when bind-state '((state --state--)))
+                             (prev-props --prev-props--)
+                             (prev-state --prev-state--))
+                        (ignore children prev-props prev-state ,@args ,@state-vars
+                                ,@(when bind-props '(props))
+                                ,@(when bind-state '(state)))
+                        ,form)))))
+        `(progn
+           (vui--register-component
+            (vui-component-def--create
+             :name ',name
+             :docstring ,docstring
+             :props-spec ',args
+             :initial-state-fn ,(if state-spec
+                                    `(lambda (--props--)
+                                       ;; Bind props so state initializers can reference them
+                                       (let (,@(mapcar (lambda (arg)
+                                                         `(,arg (plist-get --props-- ,(intern (format ":%s" arg)))))
+                                                args))
+                                        (ignore --props-- ,@args)
+                                        (list ,@(cl-mapcan (lambda (var init)
+                                                             (list (intern (format ":%s" var)) init))
+                                                 state-vars state-inits))))
+                                  nil)
+             :render-fn ,(make-body-fn render-form)
+             :on-mount ,(when on-mount-form (make-body-fn on-mount-form))
+             :on-update ,(when on-update-form (make-update-fn on-update-form))
+             :on-unmount ,(when on-unmount-form (make-body-fn on-unmount-form))
+             :should-update ,(when should-update-provided (make-update-fn should-update-form))))
+           ',name)))))
+
+;;; Constructor Functions
+
+(defun vui-text (content &rest props)
+  "Create a text vnode with CONTENT and optional PROPS.
+PROPS is a plist accepting :face, :key, and other text properties.
+
+:face is passed straight through to the `face' text property, so it
+accepts a face symbol (\\='error), or an anonymous face spec - a plist of
+attributes such as (:inherit error :weight ultra-bold) or (:foreground
+\"red\").  Note that colors must be strings (\"red\", not the symbol red),
+and there is no bare-symbol shorthand: write (:inherit error ...), not
+(error ...)."
+  (declare (indent 1))
+  (vui-vnode-text--create
+   :content content
+   :face (plist-get props :face)
+   :key (plist-get props :key)
+   :properties (cl-loop for (k v) on props by #'cddr
+                        unless (memq k '(:face :key))
+                        append (list k v))))
+
+(defun vui-fragment (&rest children)
+  "Create a fragment vnode containing CHILDREN."
+  (vui-vnode-fragment--create :children children))
+
+(defun vui-newline (&optional key)
+  "Create a newline vnode with optional KEY."
+  (vui-vnode-newline--create :key key))
+
+(defun vui-space (&optional width key)
+  "Create a space vnode with WIDTH spaces (default 1) and optional KEY."
+  (vui-vnode-space--create :width (or width 1) :key key))
+
+(defun vui-button (label &rest props)
+  "Create a button vnode with LABEL and optional PROPS.
+PROPS is a plist accepting :on-click, :face, :disabled, :max-width,
+:no-decoration, :help-echo, :tab-order, :keymap, :key.
+When :max-width is set, the button will truncate its label to fit.
+When :no-decoration is t, the button renders without [ ] brackets.
+When :help-echo is nil, tooltip is disabled (improves performance).
+When :help-echo is a string, that string is used as tooltip.
+When :tab-order is -1, button is not reachable via TAB.
+When :keymap is set, this keymap is active when point is on the button."
+  (declare (indent 1))
+  (vui-vnode-button--create
+   :label label
+   :on-click (plist-get props :on-click)
+   :face (plist-get props :face)
+   :disabled-p (plist-get props :disabled)
+   :max-width (plist-get props :max-width)
+   :no-decoration (plist-get props :no-decoration)
+   :help-echo (if (plist-member props :help-echo)
+                  (plist-get props :help-echo)
+                :default)
+   :tab-order (plist-get props :tab-order)
+   :keymap (plist-get props :keymap)
+   :key (plist-get props :key)))
+
+(cl-defun vui-field (&key value size placeholder on-change on-submit key face secret)
+  "Create a field vnode.
+All arguments are keyword-based:
+  :VALUE       - initial field content (defaults to empty string)
+  :SIZE        - field width in characters
+  :PLACEHOLDER - hint text shown in `vui-field-placeholder' face
+                 while the field is empty
+  :ON-CHANGE   - called with value on each change (triggers re-render)
+  :ON-SUBMIT   - called with value when user presses RET (no re-render)
+  :KEY         - identifier for `vui-field-value' lookup
+  :FACE        - text face
+  :SECRET      - if non-nil, hide input (for passwords)
+
+This is a simple string-based primitive.  For typed fields with
+parsing and validation, use `vui-typed-field' from vui-components.el.
+
+Examples:
+  (vui-field :size 20 :key \\='my-input)
+  (vui-field :value \"initial\" :size 20 :on-submit #\\='handle-submit)"
+  (vui-vnode-field--create
+   :value (or value "")
+   :size size
+   :placeholder placeholder
+   :on-change on-change
+   :on-submit on-submit
+   :face face
+   :secret-p secret
+   :key key))
+
+(defun vui-field-value (key)
+  "Get the current value of a field identified by KEY.
+Returns the field's current text, or nil if no field with KEY exists.
+Use this to read field values in button callbacks without triggering re-renders.
+
+Example:
+  (vui-field :key \\='my-input :size 20)
+  (vui-button \"Submit\"
+    :on-click (lambda ()
+                (let ((text (vui-field-value \\='my-input)))
+                  ...)))"
+  (catch 'found
+    (dolist (w widget-field-list)
+      (when (and (eq (car w) 'editable-field)
+                 (eq (widget-get w :vui-key) key))
+        (throw 'found (widget-value w))))))
+
+(defun vui-checkbox (&rest props)
+  "Create a checkbox vnode.
+PROPS is a plist accepting:
+  :checked BOOL - whether checkbox is checked
+  :on-change FN - called with new boolean value when toggled
+  :label STRING - optional label after checkbox
+  :key KEY - for reconciliation
+
+Usage: (vui-checkbox :checked t :on-change (lambda (v) ...))"
+  (vui-vnode-checkbox--create
+   :checked-p (plist-get props :checked)
+   :on-change (plist-get props :on-change)
+   :label (plist-get props :label)
+   :key (plist-get props :key)))
+
+(defun vui-select (&rest args)
+  "Create a select vnode for choosing from options.
+ARGS is a plist accepting:
+  :value VALUE - current selection (or nil)
+  :options OPTIONS - list of (value . label) cons cells or strings
+  :on-change FN - called with the VALUE of the selected option
+  :prompt STRING - minibuffer prompt (default \"Select: \")
+  :key KEY - for reconciliation
+
+For (value . label) options, completion candidates and the button
+text show the LABELs, while :on-change receives the corresponding
+VALUE (which may be any Lisp object, e.g. a symbol or number).
+Labels should be unique; when they are not, the first matching
+option wins.  Plain options are their own label.
+
+Usage: (vui-select :value \"apple\"
+                   :options \\='((\"apple\" . \"Apple\") (\"banana\" . \"Banana\"))
+                   :on-change (lambda (v) ...))"
+  (vui-vnode-select--create
+   :value (plist-get args :value)
+   :options (plist-get args :options)
+   :on-change (plist-get args :on-change)
+   :prompt (or (plist-get args :prompt) "Select: ")
+   :key (plist-get args :key)))
+
+(defun vui-hstack (&rest args)
+  "Create a horizontal stack layout.
+ARGS can start with keyword options, followed by children.
+Options: :spacing N (spaces between children, default 1)
+         :indent N (inherited indent, usually set by parent vstack)
+         :face FACE (applied beneath the children's own faces,
+                     covering separator spacing too)
+         :keymap MAP (cascades beneath the children's own keymaps,
+                      see `vui-region')
+         :key KEY (for reconciliation)
+
+Usage: (vui-hstack child1 child2 child3)
+       (vui-hstack :spacing 2 child1 child2)"
+  (let ((spacing 1)
+        (indent 0)
+        (face nil)
+        (keymap nil)
+        (key nil)
+        (children nil))
+    ;; Parse keyword arguments
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:spacing (setq spacing (pop args)))
+        (:indent (setq indent (pop args)))
+        (:face (setq face (pop args)))
+        (:keymap (setq keymap (pop args)))
+        (:key (setq key (pop args)))))
+    ;; Remaining args are children
+    (setq children (remq nil (flatten-list args)))
+    (vui-vnode-hstack--create
+     :children children
+     :spacing spacing
+     :indent indent
+     :face face
+     :keymap keymap
+     :key key)))
+
+(defun vui-vstack (&rest args)
+  "Create a vertical stack layout.
+ARGS can start with keyword options, followed by children.
+Options: :spacing N (blank lines between children, default 0)
+         :indent N (left indent in spaces, default 0)
+         :face FACE (applied beneath the children's own faces,
+                     covering indentation and blank lines too)
+         :keymap MAP (cascades beneath the children's own keymaps,
+                      see `vui-region')
+         :key KEY (for reconciliation)
+
+Usage: (vui-vstack child1 child2 child3)
+       (vui-vstack :spacing 1 child1 child2)
+       (vui-vstack :indent 2 child1 child2)"
+  (let ((spacing 0)
+        (indent 0)
+        (face nil)
+        (keymap nil)
+        (key nil)
+        (children nil))
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:spacing (setq spacing (pop args)))
+        (:indent (setq indent (pop args)))
+        (:face (setq face (pop args)))
+        (:keymap (setq keymap (pop args)))
+        (:key (setq key (pop args)))))
+    (setq children (remq nil (flatten-list args)))
+    (vui-vnode-vstack--create
+     :children children
+     :spacing spacing
+     :indent indent
+     :face face
+     :keymap keymap
+     :key key)))
+
+(defun vui-box (child &rest props)
+  "Create a fixed-width box containing CHILD.
+PROPS is a plist accepting:
+  :width N - width in characters (default 20)
+  :align ALIGN - :left, :center, or :right (default :left)
+  :padding-left N - left padding (default 0)
+  :padding-right N - right padding (default 0)
+  :face FACE - applied beneath the child's own faces, covering the
+               box's padding and alignment fill too
+  :keymap MAP - cascades beneath the child's own keymaps, see
+                `vui-region'
+  :key KEY - for reconciliation
+
+Usage: (vui-box (vui-text \"hello\") :width 20 :align :center)"
+  (declare (indent 1))
+  (vui-vnode-box--create
+   :child child
+   :width (or (plist-get props :width) 20)
+   :align (or (plist-get props :align) :left)
+   :padding-left (or (plist-get props :padding-left) 0)
+   :padding-right (or (plist-get props :padding-right) 0)
+   :face (plist-get props :face)
+   :keymap (plist-get props :keymap)
+   :key (plist-get props :key)))
+
+(defun vui-table (&rest args)
+  "Create a table layout.
+
+ARGS should contain :columns and :rows.
+
+Column spec properties (each column is a plist):
+  :header STRING  - Header text (optional)
+  :width N        - Fixed width in characters
+  :min-width N    - Minimum width, expand for content (default 1)
+  :align ALIGN    - :left (default), :center, :right
+
+Table properties:
+  :columns LIST      - List of column specs
+  :rows LIST         - List of rows, each row is a list of cell contents
+  :border MODE       - nil (default), :ascii, :unicode
+  :sticky-header BOOL - keep the header row visible while scrolling:
+                     the header renders into the buffer as usual, and
+                     a copy is pinned in `header-line-format' whenever
+                     the window is scrolled into the table's body (the
+                     in-buffer header row is above the window start).
+                     Windows outside the table pin nothing, and each
+                     sticky table pins its own header as the window
+                     moves through it.  Requires plain string headers.
+                     The previous `header-line-format' is restored on
+                     unmount.
+  :header-face FACE  - face for header cells (default `vui-table-header')
+  :border-face FACE  - face for border characters (default `vui-table-border')
+  :key KEY           - for reconciliation
+
+Cell contents can be strings or vnodes.
+
+Example:
+  (vui-table
+    :columns \\='((:header \"Name\" :min-width 10)
+               (:header \"Price\" :width 8 :align :right)
+               (:header \"Qty\" :width 5 :align :right))
+    :rows \\='((\"Apple\" \"$1.50\" \"10\")
+            (\"Banana\" \"$0.75\" \"25\"))
+    :border :ascii)"
+  (let ((columns (plist-get args :columns))
+        (rows (plist-get args :rows))
+        (border (plist-get args :border))
+        (key (plist-get args :key)))
+    (vui-vnode-table--create
+     :columns columns
+     :rows rows
+     :border border
+     :sticky-header (plist-get args :sticky-header)
+     :header-face (plist-get args :header-face)
+     :border-face (plist-get args :border-face)
+     :key key)))
+
+(defun vui-region (&rest args)
+  "Apply container-level styling to children.
+ARGS can start with keyword options, followed by children.
+
+Options:
+  :face FACE   - applied to the children's whole extent, beneath any
+                 faces the children set themselves, so child faces
+                 win.  Whitespace inserted by nested layout
+                 containers (separators, padding, indentation) is
+                 covered too.
+  :keymap MAP  - active over the children's extent.  Bindings
+                 cascade: a nested region's or a button's own keymap
+                 wins for keys it defines, unbound keys fall through
+                 to MAP, and keys unbound in MAP fall through to the
+                 buffer's usual keymaps.  Input fields keep their own
+                 keymap.
+  :key KEY     - for reconciliation
+
+Usage:
+  (vui-region :face \\='highlight :keymap my-map
+    (vui-hstack child1 child2))"
+  (let ((face nil)
+        (keymap nil)
+        (key nil)
+        (children nil))
+    ;; Parse keyword arguments
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:face (setq face (pop args)))
+        (:keymap (setq keymap (pop args)))
+        (:key (setq key (pop args)))))
+    ;; Remaining args are children
+    (setq children (remq nil (flatten-list args)))
+    (vui-vnode-region--create
+     :children children
+     :face face
+     :keymap keymap
+     :key key)))
+
+(defun vui-flex (&rest args)
+  "Create a horizontal row that distributes a total width among children.
+ARGS can start with keyword options, followed by children.
+
+Options:
+  :width W     - the total width to distribute.  A number, a function
+                 called at render time, or one of the symbols
+                 `fill-column' (the default) and `window' (the
+                 selected window's width).
+  :spacing N   - spaces between children (default 1)
+  :justify J   - what to do with leftover width when no child grows:
+                 :start (default), :center, :end, or :space-between
+  :indent N    - inherited indent, set by a parent vstack; subtracted
+                 from the total width
+  :wrap W      - non-nil: children wrap into rows in source order when
+                 their widths stop fitting the total (see below)
+  :face FACE   - applied beneath the children's own faces
+  :keymap MAP  - cascades beneath the children's own keymaps, see
+                 `vui-region'
+  :key KEY     - for reconciliation
+
+Children render at their natural width.  Wrap a child in
+`vui-flex-item' to give it a proportional share of the leftover
+width instead.  When the children's natural widths already exceed
+the total, everything renders at natural width and growers get zero.
+
+Without :wrap, children are assumed to render on a single line;
+multi-line children are measured by their widest line, but the row
+layout does not account for their extra lines.
+
+With :wrap, children fill a row while they fit and continue on the
+next row; each row distributes width on its own (growers grow into
+their row's leftover, `vui-flex-item' :min-width lets a child shrink).
+A row whose children are all single-line renders them in place, like a
+non-wrapped flex; a row containing a multi-line child is composed from
+the children's rendered text, so a table-like panel row keeps its
+lines side by side.  Composed rows are content: buttons keep working,
+but components in them never mount - no state, no lifecycle, and
+`vui-set-state' from inside them does nothing - and widget fields do
+not survive composition.  Keep stateful components on single-line
+rows (or outside :wrap), and give components a :key so measurement
+matches them exactly (unkeyed same-type siblings around a composed
+row or a function grower can measure as each other).  :justify is not
+applied under :wrap.
+
+Usage:
+  (vui-flex :width \\='fill-column
+    (vui-text \"Name:\")
+    (vui-flex-item :grow 1
+      (lambda (width) (vui-field :size width)))
+    (vui-button \"Save\"))"
+  (let ((width 'fill-column)
+        (spacing 1)
+        (justify :start)
+        (indent 0)
+        (wrap nil)
+        (face nil)
+        (keymap nil)
+        (key nil)
+        (children nil))
+    ;; Parse keyword arguments
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:width (setq width (pop args)))
+        (:spacing (setq spacing (pop args)))
+        (:justify (setq justify (pop args)))
+        (:indent (setq indent (pop args)))
+        (:wrap (setq wrap (pop args)))
+        (:face (setq face (pop args)))
+        (:keymap (setq keymap (pop args)))
+        (:key (setq key (pop args)))))
+    ;; Remaining args are children
+    (setq children (remq nil (flatten-list args)))
+    (vui-vnode-flex--create
+     :children children
+     :spacing spacing
+     :width width
+     :justify justify
+     :indent indent
+     :wrap wrap
+     :face face
+     :keymap keymap
+     :key key)))
+
+(defun vui-flex-item (&rest args)
+  "Wrap a child of `vui-flex' so it grows into leftover width.
+ARGS can start with keyword options, followed by the child.
+
+Options:
+  :grow N      - proportional weight for distributing leftover width
+                 among growing children (default 1)
+  :min-width M - under `vui-flex' :wrap, the minimum width (in
+                 characters) the child occupies.  A function child
+                 renders at whatever width its row assigns, so for it
+                 M is the floor it may shrink to when the row runs out
+                 of width (and its width during row partitioning).  A
+                 vnode child renders at one width and never shrinks;
+                 for it M only raises the width it occupies, padded.
+                 Ignored without :wrap.
+  :key KEY     - for reconciliation
+
+The child is either a vnode - rendered inside a box padded to the
+allotted width - or a function called with the allotted width that
+returns a vnode, which is what lets fields and other sized content
+actually fill the space:
+
+  (vui-flex-item :grow 1
+    (lambda (width) (vui-field :size width)))
+
+Outside of `vui-flex', the child renders at its natural width."
+  (let ((grow 1)
+        (min-width nil)
+        (key nil)
+        (child nil))
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:grow (setq grow (pop args)))
+        (:min-width (setq min-width (pop args)))
+        (:key (setq key (pop args)))))
+    (setq child (car args))
+    (vui-vnode-flex-item--create
+     :child child
+     :grow grow
+     :min-width min-width
+     :key key)))
+
+(defun vui-grid (&rest args)
+  "Create a responsive grid of equal-width tracks.
+ARGS can start with keyword options, followed by the cells.
+
+Options:
+  :columns N          - the column count to aim for (default 2)
+  :min-column-width M - smallest acceptable track, in characters; the
+                        column count falls until tracks of at least M
+                        fit the total, never below one column
+  :width W            - the total width, like `vui-flex' :width
+                        (default `fill-column')
+  :spacing N          - gap between tracks (default 1)
+  :row-spacing N      - blank lines between rows (default 0)
+  :indent N           - inherited indent, set by a parent vstack;
+                        subtracted from the total width
+  :face FACE          - applied beneath the cells' own faces
+  :keymap MAP         - cascades beneath the cells' own keymaps
+  :key KEY            - for reconciliation
+
+Cells fill rows in source order, so the final row may be incomplete.
+Every track is the same width, remainders going to the earlier tracks;
+a cell wider than its track widens that whole column, across every
+row, so columns stay aligned.  A cell may be a function: it is called
+with the track width in characters and must return a vnode - how a
+table or field fills its track exactly.
+
+Identity follows `vui-flex' :wrap: a row of single-line cells renders
+in place (components and widgets keep their identity), a row with a
+multi-line cell is composed as text - buttons keep working, but
+components in composed rows never mount (no state, no lifecycle) and
+widget fields do not survive composition.  Keep stateful components
+in single-line cells, and give components a :key so measurement
+matches them exactly.  A cell that renders empty keeps its track, so
+columns stay aligned.
+
+Usage:
+  (vui-grid :width \\='window :columns 3 :min-column-width 24
+    (panel-1) (panel-2) (panel-3))"
+  (let ((columns 2)
+        (min-column-width nil)
+        (width 'fill-column)
+        (spacing 1)
+        (row-spacing 0)
+        (indent 0)
+        (face nil)
+        (keymap nil)
+        (key nil)
+        (children nil))
+    (while (and args (keywordp (car args)))
+      (pcase (pop args)
+        (:columns (setq columns (pop args)))
+        (:min-column-width (setq min-column-width (pop args)))
+        (:width (setq width (pop args)))
+        (:spacing (setq spacing (pop args)))
+        (:row-spacing (setq row-spacing (pop args)))
+        (:indent (setq indent (pop args)))
+        (:face (setq face (pop args)))
+        (:keymap (setq keymap (pop args)))
+        (:key (setq key (pop args)))))
+    ;; Flatten nested lists of cells, but keep functions whole: an
+    ;; interpreted closure is itself a list and must not be flattened.
+    (dolist (arg args)
+      (cond
+       ((null arg))
+       ((functionp arg) (push arg children))
+       ((and (listp arg) (not (vui-vnode-p arg)))
+        (dolist (sub (remq nil (flatten-list arg)))
+          (push sub children)))
+       (t (push arg children))))
+    (vui-vnode-grid--create
+     :children (nreverse children)
+     :columns columns
+     :min-column-width min-column-width
+     :width width
+     :spacing spacing
+     :row-spacing row-spacing
+     :indent indent
+     :face face
+     :keymap keymap
+     :key key)))
+
+(cl-defun vui-error-boundary (&key fallback on-error id children)
+  "Create an error boundary that catches errors in CHILDREN.
+
+FALLBACK is a function (lambda (error) vnode) called to render when
+an error is caught. It receives the error object and should return
+a vnode to display.
+
+ON-ERROR is an optional callback (lambda (error)) called once when
+an error is first caught, useful for logging.
+
+ID is an optional identifier for this boundary, used to track error
+state across re-renders and to target it with
+`vui-reset-error-boundary'.  When omitted, the boundary's identity
+is derived from its position in the rendered tree, which is stable
+across re-renders as long as the tree shape around it does not
+change.  Provide an explicit ID when the boundary moves around the
+tree or when you need to reset it by name.
+
+Error state is scoped to the mounted tree (or to the buffer for
+static `vui-render' trees), so two apps using the same ID do not
+interfere, and a fresh mount starts with a clean slate.
+
+CHILDREN are the vnodes to render normally when no error.
+
+Example:
+  (vui-error-boundary
+    :fallback (lambda (err)
+                (vui-fragment
+                  (vui-text (format \"Error: %s\" (error-message-string err))
+                            :face \\='error)
+                  (vui-newline)
+                  (vui-button \"Retry\"
+                    :on-click (lambda ()
+                                (vui-reset-error-boundary \\='my-boundary)))))
+    :id \\='my-boundary
+    :children (list (my-component)))"
+  (vui-vnode-error-boundary--create
+   :children children
+   :fallback fallback
+   :on-error on-error
+   :id id))
+
+(defun vui--error-boundary-table ()
+  "Return the error boundary table for the current render context.
+Uses the root instance's table when a mounted tree is in scope, or
+a buffer-local table for static `vui-render' trees.  The table is
+created lazily."
+  (if-let* ((root (vui--get-root-instance)))
+      (or (vui-instance-boundary-errors root)
+          (setf (vui-instance-boundary-errors root)
+                (make-hash-table :test 'equal)))
+    (or vui--error-boundary-errors
+        (setq-local vui--error-boundary-errors
+                    (make-hash-table :test 'equal)))))
+
+(defun vui-reset-error-boundary (&optional id)
+  "Reset the error state for error boundary with ID.
+This clears the caught error, allowing the boundary to re-render
+its children on the next render cycle.  When ID is nil, the error
+state of all boundaries in the current tree is cleared.
+
+Must be called with the relevant tree in scope: from a component
+callback (e.g. a button's on-click handler) or with the VUI buffer
+current."
+  (let ((table (vui--error-boundary-table)))
+    (if id
+        (remhash id table)
+      (clrhash table)))
+  ;; Trigger re-render if we have a root instance
+  (when-let* ((root (vui--get-root-instance)))
+    (vui--rerender-instance root)))
+
+(defun vui-list (items render-fn &rest args)
+  "Render a list of ITEMS using RENDER-FN.
+RENDER-FN is called with each item and should return a vnode.
+
+ARGS may start with an optional positional KEY-FN, followed by
+keyword options.  KEY-FN extracts a unique key from each item
+\(default: the item itself); since a keyword is never a valid key
+function, a keyword in that position simply starts the options:
+
+  :vertical BOOL - if non-nil (default t), returns a vstack;
+                   otherwise returns an hstack
+  :indent N      - left indentation in spaces (default 0)
+  :spacing N     - blank lines between items for vertical lists
+                   (default 0), or spaces between items for
+                   horizontal lists (default 1)
+  :face FACE     - applied beneath the items' own faces, covering
+                   separators and indentation too
+  :keymap MAP    - cascades beneath the items' own keymaps, see
+                   `vui-region'
+
+This ensures proper reconciliation when items are added, removed, or
+reordered.
+
+Usage:
+  (vui-list items
+            (lambda (item) (vui-text (plist-get item :name)))
+            (lambda (item) (plist-get item :id)))
+
+  ;; With indentation (key-fn may be omitted):
+  (vui-list items render-fn :indent 2)
+  (vui-list items render-fn key-fn :indent 2)
+
+  ;; Horizontal list:
+  (vui-list items render-fn :vertical nil)"
+  (let ((key-fn nil))
+    ;; Optional positional KEY-FN; a keyword here starts the options
+    (when (and args (not (keywordp (car args))))
+      (setq key-fn (pop args)))
+    (cl-loop for (option _value) on args by #'cddr
+             unless (memq option '(:vertical :indent :spacing :face :keymap))
+             do (error "vui-list: unknown option %S" option))
+    (vui--list-1 items render-fn key-fn
+                 (if (plist-member args :vertical)
+                     (plist-get args :vertical)
+                   t)
+                 (or (plist-get args :indent) 0)
+                 (plist-get args :spacing)
+                 (plist-get args :face)
+                 (plist-get args :keymap))))
+
+(defun vui--list-1 (items render-fn key-fn vertical indent spacing face keymap)
+  "Build the vnode for `vui-list'.
+ITEMS, RENDER-FN, KEY-FN, VERTICAL, INDENT, SPACING, FACE, KEYMAP as
+in `vui-list'."
+  (let* ((key-fn (or key-fn #'identity))
+         (children (let ((result nil))
+                     (dolist (item items (nreverse result))
+                       (let* ((key (funcall key-fn item))
+                              (vnode (funcall render-fn item)))
+                         ;; Skip nil vnodes entirely
+                         (when vnode
+                           ;; Set key on the vnode if it supports it
+                           (when (vui-vnode-p vnode)
+                             (setf (vui-vnode-key vnode) key))
+                           (push vnode result)))))))
+    (if vertical
+        (vui-vnode-vstack--create
+         :children children
+         :indent indent
+         :spacing (or spacing 0)
+         :face face
+         :keymap keymap)
+      (vui-vnode-hstack--create
+       :children children
+       :indent indent
+       :spacing (or spacing 1)
+       :face face
+       :keymap keymap))))
+
+(defun vui-component (type &rest props-and-children)
+  "Create a component vnode of TYPE with PROPS-AND-CHILDREN.
+TYPE is a symbol naming a defined component.
+PROPS-AND-CHILDREN is a plist of props; the :children entry holds the
+child vnodes and may appear anywhere in the plist."
+  (declare (indent 1))
+  (let ((props nil)
+        (children nil)
+        (rest props-and-children))
+    ;; Parse props and children
+    (while rest
+      (if (eq (car rest) :children)
+          (setq children (cadr rest))
+        (setq props (append props (list (car rest) (cadr rest)))))
+      (setq rest (cddr rest)))
+    (vui-vnode-component--create
+     :type type
+     :props props
+     :children children
+     :key (plist-get props :key))))
+
+;;; State Management
+
+(defvar vui--root-instance nil
+  "The root component instance for the current buffer.")
+
+(defvar-local vui--inline-instances nil
+  "Inline instances mounted in this buffer via `vui-mount-inline'.
+Unlike `vui--root-instance', a buffer can host any number of inline
+instances, each owning a region delimited by its markers.")
+
+(defvar vui--batch-depth 0
+  "Current nesting depth of `vui-batch' calls.")
+
+(defvar vui--render-pending-p nil
+  "Non-nil if a re-render is pending (during batched updates).")
+
+(defcustom vui-render-delay 0.01
+  "Seconds to wait before rendering when using deferred rendering.
+This delay allows multiple state changes to be batched into a single
+re-render for better performance.  Set to nil to render immediately."
+  :type '(choice (number :tag "Delay in seconds")
+          (const :tag "Disabled" nil))
+  :group 'vui)
+
+(defcustom vui-incremental-render nil
+  "When non-nil, re-render eligible buffers by patching changed regions.
+
+Experimental (issue #82).  When the root component renders a flat
+list of plain-content children (a `vui-fragment' or an unindented
+`vui-vstack' of `vui-text' / `vui-newline' / `vui-space' nodes - e.g.
+a streaming log or a large text list), a re-render patches only the
+segments that changed instead of erasing and rebuilding the whole
+buffer.  Anything else (components, widgets, other containers,
+indented vstacks) falls back to the full erase+rebuild, so behavior
+is unchanged for those."
+  :type 'boolean
+  :group 'vui)
+
+(defun vui--find-state-owner (instance key)
+  "Find the instance that owns state KEY, starting from INSTANCE.
+Searches up the parent chain. Returns INSTANCE if KEY exists in its state,
+or the nearest ancestor that has KEY, or INSTANCE as fallback."
+  (let ((current instance)
+        (found nil))
+    ;; First check if current instance has this key
+    (when (plist-member (vui-instance-state current) key)
+      (setq found current))
+    ;; If not found, search up parent chain
+    (unless found
+      (setq current (vui-instance-parent instance))
+      (while (and current (not found))
+        (when (plist-member (vui-instance-state current) key)
+          (setq found current))
+        (setq current (vui-instance-parent current))))
+    ;; Return found instance or original as fallback
+    (or found instance)))
+
+(defun vui--state-updater-p (value)
+  "Non-nil if VALUE should be treated as a functional state updater.
+A functional update is a callable that takes the current value and returns
+the new one, so VALUE must be able to accept exactly one argument.  A value
+that is `functionp' but cannot - e.g. a data symbol like `all' (a builtin
+since Emacs 31) or `cons' that merely happens to be `fboundp' - is treated
+as a literal value, not an updater."
+  (and (functionp value)
+       (let ((arity (func-arity value)))
+         (and (<= (car arity) 1)
+              (or (eq (cdr arity) 'many)
+                  (>= (cdr arity) 1))))))
+
+(defun vui-set-state (key value)
+  "Set state KEY to VALUE in the appropriate component and re-render.
+Searches for the component that owns KEY, starting from the current
+component and going up the parent chain.
+Must be called from within a component's event handler.
+
+If VALUE is a function that accepts one argument, it is called with the
+current value and the result is used as the new value.  This is useful in
+async callbacks where the captured value may be stale:
+
+  ;; Instead of (1+ count) which captures count at definition time:
+  (vui-set-state :count #\\='1+)
+
+  ;; Or with a lambda for more complex updates:
+  (vui-set-state :items (lambda (old) (cons new-item old)))
+
+A value that cannot take one argument is stored as-is, so a data symbol
+that merely happens to be `fboundp' (e.g. \\='all, a builtin since Emacs 31)
+is kept literally rather than called (see `vui--state-updater-p').
+
+Treat state values as immutable: replace them (as both examples
+above do) rather than mutating them in place with setcar, push, or
+sort.  In-place mutation is invisible to change detection
+\(should-update, on-update, and hook dependency comparisons)."
+  (unless vui--current-instance
+    (error "vui-set-state called outside of component context"))
+  (let* ((target (vui--find-state-owner vui--current-instance key))
+         (current-state (vui-instance-state target))
+         (current-value (plist-get current-state key))
+         (new-value (if (vui--state-updater-p value)
+                        (funcall value current-value)
+                      value)))
+    ;; No component in the chain declares KEY: almost certainly a typo.
+    ;; The set still happens (on the current component), but silently
+    ;; creating state is how typos go unnoticed.
+    (unless (plist-member current-state key)
+      (display-warning
+       'vui
+       (format "vui-set-state: %s is not a state key of any component in scope; setting it on <%s>"
+               key (vui-component-def-name (vui-instance-def target)))
+       :warning))
+    (vui--debug-log 'state-change "<%s> state %s = %S"
+                    (vui-component-def-name (vui-instance-def target))
+                    key new-value)
+    (setf (vui-instance-state target)
+          (plist-put current-state key new-value)))
+  ;; Schedule re-render (respects batching)
+  (vui--schedule-render))
+
+(defmacro vui-with-async-context (&rest body)
+  "Capture current component context for use in async callbacks.
+Returns a function that, when called, restores the component context
+and executes BODY.  Use this when you need to call `vui-set-state'
+from timers, process sentinels, or other async callbacks.
+
+Example:
+  (run-with-timer 1 1
+    (vui-with-async-context
+      (vui-set-state :count #'1+)))  ; Use functional update!
+
+The macro captures:
+- The current buffer
+- The current component instance
+- The root instance
+
+When the returned function is called, it checks that the buffer is
+still alive and that the captured component tree has not been
+unmounted (see `vui-unmount'); if either check fails, BODY is
+skipped.  Otherwise it switches to the buffer and restores the
+component context before executing BODY."
+  (let ((buf (make-symbol "buf"))
+        (instance (make-symbol "instance"))
+        (root (make-symbol "root")))
+    `(let ((,buf (current-buffer))
+           (,instance vui--current-instance)
+           (,root vui--root-instance))
+      (lambda ()
+        (when (and (buffer-live-p ,buf)
+                   (or (null ,root) (vui-instance-buffer ,root)))
+         (with-current-buffer ,buf
+          (let ((vui--current-instance ,instance)
+                (vui--root-instance ,root))
+           ,@body)))))))
+
+(defmacro vui-async-callback (args &rest body)
+  "Create an async callback that captures component context and accepts ARGS.
+Like `vui-with-async-context', but the returned function accepts
+arguments which are bound when executing BODY.
+
+ARGS is a list of parameter names (like a lambda arglist).
+BODY is executed with component context restored and ARGS bound.
+
+Use this when an async operation needs to pass data to your callback.
+Create the callback inside component context (e.g., in `vui-use-effect'),
+then the async operation calls it later with results.
+
+Example:
+  (vui-use-effect ()
+    (my-fetch-data
+      (vui-async-callback (result)
+        (vui-set-state :data result))))
+
+Compare with `vui-with-async-context':
+- `vui-with-async-context' - for fire-and-forget callbacks (timers)
+- `vui-async-callback' - when callback receives data from async operation
+
+Like `vui-with-async-context', the callback does nothing when its
+buffer has been killed or its component tree has been unmounted."
+  (declare (indent defun))
+  (let ((buf (make-symbol "buf"))
+        (instance (make-symbol "instance"))
+        (root (make-symbol "root")))
+    `(let ((,buf (current-buffer))
+           (,instance vui--current-instance)
+           (,root vui--root-instance))
+      (lambda ,args
+        (when (and (buffer-live-p ,buf)
+                   (or (null ,root) (vui-instance-buffer ,root)))
+         (with-current-buffer ,buf
+          (let ((vui--current-instance ,instance)
+                (vui--root-instance ,root))
+           ,@body)))))))
+
+(defun vui--find-root (instance)
+  "Find the root instance by walking up the parent chain from INSTANCE."
+  (when instance
+    (let ((current instance))
+      (while (vui-instance-parent current)
+        (setq current (vui-instance-parent current)))
+      current)))
+
+(defun vui--get-root-instance ()
+  "Get the root instance from current context.
+Checks `vui--root-instance' (buffer-local) first, then tries to find
+it via `vui--current-instance' (works even in different buffer contexts)."
+  (or vui--root-instance
+      (vui--find-root vui--current-instance)))
+
+(defun vui--schedule-render ()
+  "Schedule a re-render of the root instance.
+If inside a `vui-batch', the render is deferred until batch completes.
+Otherwise, render immediately or after delay based on config."
+  (let ((root (vui--get-root-instance)))
+    (when root
+      (if (> vui--batch-depth 0)
+          ;; Inside a batch - just mark as pending
+          (setq vui--render-pending-p t)
+        ;; Not in a batch - render based on config
+        (if vui-render-delay
+            ;; Deferred rendering
+            (vui--schedule-deferred-render-for root)
+          ;; Immediate rendering
+          (vui--rerender-instance root))))))
+
+(defun vui--schedule-deferred-render ()
+  "Schedule a deferred render using current context."
+  (vui--schedule-deferred-render-for (vui--get-root-instance)))
+
+(defun vui--cancel-render-timer (root)
+  "Cancel ROOT's pending deferred-render timer, if any."
+  (when-let* ((timer (vui-instance-render-timer root)))
+    (cancel-timer timer)
+    (setf (vui-instance-render-timer root) nil)))
+
+(defun vui--schedule-deferred-render-for (root)
+  "Schedule a render of ROOT after a short delay.
+Uses a regular timer so the render fires reliably regardless of
+whether Emacs is idle.  The timer is stored on ROOT itself, so each
+mounted root has its own schedule and re-scheduling one root never
+cancels another root's pending render."
+  (when root
+    (vui--cancel-render-timer root)
+    (setf (vui-instance-render-timer root)
+          (run-with-timer
+           vui-render-delay nil
+           (lambda ()
+             (setf (vui-instance-render-timer root) nil)
+             (vui--rerender-instance root))))))
+
+(defmacro vui-batch (&rest body)
+  "Batch state updates in BODY into a single re-render.
+
+Use this when making multiple state changes that should
+result in only one re-render, for better performance.
+
+Example:
+  (vui-batch
+    (vui-set-state \\='count (1+ count))
+    (vui-set-state \\='name \"Bob\"))"
+  ;; Capture root at start before BODY runs (BODY might switch buffers)
+  `(let ((vui--batch-depth (1+ vui--batch-depth))
+         (vui--batch-root (vui--get-root-instance)))
+    (unwind-protect
+        (progn ,@body)
+      (cl-decf vui--batch-depth)
+      (when (and (= vui--batch-depth 0)
+             vui--render-pending-p
+             vui--batch-root)
+       ;; End of outermost batch - schedule deferred re-render
+       ;; Using deferred rendering avoids re-rendering while still
+       ;; inside a widget callback, which can cause issues
+       (setq vui--render-pending-p nil)
+       (if vui-render-delay
+           (vui--schedule-deferred-render-for vui--batch-root)
+         (vui--rerender-instance vui--batch-root))))))
+
+(defun vui-flush-sync ()
+  "Force immediate re-render of the current root, bypassing its pending timer.
+Use when you need the UI to update synchronously.  Pending renders
+scheduled for other roots (other buffers) are not affected."
+  (when vui--root-instance
+    (vui--cancel-render-timer vui--root-instance)
+    (vui--rerender-instance vui--root-instance)))
+
+;;; Effects System
+
+(defmacro vui-use-effect (deps &rest body)
+  "Run BODY as a side effect when DEPS change.
+
+DEPS is a list of variables to watch. The effect runs:
+- After first render
+- After re-render if any dep changed (compared with `equal')
+
+If BODY returns a function, it's called as cleanup before
+the next effect run or on unmount.
+
+Examples:
+  ;; Run once on mount (empty deps)
+  (vui-use-effect ()
+    (message \"Component mounted\"))
+
+  ;; Run when count changes
+  (vui-use-effect (count)
+    (message \"Count is now %d\" count))
+
+  ;; With cleanup
+  (vui-use-effect (user-id)
+    (let ((subscription (subscribe user-id)))
+      (lambda () (unsubscribe subscription))))"
+  (declare (indent 1))
+  `(vui--register-effect
+    (list ,@deps)
+    (lambda () ,@body)))
+
+(defun vui--register-effect (deps effect-fn)
+  "Register an effect with DEPS and EFFECT-FN to run after commit.
+Called from within a component's render function."
+  (unless vui--current-instance
+    (error "vui-use-effect called outside of component context"))
+  (let* ((instance vui--current-instance)
+         (effect-id vui--effect-index)
+         (effects (vui-instance-effects instance))
+         (prev-entry (assq effect-id effects))
+         (prev-deps (cadr prev-entry)))
+    ;; Increment effect counter for next vui-use-effect call
+    (cl-incf vui--effect-index)
+    ;; Check if deps changed (or first run)
+    (when (or (null prev-entry)
+              (not (equal prev-deps deps)))
+      ;; Schedule effect to run after commit
+      (push (list instance effect-id deps effect-fn (cddr prev-entry))
+            vui--pending-effects))))
+
+(defun vui--run-pending-effects ()
+  "Run all pending effects after commit."
+  (let ((effects (nreverse vui--pending-effects)))
+    (setq vui--pending-effects nil)
+    (dolist (effect effects)
+      (let* ((instance (nth 0 effect))
+             (effect-id (nth 1 effect))
+             (deps (nth 2 effect))
+             (effect-fn (nth 3 effect))
+             (prev-cleanup (car (nth 4 effect))))
+        ;; Run cleanup from previous effect (with context for vui-set-state)
+        (when (functionp prev-cleanup)
+          (let ((vui--current-instance instance))
+            (funcall prev-cleanup)))
+        ;; Run new effect, capture cleanup
+        ;; Bind component context so vui-set-state works in effect body
+        (let* ((vui--current-instance instance)
+               (new-cleanup (funcall effect-fn)))
+          ;; Store new deps and cleanup in instance
+          (let ((effects (vui-instance-effects instance)))
+            (setf (vui-instance-effects instance)
+                  (cons (cons effect-id (list deps new-cleanup))
+                        (assq-delete-all effect-id effects)))))))))
+
+(defun vui--cleanup-instance-effects (instance)
+  "Run all cleanup functions for INSTANCE's effects."
+  (dolist (effect-entry (vui-instance-effects instance))
+    (let ((cleanup (cadr (cdr effect-entry))))
+      (when (functionp cleanup)
+        ;; Bind context for consistency (cleanup may call vui-set-state)
+        (let ((vui--current-instance instance))
+          (funcall cleanup)))))
+  (setf (vui-instance-effects instance) nil))
+
+;;; Refs System
+
+(defmacro vui-use-ref (initial-value)
+  "Create a mutable ref that persists across re-renders.
+
+Returns a cons cell whose car is the current value.
+Access via (car ref), set via (setcar ref new-value).
+
+Unlike state, modifying a ref does NOT trigger re-render.
+
+Useful for:
+- Storing previous values
+- Holding timer/process references
+- Mutable values that don't affect rendering
+
+Examples:
+  ;; Store a timer reference
+  (let ((timer-ref (vui-use-ref nil)))
+    (vui-use-effect ()
+      (setcar timer-ref (run-with-timer 1 1 #\\='update))
+      (lambda () (cancel-timer (car timer-ref)))))
+
+  ;; Track previous value
+  (let ((prev-ref (vui-use-ref nil)))
+    (vui-use-effect (value)
+      (message \"Changed from %s to %s\" (car prev-ref) value)
+      (setcar prev-ref value)))
+
+INITIAL-VALUE is the starting value stored in the ref."
+  `(vui--get-or-create-ref ,initial-value))
+
+(defun vui--get-or-create-ref (initial-value)
+  "Get existing ref or create new one with INITIAL-VALUE.
+Called from within a component's render function."
+  (unless vui--current-instance
+    (error "vui-use-ref called outside of component context"))
+  (let* ((instance vui--current-instance)
+         (ref-id vui--ref-index)
+         (refs (or (vui-instance-refs instance)
+                   (let ((h (make-hash-table :test 'eq)))
+                     (setf (vui-instance-refs instance) h)
+                     h))))
+    ;; Increment ref counter for next vui-use-ref call
+    (cl-incf vui--ref-index)
+    ;; Get existing ref or create new one
+    (or (gethash ref-id refs)
+        (let ((ref (cons initial-value nil)))
+          (puthash ref-id ref refs)
+          ref))))
+
+;;; Context API
+
+(defmacro vui-defcontext (name &optional default-value docstring)
+  "Define a context NAME with optional DEFAULT-VALUE.
+
+Creates:
+- `NAME-context': The context object
+- `NAME-provider': Function to create a provider vnode
+- `use-NAME': Convenience function to consume the context value
+
+The symbols derived from NAME alone (`NAME-context', `NAME-provider')
+follow whatever prefix NAME carries, so packages should use a
+prefixed NAME (e.g. `my-pkg-theme').  The generated `use-NAME'
+consumer is convenient in applications and personal configs, but its
+`use-' prefix pollutes the namespace from a package's point of view;
+packages should prefer calling `vui-use-context' on `NAME-context'
+instead.
+
+Example:
+  (vui-defcontext theme \\='light \"The current UI theme.\")
+
+  ;; In a component:
+  (theme-provider \\='dark
+    (vui-component \\='my-button))
+
+  ;; In my-button - either of:
+  (let ((theme (vui-use-context theme-context)))
+    (vui-text (format \"Theme: %s\" theme)))
+  (let ((theme (use-theme)))
+    (vui-text (format \"Theme: %s\" theme)))
+
+DOCSTRING is an optional documentation string for the context."
+  (declare (indent defun))
+  (let ((context-var (intern (format "%s-context" name)))
+        (provider-fn (intern (format "%s-provider" name)))
+        (consumer-fn (intern (format "use-%s" name))))
+    `(progn
+       ;; The context object
+       (defvar ,context-var
+         (vui-context--create
+          :name ',name
+          :default-value ,default-value)
+         ,(or docstring (format "Context for %s." name)))
+
+       ;; Provider function
+       (defun ,provider-fn (value &rest children)
+        ,(format "Provide %s context with VALUE to CHILDREN." name)
+        (declare (indent 1))
+        (vui-vnode-provider--create
+         :context ,context-var
+         :value value
+         :children children))
+
+       ;; Consumer hook
+       (defun ,consumer-fn ()
+        ,(format "Get current %s context value." name)
+        (vui--consume-context ,context-var))
+
+       ',name)))
+
+(defun vui--lookup-context (context)
+  "Return CONTEXT's current value from the context stack, or its default.
+Pure lookup with no side effects (does not record consumption)."
+  (or (cl-loop for binding in vui--context-stack
+               when (eq (vui-context-binding-context binding) context)
+               return (vui-context-binding-value binding))
+      (vui-context-default-value context)))
+
+(defun vui--consume-context (context)
+  "Get the current value of CONTEXT and record that it was consumed.
+Searches up the context stack for a matching provider; returns
+`default-value' if none.  While an instance is rendering, the
+\(CONTEXT . VALUE) pair is recorded so the renderer can later tell
+whether the instance still depends on the same context values."
+  (let ((value (vui--lookup-context context)))
+    ;; The consumed-context record only feeds the flag-gated bailout, so
+    ;; skip the bookkeeping entirely when incremental rendering is off.
+    (when (and vui-incremental-render vui--current-instance)
+      (push (cons context value) vui--consumed-contexts))
+    value))
+
+(defun vui--instance-contexts-unchanged-p (instance)
+  "Return non-nil if every context INSTANCE consumed still has its value.
+Compared against the live context stack, so a provider change above
+INSTANCE makes this nil and blocks a bailout."
+  (cl-every (lambda (pair)
+              (equal (cdr pair) (vui--lookup-context (car pair))))
+            (vui-instance-consumed-contexts instance)))
+
+(defun vui-use-context (context)
+  "Return the current value of CONTEXT.
+CONTEXT is a context object, i.e. the NAME-context variable defined
+by `vui-defcontext'.  Searches the providers in scope at the current
+render position; returns the context's default value when no
+provider is found.
+
+This is the namespace-clean way to consume a context - equivalent to
+the generated `use-NAME' function:
+
+  (vui-defcontext my-pkg-theme \\='light)
+
+  ;; In a component render:
+  (vui-use-context my-pkg-theme-context)
+
+Must be called during render (inside a component's :render form or a
+provider's children)."
+  (vui--consume-context context))
+
+;;; Memoized Callbacks
+
+(defmacro vui-use-callback (deps &rest body)
+  "Create a memoized callback that only changes when DEPS change.
+
+Returns a function that remains stable (eq-identical) across re-renders
+as long as DEPS do not change.  This is useful for optimizing child
+components that depend on callback reference equality.
+
+DEPS is a list of variables to watch.  The callback is regenerated when
+any dep changes (compared with `equal', except that strings must also
+match in text properties - a dep whose face changed counts as changed).
+
+Example:
+  ;; Stable callback that only changes when item-id changes
+  (let ((handle-delete (vui-use-callback (item-id)
+                         (delete-item item-id))))
+    (vui-component \\='item-button :on-click handle-delete))
+
+Note: Unlike React useCallback, the BODY is the callback itself,
+not a function returning a callback."
+  (declare (indent 1))
+  `(vui--get-or-update-callback
+    (list ,@deps)
+    (lambda () ,@body)))
+
+(defmacro vui-use-callback* (deps &rest body)
+  "Like `vui-use-callback' but with configurable comparison mode.
+
+DEPS is a list of variables to watch.
+BODY may start with `:compare MODE' to select how deps are compared:
+  `eq'     - identity comparison (fastest, for symbols/numbers)
+  `equal'  - structural comparison (default); text-property-aware
+             for strings (see `vui--deps-equal-p')
+  form     - any other form is evaluated and must yield a function
+             (lambda (old-deps new-deps) bool)
+
+The bare symbols `eq' and `equal' and the quoted forms \\='eq and
+\\='equal are interchangeable.
+
+Examples:
+  ;; Use eq for fast symbol comparison
+  (vui-use-callback* (action-type)
+    :compare eq
+    (dispatch action-type))
+
+  ;; Custom comparison function
+  (vui-use-callback* (items)
+    :compare (lambda (old new) (equal (car old) (car new)))
+    (process items))
+
+The rest of BODY is the callback expression itself, not a function
+returning a callback."
+  (declare (indent 1))
+  (let ((compare nil))
+    (when (eq (car body) :compare)
+      (setq compare (cadr body)
+            body (cddr body)))
+    ;; Bare `eq' / `equal' name the built-in comparison modes; any
+    ;; other form is evaluated (a quoted symbol, lambda, #'fn, ...).
+    (when (memq compare '(eq equal))
+      (setq compare (list 'quote compare)))
+    `(vui--get-or-update-callback
+      (list ,@deps)
+      (lambda () ,@body)
+      ,compare)))
+
+(defun vui--deps-equal-p (old-deps new-deps compare)
+  "Compare OLD-DEPS and NEW-DEPS using COMPARE mode.
+COMPARE can be:
+  `eq'     - identity comparison (fastest)
+  `equal'  - structural comparison (default)
+  function - custom (lambda (old new) bool)
+
+The `equal' mode is text-property-aware (`vui--vnode-equal'): a dep
+string that changed only in properties (same characters, different
+face) counts as changed.  Functions in deps keep plain `equal'
+semantics, so a closure rebuilt on every render with an `equal'
+captured environment does not defeat the cache."
+  (cond
+   ((eq compare 'eq)
+    (and (= (length old-deps) (length new-deps))
+         (cl-every #'eq old-deps new-deps)))
+   ((eq compare 'equal)
+    (vui--vnode-equal old-deps new-deps t))
+   ((functionp compare)
+    (funcall compare old-deps new-deps))
+   (t (vui--vnode-equal old-deps new-deps t))))
+
+(defun vui--get-or-update-callback (deps callback-fn &optional compare)
+  "Return cached callback or update it if DEPS changed.
+COMPARE specifies comparison mode (default `equal').
+Called from within a component's render function.
+CALLBACK-FN is a thunk that returns the actual callback."
+  (unless vui--current-instance
+    (error "vui-use-callback called outside of component context"))
+  (let* ((instance vui--current-instance)
+         (callback-id vui--callback-index)
+         (cache (or (vui-instance-callbacks instance)
+                    (let ((h (make-hash-table :test 'eq)))
+                      (setf (vui-instance-callbacks instance) h)
+                      h)))
+         (cached (gethash callback-id cache))
+         (cached-deps (car cached))
+         (cached-fn (cdr cached))
+         (cmp (or compare 'equal)))
+    ;; Increment callback counter for next vui-use-callback call
+    (cl-incf vui--callback-index)
+    ;; Return cached callback if deps unchanged
+    (if (and cached (vui--deps-equal-p cached-deps deps cmp))
+        cached-fn
+      ;; Create new callback and cache it
+      (let ((new-fn callback-fn))
+        (puthash callback-id (cons deps new-fn) cache)
+        new-fn))))
+
+;;; Memoized Values
+
+(defmacro vui-use-memo (deps &rest body)
+  "Compute and cache a value that only changes when DEPS change.
+
+Similar to `vui-use-callback' but for computed values rather than functions.
+BODY is evaluated only when DEPS change, and the result is cached.
+
+DEPS is a list of variables to watch.  The value is recomputed when any
+dep changes (compared with `equal', except that strings must also
+match in text properties - a dep whose face changed counts as changed).
+
+Example:
+  ;; Expensive filtering only runs when items or filter change
+  (let ((filtered (vui-use-memo (items filter)
+                    (seq-filter (lambda (i) (string-match filter i)) items))))
+    (vui-list filtered #\\='vui-text))"
+  (declare (indent 1))
+  `(vui--get-or-update-memo
+    (list ,@deps)
+    (lambda () ,@body)))
+
+(defmacro vui-use-memo* (deps &rest body)
+  "Like `vui-use-memo' but with configurable comparison mode.
+
+DEPS is a list of variables to watch.
+BODY may start with `:compare MODE' to select how deps are compared:
+  `eq'     - identity comparison (fastest, for symbols/numbers)
+  `equal'  - structural comparison (default); text-property-aware
+             for strings (see `vui--deps-equal-p')
+  form     - any other form is evaluated and must yield a function
+             (lambda (old-deps new-deps) bool)
+
+The bare symbols `eq' and `equal' and the quoted forms \\='eq and
+\\='equal are interchangeable.
+
+Examples:
+  ;; Use eq for fast symbol comparison
+  (vui-use-memo* (mode)
+    :compare eq
+    (expensive-lookup mode))
+
+  ;; Custom comparison function
+  (vui-use-memo* (items)
+    :compare (lambda (old new) (equal (car old) (car new)))
+    (process-items items))
+
+The rest of BODY is the expression to compute and cache."
+  (declare (indent 1))
+  (let ((compare nil))
+    (when (eq (car body) :compare)
+      (setq compare (cadr body)
+            body (cddr body)))
+    ;; Bare `eq' / `equal' name the built-in comparison modes; any
+    ;; other form is evaluated (a quoted symbol, lambda, #'fn, ...).
+    (when (memq compare '(eq equal))
+      (setq compare (list 'quote compare)))
+    `(vui--get-or-update-memo
+      (list ,@deps)
+      (lambda () ,@body)
+      ,compare)))
+
+(defun vui--get-or-update-memo (deps compute-fn &optional compare)
+  "Return cached value or recompute if DEPS changed.
+COMPARE specifies comparison mode (default `equal').
+Called from within a component's render function.
+COMPUTE-FN is a thunk that computes the value to cache."
+  (unless vui--current-instance
+    (error "vui-use-memo called outside of component context"))
+  (let* ((instance vui--current-instance)
+         (memo-id vui--memo-index)
+         (cache (or (vui-instance-memos instance)
+                    (let ((h (make-hash-table :test 'eq)))
+                      (setf (vui-instance-memos instance) h)
+                      h)))
+         (cached (gethash memo-id cache))
+         (cached-deps (car cached))
+         (cached-value (cdr cached))
+         (cmp (or compare 'equal)))
+    ;; Increment memo counter for next vui-use-memo call
+    (cl-incf vui--memo-index)
+    ;; Return cached value if deps unchanged
+    (if (and cached (vui--deps-equal-p cached-deps deps cmp))
+        cached-value
+      ;; Compute new value and cache it
+      (let ((new-value (funcall compute-fn)))
+        (puthash memo-id (cons deps new-value) cache)
+        new-value))))
+
+;;; Async Data Loading
+
+(defmacro vui-use-async (key loader)
+  "Asynchronously load data using LOADER, identified by KEY.
+
+Returns a plist with:
+  :status - One of `pending', `ready', or `error'
+  :data   - The loaded data (when status is `ready')
+  :error  - The error message (when status is `error')
+
+KEY should uniquely identify this async operation. When KEY changes,
+the previous load is cancelled and a new one starts.
+
+LOADER is a function that takes two arguments: RESOLVE and REJECT.
+- Call (funcall RESOLVE data) when the async operation succeeds
+- Call (funcall REJECT error-message) when it fails
+
+The loader is invoked immediately (not deferred). For truly non-blocking
+operations, use async mechanisms like `make-process' inside the loader.
+
+Examples:
+  ;; Synchronous computation (still useful for caching/error handling)
+  (vui-use-async \\='user-data
+    (lambda (resolve reject)
+      (condition-case err
+          (funcall resolve (compute-expensive-data))
+        (error (funcall reject (error-message-string err))))))
+
+  ;; Truly async with external process
+  (vui-use-async \\='balance
+    (lambda (resolve reject)
+      (make-process
+        :name \"hledger\"
+        :command \\='(\"hledger\" \"balance\" ...)
+        :sentinel (lambda (proc event)
+                    (if (eq 0 (process-exit-status proc))
+                        (funcall resolve (parse-output proc))
+                      (funcall reject \"hledger failed\"))))))
+
+  ;; With dynamic key (reloads when user-id changes)
+  (vui-use-async (list \\='user user-id)
+    (lambda (resolve _reject)
+      (funcall resolve (fetch-user-data user-id))))"
+  (declare (indent 1))
+  `(vui--register-async ,key ,loader))
+
+(defun vui--register-async (key loader-fn)
+  "Register an async load with KEY and LOADER-FN.
+Called from within a component's render function.
+LOADER-FN receives (resolve reject) callbacks.
+Returns a plist with :status, :data, and :error."
+  (unless vui--current-instance
+    (error "vui-use-async called outside of component context"))
+  (let* ((instance vui--current-instance)
+         (async-id vui--async-index)
+         (cache (or (vui-instance-asyncs instance)
+                    (let ((tbl (make-hash-table :test 'equal)))
+                      (setf (vui-instance-asyncs instance) tbl)
+                      tbl)))
+         (entry (gethash async-id cache))
+         (prev-key (plist-get entry :key))
+         (prev-process (plist-get entry :process)))
+    ;; Increment async counter for next vui-use-async call
+    (cl-incf vui--async-index)
+    ;; Check if key changed or first call
+    (cond
+     ((and entry (equal prev-key key))
+      ;; Key unchanged - return cached result
+      (list :status (plist-get entry :status)
+            :data (plist-get entry :data)
+            :error (plist-get entry :error)))
+     (vui--measuring-p
+      ;; Measure pass: report pending without starting the load.
+      ;; The real render starts (or reuses) the actual load.
+      (list :status 'pending :data nil :error nil))
+     (t
+      ;; Key changed or first call - start new async load
+      ;; Kill previous process if still running
+      (when (and prev-process (process-live-p prev-process))
+        (delete-process prev-process))
+      ;; Set pending state
+      (let* ((root vui--root-instance)
+             (buffer (vui-instance-buffer instance))
+             (new-entry (list :key key :status 'pending :data nil :error nil :process nil))
+             ;; Create resolve callback.  Both callbacks ignore loads
+             ;; that have been superseded by a key change: the killed
+             ;; process's sentinel (or a late async result) would
+             ;; otherwise write the old entry back over the new pending
+             ;; one and re-trigger its load on the next render.
+             (resolve (lambda (data)
+                        (when (and (buffer-live-p buffer)
+                                   (eq (gethash async-id cache) new-entry))
+                          (plist-put new-entry :status 'ready)
+                          (plist-put new-entry :data data)
+                          (plist-put new-entry :process nil)
+                          ;; Trigger re-render (queued automatically when
+                          ;; a render is already in progress)
+                          (when root
+                            (vui--rerender-instance root)))))
+             ;; Create reject callback
+             (reject (lambda (error-msg)
+                       (when (and (buffer-live-p buffer)
+                                  (eq (gethash async-id cache) new-entry))
+                         (plist-put new-entry :status 'error)
+                         (plist-put new-entry :error error-msg)
+                         (plist-put new-entry :process nil)
+                         ;; Trigger re-render (queued automatically when
+                         ;; a render is already in progress)
+                         (when root
+                           (vui--rerender-instance root))))))
+        ;; Store entry immediately (so it's available for caching)
+        (puthash async-id new-entry cache)
+        ;; Call loader with resolve/reject callbacks
+        ;; Loader may call resolve/reject immediately (sync) or later (async)
+        (condition-case err
+            (let ((result (funcall loader-fn resolve reject)))
+              ;; If loader returns a process, store it for cleanup
+              (when (processp result)
+                (plist-put new-entry :process result)))
+          (error
+           ;; Loader threw an error - call reject
+           (funcall reject (error-message-string err))))
+        ;; Return pending state (or current state if resolve was called synchronously)
+        (list :status (plist-get new-entry :status)
+              :data (plist-get new-entry :data)
+              :error (plist-get new-entry :error)))))))
+
+(defun vui--cleanup-instance-asyncs (instance)
+  "Cancel all pending async processes for INSTANCE."
+  (let ((cache (vui-instance-asyncs instance)))
+    (when cache
+      (maphash (lambda (_id entry)
+                 (let ((proc (plist-get entry :process)))
+                   (when (and proc (process-live-p proc))
+                     (delete-process proc))))
+               cache)
+      (clrhash cache))))
+
+(defun vui--save-window-starts (buffer)
+  "Save viewport restoration data for all windows showing BUFFER.
+Returns an alist of (WINDOW . SPEC).  The window that holds point (the
+selected window when it shows BUFFER) gets (relative . DELTA), where
+DELTA is how many lines `window-start' sits above point; restoring by
+this delta keeps the cursor on the same screen row even when the
+re-render changes how many lines precede it, so the viewport does not
+visibly jump.  Every other window gets (absolute . LINE), its own
+`window-start' line, so a window the cursor does not live in (for
+instance one a background re-render is not focused on) keeps its own
+scroll position instead of being yanked to point.  See
+`vui--restore-window-starts'."
+  (let* ((selected (selected-window))
+         (cursor-window (and (eq (window-buffer selected) buffer) selected))
+         (point-line (line-number-at-pos (point)))
+         (result nil))
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (let ((start-line (line-number-at-pos (window-start window))))
+        (push (cons window
+                    (if (eq window cursor-window)
+                        (cons 'relative (max 0 (- point-line start-line)))
+                      (cons 'absolute start-line)))
+              result)))
+    result))
+
+(defun vui--restore-window-starts (window-info)
+  "Restore viewports saved by `vui--save-window-starts'.
+WINDOW-INFO is an alist of (WINDOW . SPEC).  Point is assumed to be
+already restored to the cursor's widget.  A (relative . DELTA) spec
+places `window-start' DELTA lines above point, keeping the cursor on
+the screen row it had; an (absolute . LINE) spec restores that
+window's own `window-start' line unchanged."
+  (dolist (entry window-info)
+    (let ((window (car entry))
+          (spec (cdr entry)))
+      (when (window-live-p window)
+        (let ((start (pcase spec
+                       (`(relative . ,delta)
+                        (save-excursion
+                          (forward-line (- delta))
+                          (line-beginning-position)))
+                       (`(absolute . ,line)
+                        (save-excursion
+                          (goto-char (point-min))
+                          (forward-line (1- line))
+                          (point))))))
+          (when start
+            (set-window-start window start)))))))
+
+(defun vui--flush-queued-rerenders ()
+  "Re-render roots queued while a render was in progress.
+Only the top-level call drains the queue; renders started from here
+queue further requests instead of draining recursively, so a
+state-update cycle that never settles is detected and signalled
+instead of overflowing the stack."
+  (unless vui--flushing-rerenders-p
+    (let ((vui--flushing-rerenders-p t)
+          (iterations 0))
+      (while vui--queued-rerenders
+        (when (> (cl-incf iterations) vui--rerender-queue-limit)
+          (setq vui--queued-rerenders nil)
+          (error "VUI re-renders did not settle after %d iterations \
+(state-update loop in a lifecycle hook or effect?)"
+                 vui--rerender-queue-limit))
+        (vui--rerender-instance (pop vui--queued-rerenders))))))
+
+(defun vui--rerender-instance (instance)
+  "Re-render INSTANCE and update the buffer.
+For instances mounted via `vui-mount-inline', only the region they
+manage is rewritten; otherwise the whole buffer is re-rendered.
+
+When called while another render is already in progress (for
+example, from `vui-set-state' in a lifecycle hook or effect with
+`vui-render-delay' set to nil), the request is queued and runs after
+the in-progress render commits, instead of erasing the buffer
+mid-render."
+  (cond
+   (vui--rendering-p
+    (cl-pushnew instance vui--queued-rerenders :test #'eq))
+   ((vui--inline-p instance)
+    (vui--rerender-inline instance))
+   (t
+    (vui--rerender-buffer instance))))
+
+(defun vui--rerender-inline (instance)
+  "Re-render inline INSTANCE inside the region it manages.
+The host buffer outside the region is left untouched.  Region
+mutations are kept out of the undo history: the rendered UI is
+ephemeral chrome, not document content."
+  (let ((buffer (vui-instance-buffer instance))
+        (start (vui-instance-region-start instance))
+        (end (vui-instance-region-end instance)))
+    (when (and buffer (buffer-live-p buffer)
+               start (marker-position start))
+      (with-current-buffer buffer
+        (let* ((inhibit-read-only t)
+               (inhibit-redisplay t)
+               (inhibit-modification-hooks t)
+               ;; Managed UI text is not part of the document's history
+               (buffer-undo-list t)
+               (pos (marker-position start))
+               (end-pos (marker-position end))
+               ;; Only track the cursor when it is inside the region;
+               ;; positions outside adjust automatically
+               (cursor-info (when (and (>= (point) pos)
+                                       (<= (point) end-pos))
+                              (vui--save-cursor-position pos end-pos)))
+               (vui--root-instance instance)
+               (vui--render-path nil)
+               (vui--pending-effects nil))
+          ;; Queue re-render requests until commit and effects are done
+          (setq vui--rendering-p t)
+          (unwind-protect
+              (progn
+                (save-excursion
+                  (vui--remove-widget-overlays pos end-pos)
+                  (vui--forget-region-fields pos end-pos)
+                  (delete-region pos end-pos)
+                  (goto-char pos)
+                  (vui--render-instance instance)
+                  ;; Reposition the markers around the fresh content:
+                  ;; START's insertion type made it advance past our
+                  ;; own insertions (so user edits stay outside), put
+                  ;; it back at the region's beginning
+                  (set-marker start pos)
+                  (set-marker end (point))
+                  (widget-setup)
+                  (vui--setup-field-placeholders))
+                (when cursor-info
+                  (vui--restore-cursor-position cursor-info pos
+                                                (marker-position end)))
+                ;; Run effects after commit
+                (vui--run-pending-effects))
+            (setq vui--rendering-p nil))))
+      ;; Run any re-renders requested during render/effects
+      (vui--flush-queued-rerenders))))
+
+(defun vui--rerender-buffer (instance)
+  "Re-render INSTANCE as the root of its whole buffer."
+  (let ((buffer (vui-instance-buffer instance)))
+    (when (and buffer (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (let* ((inhibit-read-only t)
+               (inhibit-redisplay t)  ; Prevent flicker
+               (inhibit-modification-hooks t)  ; Prevent widget-after-change errors
+               ;; Do not record the render in undo: `widget-setup' clears
+               ;; the undo list at the end of every render, so nothing
+               ;; recorded here survives, and recording it copies the
+               ;; whole erased buffer, text properties included, only to
+               ;; drop it.  On a large table that copy is a third of the
+               ;; garbage a re-render makes.  Inline mounts already do
+               ;; this (their region is ephemeral UI, not document text).
+               (buffer-undo-list t)
+               ;; Save widget-relative cursor position
+               (cursor-info (vui--save-cursor-position))
+               ;; Save viewport (window-start) for all windows showing this buffer
+               (window-info (vui--save-window-starts buffer))
+               (vui--root-instance instance)
+               ;; Initialize render path for cursor tracking
+               (vui--render-path nil)
+               ;; Clear pending effects before render
+               (vui--pending-effects nil))
+          ;; Queue re-render requests (vui-set-state with nil delay)
+          ;; until commit and effects are done
+          (setq vui--rendering-p t)
+          (unwind-protect
+              (progn
+                ;; `vui--commit-root' erases and rebuilds, or patches in
+                ;; place when incremental rendering is eligible.
+                (vui--render-instance instance #'vui--commit-root)
+                (widget-setup)
+                (vui--setup-field-placeholders)
+                ;; Restore cursor position
+                (vui--restore-cursor-position cursor-info)
+                ;; Restore viewport for all windows
+                (vui--restore-window-starts window-info)
+                ;; Run effects after commit
+                (vui--run-pending-effects))
+            (setq vui--rendering-p nil)))
+        ;; `widget-setup' cleared the undo list inside the binding above,
+        ;; so that clear was undone with it; redo it here.  Entries from
+        ;; before the render describe text that no longer exists, and an
+        ;; undo in a field would edit the wrong place.
+        (setq buffer-undo-list nil)
+        ;; Run any re-renders requested during render/effects
+        (vui--flush-queued-rerenders)))))
+
+(defun vui-rerender (instance)
+  "Re-render INSTANCE, preserving component state.
+This triggers a re-render of the component tree rooted at INSTANCE.
+Component state (including collapsed sections, internal state) is
+preserved through reconciliation.  Memoized values are also preserved
+and will only recompute if their dependencies change.
+
+Returns INSTANCE for chaining."
+  (vui--rerender-instance instance)
+  instance)
+
+(defun vui--invalidate-memos (instance)
+  "Recursively clear all memoized values in INSTANCE and its children."
+  (when-let* ((memos (vui-instance-memos instance)))
+    (clrhash memos))
+  (dolist (child (vui-instance-children instance))
+    (vui--invalidate-memos child)))
+
+(defun vui-update (instance new-props)
+  "Update INSTANCE with NEW-PROPS, invalidate memos, and re-render.
+This is useful when new data arrives and you want computed values to
+refresh while preserving UI state (like collapsed sections).
+
+NEW-PROPS completely replaces the instance's current props, so pass
+every prop the component needs, not only the changed ones.
+
+All memoized values in the instance tree are invalidated, forcing
+recomputation on the next render.  Component state is preserved
+through reconciliation.
+
+State is preserved, not re-seeded: a component whose `:state' is
+initialized from a prop keeps the value it captured at mount, and
+new props for that prop are ignored with no error.  Read the prop
+directly in `:render', or sync it in `:on-update'.  See the
+External Updates guide.
+
+Returns INSTANCE for chaining."
+  (vui--invalidate-memos instance)
+  (setf (vui-instance-props instance) new-props)
+  (vui--rerender-instance instance)
+  instance)
+
+(defun vui-update-props (instance new-props)
+  "Update INSTANCE with NEW-PROPS and re-render, preserving memos.
+This is useful for periodic refreshes where data may not have changed.
+Memoized values are preserved and only recompute if their dependencies
+change.
+
+NEW-PROPS completely replaces the instance's current props, so pass
+every prop the component needs, not only the changed ones.  As with
+`vui-update', state seeded from a prop is preserved rather than
+re-seeded.
+
+Use `vui-update' instead when external data has changed and all cached
+computations should be discarded.
+
+Returns INSTANCE for chaining."
+  (setf (vui-instance-props instance) new-props)
+  (vui--rerender-instance instance)
+  instance)
+
+(defvar-local vui--resize-last-width nil
+  "The window width this buffer's instances last re-rendered for.
+Set by `vui--on-window-size-change' so height-only size changes (the
+echo area growing, a split below) do not trigger a re-render: layout
+reads widths only.  Nil until the hook first fires.")
+
+(defun vui--on-window-size-change (_window-or-frame)
+  "Re-render this buffer's mounted VUI instances.
+Installed buffer-locally on `window-size-change-functions' by
+`vui-rerender-on-resize'.  Skipped when a window shows the buffer at
+the same width as the previous firing - the hook also fires for
+height-only changes, which cannot affect layout.  With no window to
+measure, it re-renders unconditionally."
+  (let* ((window (get-buffer-window nil t))
+         (width (and window (window-width window))))
+    (unless (and width vui--resize-last-width
+                 (= width vui--resize-last-width))
+      (when width
+        (setq vui--resize-last-width width))
+      (dolist (instance (delq nil (cons vui--root-instance
+                                        (copy-sequence vui--inline-instances))))
+        (if vui-render-delay
+            (vui--schedule-deferred-render-for instance)
+          (vui--rerender-instance instance))))))
+
+(defcustom vui-rerender-on-resize-default t
+  "Whether mounting installs resize re-rendering automatically.
+When non-nil, `vui-mount' and `vui-mount-inline' call
+`vui-rerender-on-resize' on their buffer, so layouts whose width
+depends on the window (`vui-flex' and `vui-grid' with :width `window'
+or a function) reflow as the window changes without any setup.  The
+hook is cheap when nothing depends on the window - it only runs on
+actual size changes of the buffer's windows - and
+`vui-cancel-rerender-on-resize' removes it from a buffer at any time.
+Set to nil to restore the previous opt-in behavior."
+  :type 'boolean
+  :group 'vui)
+
+(defun vui-rerender-on-resize (&optional buffer)
+  "Re-render BUFFER's VUI instances whenever its window size changes.
+BUFFER defaults to the current buffer.  Covers both the instance
+mounted with `vui-mount' and any inline instances.
+
+Useful together with `vui-flex' rows whose :width depends on the
+window, e.g. the symbol `window' or a function.  Re-renders go
+through the normal deferred scheduling, so a burst of resize events
+coalesces into one re-render per instance.
+
+The hook is buffer-local and dies with the buffer.  Use
+`vui-cancel-rerender-on-resize' to remove it earlier."
+  (with-current-buffer (or buffer (current-buffer))
+    (add-hook 'window-size-change-functions
+              #'vui--on-window-size-change nil t)))
+
+(defun vui-cancel-rerender-on-resize (&optional buffer)
+  "Stop re-rendering BUFFER's VUI instances on window size changes.
+BUFFER defaults to the current buffer.  Undoes
+`vui-rerender-on-resize'."
+  (with-current-buffer (or buffer (current-buffer))
+    (remove-hook 'window-size-change-functions
+                 #'vui--on-window-size-change t)))
+
+;;; Interactive elements: text buttons and editable fields
+;;
+;; vui renders buttons, checkboxes and selects as `button.el' text
+;; buttons (cheap and marker-free, see issue #107) and editable fields as
+;; `widget.el' widgets (they need real in-buffer editing).  Cursor
+;; tracking and navigation treat the two uniformly through the
+;; `vui--elt-*' helpers, which dispatch on `widgetp': an editable field is
+;; a widget, a text button is not.
+
+(defun vui--elt-at (&optional pos)
+  "Return the interactive element at POS, or nil.
+The element is a `button.el' text button (vui buttons, checkboxes and
+selects) or a `widget.el' editable field."
+  (let ((pos (or pos (point))))
+    (or (button-at pos)
+        (widget-field-at pos))))
+
+(defun vui--elt-get (elt prop)
+  "Get PROP of interactive element ELT (a text button or a widget field)."
+  (if (widgetp elt) (widget-get elt prop) (button-get elt prop)))
+
+;;; Public element-at-point API
+;;
+;; vui renders interactive elements with two mechanisms - `button.el' text
+;; buttons (buttons, checkboxes, selects) and `widget.el' editable fields
+;; (issues #107/#109) - and hides the difference behind the `vui--elt-*'
+;; helpers above.  These functions give that abstraction a public face, so a
+;; consumer can ask "what vui element is at point, and what are its
+;; properties" without reaching for `button-at'/`widget-at' or
+;; `button-get'/`widget-get'.  That keeps the rendering mechanism an internal
+;; detail vui is free to change: a refactor like #109 (widgets -> text
+;; buttons) stops being a breaking change for everyone downstream (issue #113).
+
+(defun vui-element-at (&optional pos)
+  "Return the vui interactive element at POS, or nil.
+POS defaults to point.  The element is whatever vui rendered there - a
+text button (a vui button, checkbox or select) or an editable field -
+returned as an opaque handle.  Read its properties with `vui-element-get'
+and run its action with `vui-activate'.  Do not assume which rendering
+mechanism produced the handle: that is vui's to change (issue #113)."
+  (vui--elt-at (or pos (point))))
+
+(defun vui-element-get (element prop)
+  "Return vui property PROP of ELEMENT, or nil.
+ELEMENT is a handle from `vui-element-at'.  PROP is one of vui's element
+properties - `:vui-key' (the reconciliation key), `:vui-tag' (the label),
+`:vui-path' (the component-tree path) and the like.  This reads them the
+same way whichever mechanism rendered ELEMENT, so consumers never call
+`widget-get' or `button-get' directly and stay insulated from a rendering
+change (issue #113)."
+  (vui--elt-get element prop))
+
+(defun vui-key-at (&optional pos)
+  "Return the reconciliation `:key' of the vui element at POS, or nil.
+POS defaults to point.  Returns nil when POS holds no vui element, or the
+element carries no key.  A convenience for the common case of asking which
+keyed row - a note, an item, a choice - the cursor sits on; equivalent to
+\(vui-element-get (vui-element-at POS) :vui-key)."
+  (when-let* ((elt (vui--elt-at (or pos (point)))))
+    (vui--elt-get elt :vui-key)))
+
+(defun vui-activate (&optional pos)
+  "Activate the vui element at POS, running its action.
+POS defaults to point.  Runs whatever the element does when pushed: a
+button follows its `:on-click', a checkbox toggles, a select opens its
+menu, an editable field submits (`:on-submit').  Returns non-nil when an
+element was found at POS (and its action invoked), nil when POS holds none.
+
+Mechanism-agnostic on purpose: activation is itself where the rendering
+mechanism used to leak (`push-button' for a button, `widget-apply' for a
+field), so a consumer calls this and a rendering change never reaches it
+\(issue #113).  A disabled button is still reported here, but its own
+action no-ops."
+  (interactive)
+  (when-let* ((elt (vui--elt-at (or pos (point)))))
+    (if (widgetp elt)
+        (when (widget-get elt :action)
+          (widget-apply elt :action))
+      (button-activate elt))
+    t))
+
+(defun vui--widget-bounds (elt)
+  "Return (START . END) bounds of interactive element ELT, or nil.
+For an editable field, the editable text area (not decoration); for a
+text button, the button's extent.  ELT may be a text button or a
+widget (the name is kept for history)."
+  (if (widgetp elt)
+      (let ((field-start (widget-field-start elt))
+            (field-end (widget-field-end elt)))
+        (when (and field-start field-end)
+          (cons field-start field-end)))
+    (let ((start (button-start elt))
+          (end (button-end elt)))
+      (when (and start end)
+        (cons start end)))))
+
+(defun vui--insert-text-button (text action &rest props)
+  "Insert a vui text button showing TEXT, running ACTION when pushed.
+ACTION is called with the button as its single argument.  PROPS is a
+plist of extra button properties (e.g. `face', `help-echo', `keymap',
+and vui's own :vui-path/:vui-key/:vui-tag/:vui-tab-order).  Returns the
+inserted button.  Text buttons carry no markers, so a bufferful of them
+renders in linear time (issue #107).
+
+PROPS may override the defaults: unless it sets its own `keymap' the
+button gets `vui--button-keymap' (so TAB/S-TAB use vui navigation, not
+button.el's button-only walk), and unless it sets `follow-link' /
+`mouse-face' the button gets the clickable-affordance defaults (a
+disabled button passes nil for both so it does not look clickable)."
+  (unless (plist-member props 'keymap)
+    (setq props (plist-put props 'keymap vui--button-keymap)))
+  (unless (plist-member props 'follow-link)
+    (setq props (plist-put props 'follow-link t)))
+  (unless (plist-member props 'mouse-face)
+    (setq props (plist-put props 'mouse-face 'highlight)))
+  (apply #'insert-text-button text 'action action props))
+
+(defun vui--save-cursor-position (&optional start end)
+  "Save cursor position relative to current widget.
+Returns plist with :path, :identity, :label, :offset for widgets, or
+:line, :column for non-widget positions.  :path is the widget's ordinal
+tree path, used to relocate it (or, when it is gone, its nearest tree
+neighbour) on restore.  :label is the widget's `:tag', kept alongside
+:identity so a key shared across the buffer can be disambiguated on
+restore (see `vui--find-widget-by-identity').
+START and END are accepted for symmetry with `vui--restore-cursor-position'
+but are not needed here."
+  (ignore start end)
+  (let ((elt (vui--elt-at (point))))
+    (if elt
+        (let* ((bounds (vui--widget-bounds elt))
+               (elt-start (car bounds))
+               (offset (if elt-start (- (point) elt-start) 0))
+               (path (vui--elt-get elt :vui-path))
+               (identity (vui--widget-identity elt))
+               (label (vui--elt-get elt :vui-tag)))
+          (list :path path :identity identity :label label :offset offset))
+      ;; No element at point - save line/column as fallback
+      (list :line (line-number-at-pos) :column (current-column)))))
+
+(defun vui--collect-widgets (&optional start end)
+  "Collect interactive elements between START and END, in buffer order.
+Bounds default to the whole buffer.  Text buttons (vui buttons,
+checkboxes and selects) are found by walking `button-at'; editable
+fields come from `widget-field-list'."
+  (let ((from (or start (point-min)))
+        (to (or end (point-max)))
+        (entries nil))
+    ;; Text buttons.  Walk position by position with `button-at' rather than
+    ;; `next-button': two buttons that abut with no separating text (e.g. an
+    ;; hstack with :spacing 0) share one contiguous `button' text-property
+    ;; span, and `next-button' skips the second one.  `button-at' at each
+    ;; position catches every button.  The `< to' loop guard bounds each
+    ;; button's start (which is <= pos), matching the field branch below.
+    (let ((pos from))
+      (catch 'done
+        (while (< pos to)
+          (let ((b (button-at pos)))
+            (cond
+             (b
+              (when (>= (button-start b) from)
+                (push (cons (button-start b) b) entries))
+              (setq pos (button-end b)))
+             ((setq pos (next-button pos)))     ; skip a gap to the next button
+             (t (throw 'done nil)))))))          ; no more buttons
+    ;; Editable fields
+    (dolist (widget widget-field-list)
+      (when-let* ((pos (widget-field-start widget)))
+        (when (and (>= pos from) (< pos to))
+          (push (cons pos widget) entries))))
+    (mapcar #'cdr (sort entries #'car-less-than-car))))
+
+(defun vui--find-widget-by-path (path &optional start end)
+  "Find widget with matching :vui-path between START and END.
+PATH is a list representing the widget's location in the component
+tree.  Bounds default to the whole buffer.  Returns nil if not found."
+  (when path
+    (catch 'found
+      (dolist (w (vui--collect-widgets start end))
+        (when (equal (vui--elt-get w :vui-path) path)
+          (throw 'found w)))
+      nil)))
+
+(defun vui--widget-identity (widget)
+  "Return a stable identity for WIDGET across re-renders, or nil.
+Prefers WIDGET's reconciliation key (`:vui-key', set on fields,
+buttons, checkboxes and selects that carry a :key), falling back to
+its label (`:tag').  Unlike `:vui-path' and the ordinal index, neither
+changes when content is inserted or removed above WIDGET, so this lets
+cursor restoration track the same logical widget after the surrounding
+rows shift.  The key wins over the label because it stays stable even
+when the displayed text changes (a counter button, a select showing
+its current choice), and it tells same-label widgets apart.  Keys are
+only unique among siblings, so two lists can reuse one; restoration
+pairs this identity with the saved label to break such ties (see
+`vui--find-widget-by-identity'), so a shared key does not collapse two
+distinct rows.  Returns nil when WIDGET has neither key nor label, so
+an identity-less widget falls back to ordinal position as before."
+  (or (vui--elt-get widget :vui-key)
+      (vui--elt-get widget :vui-tag)))
+
+(defun vui--find-widget-by-identity (identity label &optional start end)
+  "Return the widget between START and END identified by IDENTITY and LABEL.
+IDENTITY is computed with `vui--widget-identity' (the reconciliation
+key, or the label when unkeyed); LABEL is the saved `:tag'.  The key is
+matched first, so a keyed widget is found even when its label changed.
+Keys are only unique among siblings, so a key can repeat across the
+buffer; when more than one widget shares IDENTITY, LABEL breaks the tie
+(the one in another list with a different label is rejected).  Bounds
+default to the whole buffer.  Returns nil when IDENTITY is nil, nothing
+matches, or the choice stays ambiguous, so callers never guess between
+true look-alikes."
+  (when identity
+    (let ((matches nil))
+      (dolist (w (vui--collect-widgets start end))
+        (when (equal (vui--widget-identity w) identity)
+          (push w matches)))
+      (cond
+       ((null matches) nil)
+       ;; Unique by identity: trust it even if the label changed.
+       ((null (cdr matches)) (car matches))
+       ;; Identity collides (a key reused across lists): keep only the
+       ;; widget whose label also matches, and only if that is unique.
+       (t (let ((by-label (seq-filter
+                           (lambda (w) (equal (vui--elt-get w :vui-tag) label))
+                           matches)))
+            (when (and by-label (null (cdr by-label)))
+              (car by-label))))))))
+
+(defun vui--goto-widget-offset (widget offset)
+  "Move point into WIDGET, OFFSET characters past its start.
+Point is clamped to WIDGET's bounds; a nil OFFSET counts as 0."
+  (let* ((bounds (vui--widget-bounds widget))
+         (widget-start (car bounds))
+         (widget-end (cdr bounds)))
+    (when (and widget-start widget-end)
+      ;; Cap at (1- end) because bounds are exclusive on the right.
+      (goto-char (max widget-start
+                      (min (+ widget-start (or offset 0))
+                           (1- widget-end)))))))
+
+(defun vui--path-lt (a b)
+  "Non-nil when numeric key list A sorts before B lexicographically.
+A and B are the comparison keys built by `vui--path-nearest-widget'."
+  (catch 'done
+    (while (and a b)
+      (cond ((< (car a) (car b)) (throw 'done t))
+            ((> (car a) (car b)) (throw 'done nil)))
+      (setq a (cdr a) b (cdr b)))
+    nil))
+
+(defun vui--path-nearest-widget (path &optional start end)
+  "Return the surviving widget whose `:vui-path' is nearest PATH, or nil.
+Nearness is measured in the component tree, not by buffer position: a
+widget sharing a longer path prefix with PATH wins (so recovery stays
+inside the same container), and among those the one nearest at the first
+differing step wins, the successor that slid up into the vacated slot
+before the predecessor.  So when the widget PATH pointed at is removed,
+point recovers to a sibling of the removed node, or failing that to an
+ancestor, rather than to whatever merely sits nearby in the buffer.
+Bounds default to the whole buffer."
+  (let ((best nil) (best-key nil))
+    (dolist (widget (vui--collect-widgets start end) best)
+      (when-let* ((q (vui--elt-get widget :vui-path)))
+        (let* ((shared (let ((n 0) (a path) (b q))
+                         (while (and a b (equal (car a) (car b)))
+                           (setq n (1+ n) a (cdr a) b (cdr b)))
+                         n))
+               (pe (nth shared path))
+               (qe (nth shared q))
+               ;; Smaller key = nearer.  Order the tuple so the tree
+               ;; semantics fall out of a plain lexicographic compare.
+               (key (list (- shared)                        ; longer prefix first
+                          (if (and pe qe) (abs (- pe qe)) 0) ; nearer sibling first
+                          (if (and pe qe (> qe pe)) 0 1)     ; successor before predecessor
+                          (length q))))                      ; shallower (nearer parent) first
+          (when (or (null best-key) (vui--path-lt key best-key))
+            (setq best widget best-key key)))))))
+
+(defun vui--restore-cursor-position (cursor-info &optional start end)
+  "Restore cursor from CURSOR-INFO saved by `vui--save-cursor-position'.
+When START and END are given, widget lookups are scoped to that
+region and fallbacks move to START instead of the buffer beginning."
+  (let* ((path (plist-get cursor-info :path))
+         (offset (plist-get cursor-info :offset))
+         (identity (plist-get cursor-info :identity))
+         (label (plist-get cursor-info :label))
+         (line (plist-get cursor-info :line))
+         (column (plist-get cursor-info :column))
+         (home (or start (point-min)))
+         ;; Single lookup for path-based matching
+         (path-widget (and path (vui--find-widget-by-path path start end)))
+         ;; The path is an ordinal position in the tree, so content
+         ;; inserted or removed above point shifts it onto a neighbour.
+         ;; When a stable identity was captured, only trust the path if
+         ;; the widget there still matches it (both key and label, so a
+         ;; same-key sibling that slid into the slot is rejected);
+         ;; otherwise re-find the widget by identity so point tracks the
+         ;; same logical row.
+         (path-ok (and path-widget
+                       (or (null identity)
+                           (and (equal identity
+                                       (vui--widget-identity path-widget))
+                                (equal label
+                                       (vui--elt-get path-widget :vui-tag))))))
+         (identity-widget (and (not path-ok)
+                               (vui--find-widget-by-identity
+                                identity label start end))))
+    (cond
+     ;; Path still resolves to the saved widget (most common, fast path)
+     (path-ok
+      (vui--goto-widget-offset path-widget offset))
+     ;; Path drifted: relocate the same widget by stable identity
+     (identity-widget
+      (vui--goto-widget-offset identity-widget offset))
+     (t
+      ;; The saved widget is gone.  Recover to the surviving widget nearest
+      ;; it in the component tree (`vui--path-nearest-widget'): the sibling
+      ;; that slid into its slot, the previous sibling when it was last in
+      ;; its container, or an ancestor, rather than whatever merely sits
+      ;; nearby in the buffer.  Falls back to line/column for a saved
+      ;; non-widget position, then to HOME.
+      (let ((near (and path (vui--path-nearest-widget path start end))))
+        (cond
+         (near
+          (vui--goto-widget-offset near 0))
+         ((and line column)
+          (goto-char (point-min))
+          (forward-line (1- line))
+          (move-to-column column))
+         (t
+          (goto-char home))))))))
+
+(defun vui-goto-key (key &optional start end)
+  "Move point onto the widget whose reconciliation `:key' is KEY.
+Search the widgets between START and END (default: the whole buffer) in
+the current buffer, comparing keys with `equal'.  On a match, move point
+\(and the point of every window showing the buffer) to the widget's
+start and return that position; return nil when no widget carries KEY.
+
+Handy for steering point to a known row after a re-render, e.g. before
+refreshing so cursor restoration has a stable anchor to return to.  A nil
+KEY matches nothing and returns nil: unkeyed widgets carry a nil
+`:vui-key', so treating nil as a wildcard would jump to the first of
+them."
+  (when-let* ((widget (and key
+                           (seq-find (lambda (w) (equal (vui--elt-get w :vui-key) key))
+                                     (vui--collect-widgets start end))))
+              (pos (car (vui--widget-bounds widget))))
+    (goto-char pos)
+    (dolist (win (get-buffer-window-list (current-buffer) nil t))
+      (set-window-point win pos))
+    pos))
+
+(defun vui--remove-widget-overlays (&optional start end)
+  "Remove widget-related overlays between START and END.
+Bounds default to the whole buffer.  Preserves unrelated overlays
+like hl-line."
+  (dolist (ov (overlays-in (or start (point-min)) (or end (point-max))))
+    (when (or (overlay-get ov 'button)
+              (overlay-get ov 'widget)
+              (overlay-get ov 'field)
+              (overlay-get ov 'vui-placeholder))
+      (delete-overlay ov))))
+
+(defun vui--apply-region-props (start end face keymap)
+  "Apply container-level FACE and KEYMAP to the region START..END.
+
+FACE is added with the lowest priority, so faces set by children win;
+whitespace inserted by layout containers (separators, padding,
+indentation) is covered as well.
+
+KEYMAP cascades beneath the children's own keymaps: plain text that
+already carries a keymap (from a nested styled region) gets a
+composed keymap where the existing map wins and unbound keys fall
+through to KEYMAP.  Text buttons compose KEYMAP beneath their own
+keymap (`button-map' for buttons without a custom one) so button keys
+keep working.  Input fields are untouched: their field keymap shadows
+text properties."
+  (when (< start end)
+    (when face
+      (add-face-text-property start end face t))
+    (when keymap
+      (let ((pos start))
+        (while (< pos end)
+          (if (get-char-property pos 'button)
+              ;; Text button: compose KEYMAP beneath the button's own
+              ;; keymap (a custom one, else `button-map') over its whole
+              ;; extent, so the button's keys win and KEYMAP stays
+              ;; reachable for keys the button leaves unbound
+              (let ((bend (or (next-single-char-property-change
+                               pos 'button nil end)
+                              end))
+                    (own (get-text-property pos 'keymap)))
+                (put-text-property pos bend 'keymap
+                                   (make-composed-keymap
+                                    (or own vui--button-keymap) keymap))
+                (setq pos bend))
+            ;; Plain text: compose under any nested region's keymap
+            (let ((next (or (next-property-change pos nil end) end))
+                  (existing (get-text-property pos 'keymap)))
+              (put-text-property pos next 'keymap
+                                 (if existing
+                                     (make-composed-keymap existing keymap)
+                                   keymap))
+              (setq pos next))))))))
+
+(defun vui--inline-p (instance)
+  "Return non-nil if INSTANCE was mounted inline (owns a region)."
+  (and (vui-instance-region-start instance) t))
+
+(defun vui--forget-region-fields (start end)
+  "Drop field-widget bookkeeping for fields between START and END.
+Field widgets whose text is about to be deleted would otherwise
+linger in `widget-field-list' with collapsed bounds, confusing
+`widget-before-change' and `vui-field-value'.  Entries whose field
+no longer exists are dropped as well."
+  (let ((in-region-p
+         (lambda (widget)
+           (let ((field-start (widget-field-start widget)))
+             (or (null field-start)
+                 (and (>= field-start start) (<= field-start end)))))))
+    (setq widget-field-list (cl-remove-if in-region-p widget-field-list))
+    (setq widget-field-new (cl-remove-if in-region-p widget-field-new))))
+
+(defun vui--field-add-placeholder (widget)
+  "Show WIDGET's placeholder while its field is empty.
+The placeholder (stored as :vui-placeholder on WIDGET) is displayed
+over the empty field with the `vui-field-placeholder' face, padded or
+truncated to the field's :size.  It disappears as soon as the field
+is modified."
+  (when-let* ((placeholder (widget-get widget :vui-placeholder)))
+    (when (string-empty-p (widget-value widget))
+      (let ((start (widget-field-start widget))
+            (end (widget-field-end widget))
+            (size (vui--width (widget-get widget :size))))
+        (when (and start end (> end start)
+                   ;; Idempotent: the field may already show its
+                   ;; placeholder (e.g. another region in the same
+                   ;; buffer re-rendered and re-ran the setup pass)
+                   (not (seq-find (lambda (ov)
+                                    (overlay-get ov 'vui-placeholder))
+                                  (overlays-in start end))))
+          (let ((overlay (make-overlay start end))
+                (hide (lambda (ov &rest _) (delete-overlay ov))))
+            (overlay-put overlay 'vui-placeholder t)
+            (overlay-put overlay 'display
+                         (propertize
+                          (concat (vui--truncate-string placeholder (or size (vui--text-width placeholder)))
+                                  (vui--pad (- size (vui--text-width placeholder))))
+                          'face 'vui-field-placeholder))
+            ;; Hide the placeholder the moment the field is modified;
+            ;; the next re-render decides whether to show it again
+            (overlay-put overlay 'modification-hooks (list hide))
+            (overlay-put overlay 'insert-in-front-hooks (list hide))
+            (overlay-put overlay 'insert-behind-hooks (list hide))))))))
+
+(defun vui--setup-field-placeholders ()
+  "Add placeholder overlays to empty fields that declare one.
+Must run after `widget-setup', which finalizes field boundaries."
+  (dolist (widget widget-field-list)
+    (vui--field-add-placeholder widget)))
+
+(defun vui--handle-error (type hook-name err instance)
+  "Handle an error ERR caught in HOOK-NAME.
+TYPE is `lifecycle' or `event'.
+INSTANCE is the component instance where the error occurred."
+  (let* ((handler (if (eq type 'lifecycle)
+                      vui-lifecycle-error-handler
+                    vui-event-error-handler))
+         (component-name (when instance
+                           (vui-component-def-name (vui-instance-def instance))))
+         (context (list :component component-name :hook hook-name))
+         (msg (format "VUI %s error in %s (%s): %s"
+                      type hook-name (or component-name "unknown")
+                      (error-message-string err))))
+    ;; Store for debugging
+    (setq vui-last-error (list type err context))
+    ;; Handle based on configuration
+    (pcase handler
+      ('warn (display-warning 'vui msg :warning))
+      ('message (message "%s" msg))
+      ('signal (signal (car err) (cdr err)))
+      ('ignore nil)
+      ((pred functionp) (funcall handler hook-name err instance)))))
+
+(defun vui--call-lifecycle-hook (hook-name hook-fn instance &rest args)
+  "Call HOOK-FN with ARGS, catching errors according to configuration.
+HOOK-NAME is a string like \"on-mount\" for error messages.
+INSTANCE is the component instance."
+  (when hook-fn
+    (condition-case err
+        (apply hook-fn args)
+      (error
+       (vui--handle-error 'lifecycle hook-name err instance)))))
+
+(defun vui--wrap-event-callback (callback-name callback instance)
+  "Wrap CALLBACK in error handling.
+CALLBACK-NAME is a string like \"on-click\" for error messages.
+INSTANCE is the component instance."
+  (when callback
+    (lambda (&rest args)
+      (condition-case err
+          (apply callback args)
+        (error
+         (vui--handle-error 'event callback-name err instance))))))
+
+(defun vui--render-instance (instance &optional commit-fn)
+  "Render a component INSTANCE into the current buffer.
+When COMMIT-FN is non-nil it is called with the computed vtree to write
+it to the buffer, instead of the default `vui--render-vnode'.  This lets
+the root re-render commit incrementally (see `vui--commit-root')."
+  (let* ((vui--current-instance instance)
+         (vui--child-index 0)
+         (vui--new-children nil)
+         (vui--consumed-contexts nil) ; Contexts read by this instance's own render
+         (vui--effect-index 0)    ; Reset effect counter for this component
+         (vui--ref-index 0)       ; Reset ref counter for this component
+         (vui--callback-index 0)  ; Reset callback counter for this component
+         (vui--memo-index 0)      ; Reset memo counter for this component
+         (vui--async-index 0)     ; Reset async counter for this component
+         (old-children (vui-instance-children instance))
+         ;; O(1) child lookup for this render, so reconciling S children is
+         ;; O(S) not O(S^2).  Nil when there is nothing to reuse.
+         (vui--reconcile-lookup (and old-children
+                                     (vui--build-reconcile-lookup instance old-children)))
+         (def (vui-instance-def instance))
+         (component-name (vui-component-def-name def))
+         (render-fn (vui-component-def-render-fn def))
+         (should-update-fn (vui-component-def-should-update def))
+         (props (vui-instance-props instance))
+         (state (vui-instance-state instance))
+         (first-render-p (not (vui-instance-mounted-p instance)))
+         ;; Capture previous values for on-update/should-update
+         (prev-props (vui-instance-prev-props instance))
+         (prev-state (vui-instance-prev-state instance))
+         ;; Check should-update for re-renders
+         (should-render-p (or first-render-p
+                              (not should-update-fn)
+                              (funcall should-update-fn props state prev-props prev-state)))
+         ;; Get vtree: either fresh render or cached
+         (vtree (if should-render-p
+                    (progn
+                      (vui--debug-log 'render "<%s> rendering (first=%s)"
+                                      component-name first-render-p)
+                      (vui--timing-start)
+                      (let ((new-vtree (vui--with-debug-indent
+                                        (funcall render-fn props state))))
+                        (vui--timing-record 'render component-name)
+                        (setf (vui-instance-cached-vtree instance) new-vtree)
+                        new-vtree))
+                  ;; Use cached vtree
+                  (vui--debug-log 'render "<%s> skipped (should-update=nil)"
+                                  component-name)
+                  (vui-instance-cached-vtree instance))))
+    (when vtree
+      (vui--timing-start)
+      (if commit-fn (funcall commit-fn vtree) (vui--render-vnode vtree))
+      (vui--timing-record 'commit component-name))
+    ;; Update children list for next reconciliation
+    (let ((new-children (nreverse vui--new-children)))
+      ;; Two sibling vnodes with the same key reconcile to the same
+      ;; instance, silently sharing state - warn, it is always a bug
+      (unless vui--measuring-p
+        (let ((seen (make-hash-table :test 'eq)))
+          (dolist (child new-children)
+            (if (gethash child seen)
+                (display-warning
+                 'vui
+                 (format "Duplicate reconciliation key %S under <%s>; siblings share one component instance"
+                         (vui-vnode-key (vui-instance-vnode child))
+                         component-name)
+                 :warning)
+              (puthash child t seen)))))
+      ;; Call on-unmount for children that were removed
+      (dolist (old-child old-children)
+        (unless (memq old-child new-children)
+          (vui--call-unmount-recursive old-child)))
+      (setf (vui-instance-children instance) new-children)
+      ;; Record the contexts this instance's whole subtree depends on:
+      ;; its own reads plus every child's recorded set.  Used only to
+      ;; decide whether the instance may bail out of a future re-render,
+      ;; so it is skipped entirely (no per-instance union) with the flag
+      ;; off.  Safe because a bail can only follow a flag-on render, which
+      ;; rebuilds this set (a flag-off render leaves no patchable record).
+      (when vui-incremental-render
+        (setf (vui-instance-consumed-contexts instance)
+              (let ((acc (copy-sequence vui--consumed-contexts)))
+                (dolist (child new-children acc)
+                  (setq acc (nconc (copy-sequence
+                                    (vui-instance-consumed-contexts child))
+                                   acc)))))))
+    ;; Lifecycle hooks (wrapped with error handling).
+    ;; Skipped during measure passes: those render throwaway instances
+    ;; into a temp buffer and must not produce side effects.
+    (unless vui--measuring-p
+      (if first-render-p
+          ;; First render: call on-mount
+          (progn
+            (setf (vui-instance-mounted-p instance) t)
+            (vui--debug-log 'mount "<%s> mounted" component-name)
+            (vui--timing-start)
+            (let ((result (vui--call-lifecycle-hook
+                           "on-mount"
+                           (vui-component-def-on-mount def)
+                           instance
+                           props state)))
+              ;; If on-mount returns a function, store it as cleanup
+              (when (functionp result)
+                (setf (vui-instance-mount-cleanup instance) result)))
+            (vui--timing-record 'mount component-name))
+        ;; Re-render: call on-update only if we actually rendered
+        (when should-render-p
+          (vui--debug-log 'update "<%s> updated" component-name)
+          (vui--timing-start)
+          (vui--call-lifecycle-hook
+           "on-update"
+           (vui-component-def-on-update def)
+           instance
+           props state prev-props prev-state)
+          (vui--timing-record 'update component-name))))
+    ;; Store current props/state for next render's on-update.  A
+    ;; shallow copy is enough: it owns its own plist cells, so the
+    ;; in-place plist-put done by `vui-set-state' cannot reach it,
+    ;; while the values themselves are shared.  Values are treated as
+    ;; immutable - replace them (e.g. with functional updates) rather
+    ;; than mutating them in place, or change detection cannot see it.
+    (setf (vui-instance-prev-props instance) (copy-sequence props))
+    (setf (vui-instance-prev-state instance) (copy-sequence state))))
+
+(defun vui--call-unmount-recursive (instance)
+  "Call on-unmount for INSTANCE and all its children recursively."
+  ;; First unmount children (depth-first)
+  (vui--with-debug-indent
+   (dolist (child (vui-instance-children instance))
+     (vui--call-unmount-recursive child)))
+  ;; Clean up effects and async timers
+  (vui--cleanup-instance-effects instance)
+  (vui--cleanup-instance-asyncs instance)
+  ;; Call mount cleanup function if one was returned from on-mount
+  (when-let* ((cleanup (vui-instance-mount-cleanup instance)))
+    (condition-case err
+        (funcall cleanup)
+      (error
+       (vui--handle-error 'lifecycle "mount-cleanup" err instance))))
+  ;; Then call on-unmount hook (with error handling)
+  (let* ((def (vui-instance-def instance))
+         (component-name (vui-component-def-name def))
+         (vui--current-instance instance))
+    (vui--debug-log 'unmount "<%s> unmounting" component-name)
+    (vui--timing-start)
+    (vui--call-lifecycle-hook
+     "on-unmount"
+     (vui-component-def-on-unmount def)
+     instance
+     (vui-instance-props instance)
+     (vui-instance-state instance))
+    (vui--timing-record 'unmount component-name)))
+
+(defun vui--detach-instance (instance)
+  "Clear buffer references for INSTANCE and all its children, recursively.
+A detached instance can no longer be re-rendered: `vui--rerender-instance'
+becomes a no-op for it, and async callbacks created via
+`vui-with-async-context' that captured it do nothing."
+  (setf (vui-instance-buffer instance) nil)
+  (dolist (child (vui-instance-children instance))
+    (vui--detach-instance child)))
+
+(defun vui--unmount-root (instance)
+  "Run full lifecycle teardown for root INSTANCE and detach it.
+Calls on-unmount hooks, effect cleanups, on-mount cleanup functions,
+and async process cleanup for the whole tree, cancels any pending
+deferred render, and clears buffer references so stale re-render
+requests for this tree become no-ops."
+  (vui--call-unmount-recursive instance)
+  ;; Cancel after cleanups: an on-unmount hook calling `vui-set-state'
+  ;; would otherwise leave a fresh timer behind.
+  (vui--cancel-render-timer instance)
+  (vui--detach-instance instance))
+
+(defun vui--build-reconcile-lookup (parent children)
+  "Build an O(1) reconciliation lookup over PARENT's existing CHILDREN.
+Returns a plist with :parent (for validation), :vec (a vector of the
+children for positional/index reuse) and :by-key (a hash from (TYPE . KEY)
+to the FIRST child with that type and key, matching the first-match
+semantics of the previous linear `cl-find-if').  Built once per parent
+render, so per-child lookup in `vui--find-matching-child' is O(1)."
+  (let ((by-key (make-hash-table :test 'equal)))
+    (dolist (child children)
+      (let ((key (vui-vnode-key (vui-instance-vnode child))))
+        (when key
+          (let ((hk (cons (vui-component-def-name (vui-instance-def child)) key)))
+            ;; first wins: keep the earliest child for a (type . key)
+            (unless (gethash hk by-key)
+              (puthash hk child by-key))))))
+    (list :parent parent :vec (vconcat children) :by-key by-key)))
+
+(defun vui--find-matching-child (parent type key index)
+  "Find a child of PARENT matching TYPE and KEY or INDEX.
+Uses `vui--reconcile-lookup' for O(1) matching when it was built for
+PARENT; otherwise falls back to a linear scan (identical semantics)."
+  (when parent
+    (if (and vui--reconcile-lookup
+             (eq (plist-get vui--reconcile-lookup :parent) parent))
+        ;; Fast path: O(1) lookup built for this render.
+        (if key
+            ;; Key-based: child with same type AND key (first match).
+            (gethash (cons type key) (plist-get vui--reconcile-lookup :by-key))
+          ;; Index-based: child at same global position with same type.
+          (let* ((vec (plist-get vui--reconcile-lookup :vec))
+                 (child (and (< index (length vec)) (aref vec index))))
+            (when (and child
+                       (eq (vui-component-def-name (vui-instance-def child)) type))
+              child)))
+      ;; Fallback: linear scan (e.g. no lookup built during measurement).
+      (let ((children (vui-instance-children parent)))
+        (if key
+            (cl-find-if (lambda (child)
+                          (and (eq (vui-component-def-name (vui-instance-def child)) type)
+                               (equal (vui-vnode-key (vui-instance-vnode child)) key)))
+                        children)
+          (let ((child-at-index (nth index children)))
+            (when (and child-at-index
+                       (eq (vui-component-def-name (vui-instance-def child-at-index)) type))
+              child-at-index)))))))
+
+(defun vui--create-instance (vnode &optional parent)
+  "Create a new component instance from VNODE with optional PARENT."
+  (let* ((type (vui-vnode-component-type vnode))
+         (def (vui--get-component type))
+         (props (vui-vnode-component-props vnode))
+         (children (vui-vnode-component-children vnode))
+         (props-with-children (if children
+                                  (plist-put (copy-sequence props) :children children)
+                                props))
+         (initial-state-fn (vui-component-def-initial-state-fn def))
+         (initial-state (if initial-state-fn
+                            (funcall initial-state-fn props-with-children)
+                          nil)))
+    (vui-instance--create
+     :id (cl-incf vui--instance-counter)
+     :def def
+     :props props-with-children
+     :state initial-state
+     :vnode vnode
+     :parent parent
+     :children nil
+     :buffer (when parent (vui-instance-buffer parent))
+     :mounted-p nil)))
+
+(defun vui--reconcile-component (vnode parent)
+  "Reconcile VNODE with existing child of PARENT, or create new instance."
+  (let* ((type (vui-vnode-component-type vnode))
+         (key (vui-vnode-key vnode))
+         (index vui--child-index)
+         (existing (vui--find-matching-child parent type key index))
+         (props (vui-vnode-component-props vnode))
+         (children (vui-vnode-component-children vnode))
+         (props-with-children (if children
+                                  (plist-put (copy-sequence props) :children children)
+                                props)))
+    (cl-incf vui--child-index)
+    (if existing
+        ;; Reuse existing instance, update props
+        (progn
+          (setf (vui-instance-props existing) props-with-children)
+          (setf (vui-instance-vnode existing) vnode)
+          existing)
+      ;; Create new instance
+      (vui--create-instance vnode parent))))
+
+;;; Rendering
+
+;; General Render Width
+
+(defun vui--width (width)
+  "Return the width value converted according to the current measurement
+mode specified by vui-width-mode. If the mode is char, return width as
+is; if the mode is pixel, convert width to its pixel equivalent using
+vui--to-pixel-width."
+  (pcase vui-width-mode
+    ('char width)
+    ('pixel (vui--to-pixel-width width))))
+
+(defun vui--width-to-chars (width)
+  "Convert WIDTH, a measurement in the current mode units, to characters.
+The inverse of `vui--width': identity in `char' mode, and in `pixel'
+mode the number of space-width columns that fit in WIDTH pixels
+\(rounding down).  For handing a mode-unit measurement to code whose
+contract is characters, such as a `vui-flex' grower's WIDTH argument."
+  (pcase vui-width-mode
+    ('char width)
+    ('pixel (let ((space (vui--space-pixel-width)))
+              (if (and width (> space 0)) (/ width space) 0)))))
+
+(defun vui--faced (str face)
+  "Return STR wearing FACE, or STR itself when FACE is nil.
+Where FACE is non-nil the result is a copy: STR is often a caller's
+literal.  Used so a string is measured with the same face it is
+inserted with."
+  (if face (propertize str 'face face) str))
+
+(defun vui--text-width (text &optional multi-line-p)
+  "Calculate the width of TEXT according to the value of vui-width-mode. If
+the mode is char, return the maximum width of all lines when
+MULTI-LINE-P is non-nil, or the width of the entire string otherwise. If
+the mode is pixel, return the pixel width of TEXT."
+  (pcase vui-width-mode
+    ('char (if multi-line-p
+               (apply #'max (mapcar #'string-width (string-split text "\n")))
+             (string-width text)))
+    ('pixel (vui--string-pixel-width text))))
+
+(defconst vui--spaces-memo-size 129
+  "How many space-run lengths `vui--spaces' keeps ready-made (0 to N-1).")
+
+(defvar vui--spaces-memo (make-vector vui--spaces-memo-size nil)
+  "Ready-made strings of N spaces, indexed by N.  See `vui--spaces'.")
+
+(defun vui--spaces (n)
+  "Return a string of N spaces, shared for small N.
+Padding is the most allocated string on a table render (two runs per
+cell), and every one of them is inserted or concatenated, both of which
+copy, so the run itself can be a shared string: for N below
+`vui--spaces-memo-size' the same string is returned every time and the
+render allocates nothing for it.  Callers must not mutate the result."
+  (cond ((<= n 0) "")
+        ((< n vui--spaces-memo-size)
+         (or (aref vui--spaces-memo n)
+             (aset vui--spaces-memo n (make-string n ?\s))))
+        (t (make-string n ?\s))))
+
+(defun vui--pad (width)
+  "Return a padding string of the specified WIDTH based on the current
+vui-width-mode. If the mode is char, return a string of WIDTH spaces. If
+the mode is pixel, return pixel-based padding using vui--pixel-spaces.
+The result may be shared (see `vui--spaces'); insert or concat it, do
+not mutate it."
+  (if (and width (> width 0))
+      (pcase vui-width-mode
+        ('char (vui--spaces width))
+        ('pixel (vui--pixel-spaces width)))
+    ""))
+
+(defun vui--column-width ()
+  "Return the width of one text column in the current mode units.
+1 in `char' mode, the pixel width of a space in `pixel' mode.  Never
+less than 1, so it is safe as a divisor."
+  (max 1 (or (vui--width 1) 1)))
+
+(defun vui--split-padding (padding)
+  "Split PADDING (mode units) into (LEFT . RIGHT) for centering.
+The split happens at whole-column granularity: LEFT gets half of the
+whole columns PADDING holds, RIGHT gets the rest, including any
+sub-column pixel remainder in `pixel' mode.  So ASCII content centers
+byte-identically in both modes, and a fractional remainder only ever
+lands on the right, where it cannot shift the content."
+  (let* ((col (vui--column-width))
+         (left (* col (/ (/ padding col) 2))))
+    (cons left (- padding left))))
+
+(defun vui--normalize-width (char width)
+  "Normalize WIDTH based on the pixel width of CHAR when vui-width-mode is
+pixel. If CHAR is non-nil and the mode is pixel, return WIDTH rounded up
+to the nearest multiple of the pixel width of CHAR. Otherwise, return
+WIDTH unchanged."
+  (if (and char
+           (equal vui-width-mode 'pixel))
+      (let ((char-width (vui--text-width char)))
+        (if (= 0 (% width char-width))
+            width
+          (* char-width (1+ (/ width char-width)))))
+    width))
+
+(defun vui--index-of (str width)
+  "Return the index in STR that corresponds to the specified WIDTH based on
+the current vui-width-mode. If the mode is char, return the minimum of
+the string length and WIDTH. If the mode is pixel, return the index
+found using a pixel-based binary search."
+  (pcase vui-width-mode
+    ('char (min (length str) width))
+    ('pixel (vui--pixel-binary-search str width))))
+
+(defun vui--clip-string (str width)
+  "Clip STR to the specified WIDTH. If WIDTH is 0 or less, return an empty
+string. Otherwise, return the prefix of STR that fits within WIDTH
+according to the current vui-width-mode."
+  (if (<= width 0)
+      ""
+    (substring str 0 (vui--index-of str width))))
+
+(defun vui--truncate-string-pixelwise (string max-pixels &optional buffer ellipsis ellipsis-pixels)
+  "Truncate STRING to a maximum width of MAX-PIXELS.
+If the built-in truncate-string-pixelwise is available, it is used for
+the truncation. Otherwise, if the pixel width of STRING exceeds
+MAX-PIXELS, it is clipped and ELLIPSIS is appended."
+  (if (fboundp 'truncate-string-pixelwise)
+      (truncate-string-pixelwise string max-pixels buffer ellipsis ellipsis-pixels)
+    (if (<= (vui--string-pixel-width string) max-pixels)
+        string
+      (let* ((ellipsis (or ellipsis ""))
+             (ellipsis-pixels (or ellipsis-pixels (vui--string-pixel-width ellipsis))))
+        (concat (vui--clip-string string (- max-pixels ellipsis-pixels))
+                ellipsis)))))
+
+(defun vui--truncate-string (str width &optional ellipsis)
+  "Truncate STR to the specified WIDTH, optionally appending ELLIPSIS. The
+truncation method depends on vui-width-mode: it uses character-based
+truncation if the mode is char, and pixel-based truncation if the mode
+is pixel."
+  (pcase vui-width-mode
+    ('char (truncate-string-to-width str width nil nil ellipsis))
+    ('pixel (vui--truncate-string-pixelwise str width nil ellipsis (vui--string-pixel-width ellipsis)))))
+
+;; Render Pixel Width
+
+(defconst vui--width-properties '(face display)
+  "Text properties that can change how wide a string renders.
+The pixel cache keys on these and nothing else.")
+
+(defun vui--width-key (str)
+  "Return a cache key for STR covering exactly what determines its width.
+A string with no text properties is its own key, so the common case
+allocates nothing.  Otherwise the key is (CHARS . RUNS): the bare
+characters plus the runs of `face' and `display' properties
+\(`vui--width-properties') as (START END PROP VALUE) lists, and every
+other property is dropped.
+
+Two reasons not to key on the string as it comes.  Keying on the raw
+string under `equal' ignores properties, so a plain cell and a bold
+header with the same text would share one width, wrong wherever bold
+is wider (any proportional font).  Keying on every property, or through
+a property-aware hash test, is both slow (a user-defined test runs
+through Lisp for every probe, where `equal' is a C fast path) and
+unsafe: rendered buttons carry keymaps and action closures that do not
+affect width and hold references back into the component tree."
+  (let ((len (length str)))
+    (if (and (null (text-properties-at 0 str))
+             (null (next-property-change 0 str)))
+        str
+      (let ((runs nil))
+        (dolist (prop vui--width-properties)
+          (let ((pos 0))
+            (while (< pos len)
+              (let ((next (or (next-single-property-change pos prop str) len))
+                    (val (get-text-property pos prop str)))
+                (when val (push (list pos next prop val) runs))
+                (setq pos next)))))
+        (cons (substring-no-properties str) runs)))))
+
+(defun vui--reset-text-pixel-cache ()
+  "Empty `vui--text-pixel-cache'.
+Runs from `after-setting-font-hook', since every cached width is stale
+once the frame font changes.  Face remappings do not need this: they
+are part of the cache key, as are the width-relevant text properties
+\(see `vui--width-key')."
+  (setq vui--space-pixel-memo nil
+        vui--text-pixel-cache (make-hash-table :test #'equal)))
+
+(defun vui--measure-buffer ()
+  "Return the buffer to measure in: `vui--measure-buffer' or the current one."
+  (let ((buf vui--measure-buffer))
+    (if (and buf (buffer-live-p buf)) buf (current-buffer))))
+
+(defun vui--string-pixel-width (str)
+  "Return the pixel width of STR, memoized in `vui--text-pixel-cache'.
+Measured in the face context of `vui--measure-buffer' (see there), so a
+buffer under `text-scale-mode' or `variable-pitch-mode' gets widths that
+match what it displays.  Before Emacs 31 `string-pixel-width' cannot
+take a buffer, so the measurement is in the frame's default face; the
+cache is still keyed by the remapping so nothing is served across
+contexts."
+  (when str
+    (unless vui--text-pixel-cache
+      (vui--reset-text-pixel-cache))
+    (let* ((buf (vui--measure-buffer))
+           (context (buffer-local-value 'face-remapping-alist buf))
+           (table (or (gethash context vui--text-pixel-cache)
+                      (puthash context (make-hash-table :test #'equal)
+                               vui--text-pixel-cache)))
+           (key (vui--width-key str)))
+      (or (gethash key table)
+          (puthash key
+                   (if vui--string-pixel-width-takes-buffer
+                       ;; Two-arg form is Emacs 31+; the flag guards it
+                       ;; at run time, so silence the compile-time arity
+                       ;; check on older Emacs.
+                       (with-suppressed-warnings ((callargs string-pixel-width))
+                         (string-pixel-width str buf))
+                     (string-pixel-width str))
+                   table)))))
+
+(defun vui--space-pixel-width ()
+  "Return the pixel width of a space in the current measuring context.
+Every pad and every character-to-pixel conversion asks for this, more
+than half of all width lookups on a table render, so it gets its own
+one-entry memo in front of `vui--string-pixel-width' rather than a hash
+walk each time.  Falls through to the main cache when the context (the
+measuring buffer's face remapping) differs from the memoized one."
+  (let ((context (buffer-local-value 'face-remapping-alist
+                                     (vui--measure-buffer))))
+    (if (and vui--space-pixel-memo
+             (eq (car vui--space-pixel-memo) context))
+        (cdr vui--space-pixel-memo)
+      (let ((width (vui--string-pixel-width " ")))
+        (setq vui--space-pixel-memo (cons context width))
+        width))))
+
+(defun vui--pixel-binary-search (str pixel-width)
+  "Automatically calculate the boundary and return the truncation position."
+  (let* ((len (length str))
+         (low 0)
+         (high len)
+         (best 0))
+    (while (<= low high)
+      (let* ((mid (/ (+ low high) 2))
+             (w (vui--text-width (substring str 0 mid))))
+        (cond
+         ((= w pixel-width) (setq best mid
+                                  low (1+ len)))
+         ((< w pixel-width) (setq best mid
+                                  low (1+ mid)))
+         (t (setq high (1- mid))))))
+    best))
+
+(defun vui--pixel-spaces (pixel)
+  "Generate a string of spaces and fine-tuned pixel spacing equivalent to
+the specified PIXEL width. It calculates the number of standard space
+characters that fit and appends the remaining pixel width using
+vui--pixel-spacing."
+  (let* ((space-pixel (vui--space-pixel-width))
+         (space-count (/ pixel space-pixel))
+         (remainder (- pixel (* space-pixel space-count))))
+    ;; No sub-space remainder (every pad in a monospace font): the run
+    ;; of spaces alone, shared, with no concat copy.
+    (if (zerop remainder)
+        (vui--spaces space-count)
+      (concat (vui--spaces space-count)
+              (vui--pixel-spacing remainder space-pixel)))))
+
+(defun vui--pixel-spacing (pixel &optional space-pixel)
+  "Return a spacer PIXEL pixels wide, or \"\" when PIXEL is not positive.
+SPACE-PIXEL is the width of a space in the measuring context (looked up
+when omitted).
+
+The spacer is a space carrying `(space :relative-width F)' with F =
+PIXEL / SPACE-PIXEL, not `(space :width (PIXEL))'.  Both render PIXEL
+wide at the time of the render, but an absolute pixel count is frozen:
+under `text-scale-mode' the text around it grows and the spacer does
+not, and the padding is off until the next render.  `:relative-width'
+is a multiple of the width of the space it sits on, in that space's
+face, so it follows the buffer's face remapping the way a real space
+does and the row keeps its proportions.  Emacs rounds F * width, so the
+float division is exact for every remainder below one space."
+  (if (<= pixel 0)
+      ""
+    (let ((space-pixel (or space-pixel (vui--space-pixel-width))))
+      (propertize " " 'display
+                  `(space :relative-width ,(/ (float pixel) space-pixel))))))
+
+(defun vui--to-pixel-width (width)
+  "Convert characters width to pixel width."
+  (when width
+    (if (<= width 0)
+        0
+      (* width (vui--space-pixel-width)))))
+
+;; Table rendering helpers
+
+(defun vui--measure-render-to-string (vnode)
+  "Render VNODE into a temp buffer for measurement; return its text.
+Rebinds vui--new-children and vui--child-index so orphaned instances
+cannot pollute the parent's children list, and isolates side effects
+via `vui--measuring-p' / `vui--pending-effects'.  The render target is
+captured before entering the temp buffer, so pixel measurements keep
+its face context (see `vui--measure-buffer').
+
+When the caller bound `vui--measure-reconcile', mounted components
+measure as their live current state (see `vui--measure-live-parent')
+and the cursor's index advances exactly as the real render will.
+
+The origin buffer's `fill-column' is carried into the temp buffer, so
+children resolving :width `fill-column' measure (and, in composed
+rows, render) against the buffer they will land in.  Other
+buffer-local variables are NOT carried: content that reads them sees
+their global values here."
+  (let ((vui--measure-buffer (vui--measure-buffer))
+        (reconcile vui--measure-reconcile)
+        (origin-fill-column fill-column))
+    (with-temp-buffer
+      (setq fill-column origin-fill-column)
+      (let ((vui--current-instance nil)
+            (vui--root-instance nil)
+            (vui--new-children nil)
+            (vui--child-index (if reconcile (cdr reconcile) 0))
+            (vui--measure-live-parent (car reconcile))
+            ;; The cursor is meaningful only at this entry's level; a
+            ;; nested measure (a table sizing its cells inside this
+            ;; subtree) must not consume it.
+            (vui--measure-reconcile nil)
+            (vui--measuring-p t)
+            (vui--pending-effects nil))
+        (vui--render-vnode vnode)
+        (when reconcile (setcdr reconcile vui--child-index)))
+      (buffer-string))))
+
+(defun vui--measure-live-match (vnode)
+  "Return the live mounted instance component VNODE measures as, or nil.
+Matches VNODE against `vui--measure-live-parent's children with the
+reconciliation rules (type plus key, or type at the current
+`vui--child-index').  Only a mounted instance counts; anything else
+measures as a throwaway render."
+  (let ((live (vui--find-matching-child
+               vui--measure-live-parent
+               (vui-vnode-component-type vnode)
+               (vui-vnode-key vnode)
+               vui--child-index)))
+    (and live
+         (vui-instance-mounted-p live)
+         live)))
+
+(defun vui--measure-shim-instance (instance)
+  "Return a measure-pass stand-in for INSTANCE.
+Shares everything a render function reads, but the hook storage a
+render may WRITE goes to copies: each ref cell is copied (a `setcar'
+during the measure is discarded, so the previous-value ref pattern
+still fires once per committed render), and the memo and callback
+tables are copied (cache writes are discarded).  The live instance is
+never touched."
+  (let ((shim (copy-vui-instance instance)))
+    (when-let* ((refs (vui-instance-refs instance)))
+      (let ((copy (make-hash-table :test 'eq)))
+        (maphash (lambda (key ref) (puthash key (cons (car ref) (cdr ref)) copy))
+                 refs)
+        (setf (vui-instance-refs shim) copy)))
+    (when-let* ((memos (vui-instance-memos instance)))
+      (setf (vui-instance-memos shim) (copy-hash-table memos)))
+    (when-let* ((callbacks (vui-instance-callbacks instance)))
+      (setf (vui-instance-callbacks shim) (copy-hash-table callbacks)))
+    shim))
+
+(defun vui--measure-instance-vtree (instance vnode)
+  "Compute the vtree INSTANCE will render for component VNODE.
+Mirrors the decision `vui--render-instance' will make: when the
+component's should-update says skip, the cached vtree is returned -
+it is exactly what the real render will commit - and otherwise the
+render function runs with VNODE's props and INSTANCE's current state.
+The cached vtree cannot be used unconditionally: when the measured
+re-render was triggered by this very instance's state change, it
+still shows the previous state.
+
+INSTANCE is never written: the render function runs against a shim
+copy (see `vui--measure-shim-instance') so render-time ref, memo, and
+callback writes are discarded, and no cached vtree, children, prev
+props/state, or lifecycle are touched - the real render does all of
+that."
+  (let* ((def (vui-instance-def instance))
+         (render-fn (vui-component-def-render-fn def))
+         (should-update-fn (vui-component-def-should-update def))
+         (props (vui-vnode-component-props vnode))
+         (children (vui-vnode-component-children vnode))
+         (props-wc (if children
+                       (plist-put (copy-sequence props) :children children)
+                     props))
+         (state (vui-instance-state instance)))
+    (if (and should-update-fn
+             (not (funcall should-update-fn props-wc state
+                           (vui-instance-prev-props instance)
+                           (vui-instance-prev-state instance)))
+             (vui-instance-cached-vtree instance))
+        (vui-instance-cached-vtree instance)
+      (let ((vui--current-instance (vui--measure-shim-instance instance))
+            (vui--consumed-contexts nil)
+            (vui--effect-index 0)
+            (vui--ref-index 0)
+            (vui--callback-index 0)
+            (vui--memo-index 0)
+            (vui--async-index 0))
+        (funcall render-fn props-wc state)))))
+
+(defun vui--cell-measure (cell)
+  "Measure CELL: return (STRING . WIDTH), rendering CELL if it is a vnode.
+STRING is the cell as text (a string cell as is, a vnode cell as its
+rendered text) and WIDTH its width in mode units.  This is the two-pass
+approach: render to measure, then render for real; the sizing pass
+keeps this pair so the row pass can reuse it instead of rendering and
+measuring the cell a second time.  Simple cases (string, nil) are
+optimized to avoid temp buffer overhead."
+  (cond
+   ((null cell) (cons "" 0))
+   ((stringp cell) (cons cell (vui--text-width cell)))
+   ;; For any vnode: render to temp buffer and measure
+   ;; This is the universal approach that works for any component
+   (t (let ((str (vui--measure-render-to-string cell)))
+        (cons str (vui--text-width str))))))
+
+(defun vui--cell-visual-width (cell)
+  "Get the visual width of CELL by rendering it.  See `vui--cell-measure'."
+  (cdr (vui--cell-measure cell)))
+
+(defun vui--measure-vnode-width (vnode)
+  "Measure VNODE's rendered width as the width of its widest line.
+Renders into a temp buffer with the same side-effect isolation as
+`vui--cell-visual-width', but multi-line content measures by its
+widest line rather than the sum of all lines."
+  (cond
+   ((null vnode) 0)
+   ((stringp vnode)
+    (vui--text-width vnode t))
+   (t (vui--text-width (vui--measure-render-to-string vnode) t))))
+
+(defun vui--measure-block (vnode)
+  "Render VNODE once and return its block: (LINES . WIDTH).
+LINES is the rendered text split into lines and WIDTH the widest
+line's width in mode units - the measured-block input of the pure
+layout core in vui-layout.el (issue #134).  Strings and nil skip the
+render; anything else renders like `vui--measure-vnode-width',
+including live-state measurement of mounted components when
+`vui--measure-reconcile' is bound."
+  (let* ((text (cond
+                ((null vnode) "")
+                ((stringp vnode) vnode)
+                (t (vui--measure-render-to-string vnode))))
+         ;; Split once; char mode takes the widest line from this very
+         ;; split (`vui--text-width' with MULTI-LINE-P would split the
+         ;; same string again), pixel mode measures the whole text
+         ;; (`string-pixel-width' already returns the widest line).
+         (lines (split-string text "\n")))
+    (cons lines
+          (pcase vui-width-mode
+            ('char (apply #'max (mapcar #'string-width lines)))
+            ('pixel (vui--string-pixel-width text))))))
+
+(defun vui--cell-to-string (cell)
+  "Convert CELL to string content by rendering it.
+For strings, returns as-is. For vnodes, renders to temp buffer."
+  (cond
+   ((null cell) "")
+   ((stringp cell) cell)
+   (t (vui--measure-render-to-string cell))))
+
+(defun vui--table-measure-cell (row i measures)
+  "Measure cell I of ROW, recording it in MEASURES when non-nil.
+Returns the width.  MEASURES maps a row to a vector of (STRING . WIDTH)
+covering the row's cells; a cell already measured (a column can be
+sized in more than one pass) is not measured again."
+  (if (null measures)
+      (vui--cell-visual-width (nth i row))
+    (let ((vec (or (gethash row measures)
+                   (puthash row (make-vector (length row) nil) measures))))
+      (cdr (or (aref vec i)
+               (aset vec i (vui--cell-measure (nth i row))))))))
+
+(defun vui--calculate-table-widths (columns rows border &optional header-face measures)
+  "Calculate column widths from COLUMNS specs and ROWS data.
+Uses two-pass rendering: cells are rendered to measure their visual width.
+When MEASURES is a hash table it is filled with what the pass measured,
+one vector of (STRING . WIDTH) per row (see `vui--cell-measure'), keyed
+by the row object, so the row pass can reuse it (`vui--render-table-row').
+Headers are measured wearing HEADER-FACE (default `vui-table-header'),
+the face they render with: in a proportional font bold is wider than
+regular, so measuring the plain text would size the column short.
+
+Column options:
+  :width W    - Target width for the VALUE portion of cell
+  :grow       - If t, pad short content to :width (minimum width behavior)
+  :truncate   - If t, truncate long content; if nil, overflow with ¦
+
+Width calculation:
+  - :width nil           -> auto-size to max(content)
+  - :width W :grow t     -> column width = W (enforced minimum)
+  - :width W :grow nil   -> column width = max(content) if all fit, else W"
+  (let* ((header-face (or header-face 'vui-table-header))
+         (col-count (length columns))
+         (widths (make-vector col-count 0)))
+    (cl-loop for col in columns
+             for i from 0
+             do (let ((declared-width (vui--width (plist-get col :width)))
+                      (grow (plist-get col :grow))
+                      (truncate-p (plist-get col :truncate))
+                      (header (plist-get col :header)))
+                  (if (null declared-width)
+                      ;; No :width - auto-size to max content
+                      (let ((max-w 1))
+                        (when header
+                          (setq max-w (max max-w (vui--text-width (vui--faced header header-face)))))
+                        (dolist (row rows)
+                          (when (and (listp row) (< i (length row)))
+                            (let ((cell-w (vui--table-measure-cell row i measures)))
+                              (setq max-w (max max-w cell-w)))))
+                        (aset widths i max-w))
+                    ;; Has :width
+                    (if grow
+                        ;; :grow t - column is at least :width
+                        (let ((max-w declared-width))
+                          ;; Can still grow beyond :width if content is larger
+                          ;; (unless :truncate is set)
+                          (unless truncate-p
+                            (when header
+                              (setq max-w (max max-w (vui--text-width (vui--faced header header-face)))))
+                            (dolist (row rows)
+                              (when (and (listp row) (< i (length row)))
+                                (let ((cell-w (vui--table-measure-cell row i measures)))
+                                  (setq max-w (max max-w cell-w))))))
+                          (aset widths i max-w))
+                      ;; :grow nil - column is max(content), overflow/truncate at :width
+                      (let ((max-w 1)
+                            (has-overflow nil))
+                        (when header
+                          (setq max-w (max max-w (vui--text-width (vui--faced header header-face)))))
+                        (dolist (row rows)
+                          (when (and (listp row) (< i (length row)))
+                            (let ((cell-w (vui--table-measure-cell row i measures)))
+                              (if (> cell-w declared-width)
+                                  (setq has-overflow t)
+                                (setq max-w (max max-w cell-w))))))
+                        ;; If any overflow/truncate needed, use declared-width; else shrink to max-w
+                        (aset widths i (if has-overflow
+                                           declared-width
+                                         max-w)))))))
+    ;; A bordered column's border segment spans the content width plus
+    ;; the cell padding on both sides, and it is drawn with whole fill
+    ;; glyphs, so it is that PADDED width that has to be a multiple of
+    ;; the fill glyph.  Rounding only the content width is enough in a
+    ;; monospace font (padding is two glyph widths already) but not when
+    ;; the fill glyph comes from a fallback font wider than the space,
+    ;; as it does under `variable-pitch-mode': the border row would then
+    ;; come out short of the data rows.  Char mode is unaffected
+    ;; (`vui--normalize-width' is the identity there).
+    (let* ((fill (pcase border (:ascii "-") (:unicode "─")))
+           (padding (if border (vui--width 2) 0)))
+      (mapcar (lambda (w)
+                (- (vui--normalize-width fill (+ w padding)) padding))
+              (append widths nil)))))
+
+(defvar-local vui--table-sticky-registry nil
+  "Sticky table regions in this buffer, newest first.
+Each entry is a cons (HEADER-MARKER . END-MARKER): HEADER-MARKER sits
+at the start of the table's in-buffer header row, END-MARKER at the
+end of the table.  `vui--table-sticky-header' pins the header of the
+entry whose region spans the window start.  Entries whose region has
+collapsed (the table was erased or re-rendered elsewhere) are inert
+and are pruned by `vui--table-prune-sticky-registry'.")
+
+(defvar-local vui--table-saved-header-line nil
+  "Previous `header-line-format', saved before a sticky header replaced it.
+A cons (t . VALUE) while a sticky table header is installed, nil
+otherwise.  The cons distinguishes a saved nil from nothing saved.
+VALUE is put back by `vui--table-restore-header-line'.")
+
+(defun vui--table-prune-sticky-registry ()
+  "Drop registry entries whose table region no longer exists.
+A deleted or rewritten table leaves its markers collapsed (start not
+before end); such entries never match a window position, so this is
+garbage collection, not behavior."
+  (setq vui--table-sticky-registry
+        (cl-delete-if (lambda (entry)
+                        (let ((start (marker-position (car entry)))
+                              (end (marker-position (cdr entry))))
+                          (when (or (null start) (null end) (>= start end))
+                            (set-marker (car entry) nil)
+                            (set-marker (cdr entry) nil)
+                            t)))
+                      vui--table-sticky-registry)))
+
+(defun vui--table-register-sticky (header-pos end-pos)
+  "Register a sticky table spanning up to END-POS in the current buffer.
+HEADER-POS is where its in-buffer header row starts.  Installs the
+header-line machinery on first use, saving the previous
+`header-line-format' so unmounting can restore it."
+  (vui--table-prune-sticky-registry)
+  (push (cons (copy-marker header-pos) (copy-marker end-pos))
+        vui--table-sticky-registry)
+  (unless vui--table-saved-header-line
+    (setq vui--table-saved-header-line (cons t header-line-format)))
+  (setq header-line-format '("" (:eval (vui--table-sticky-header)))))
+
+(defun vui--table-sticky-header-padding ()
+  "Return a stretch space aligning sticky headers with buffer text.
+A window's content consists of the fringe, margin, and text area.
+
+  ┌────────┬────────┬───────────────────────────────────────────┐
+  │ Fringe │ Margin │             Buffer Text Area              │
+  ├────────┼────────┼───────────────────────────────────────────┤
+  |        |        | (line-num) (line-prefix) (...) (REAL TEXT)|
+  └────────┴────────┴───────────────────────────────────────────┘
+
+Emacs inserts some virtual content at the beginning of the text
+area, such as `display-line-numbers', `line-prefix', or `wrap-prefix'.
+The current implementation only aligns `display-line-numbers', since it
+is the most common case.  :align-to N refers to the Nth canonical column
+from the start of the text area."
+  (propertize " " 'display `(space :align-to ,(line-number-display-width 'columns))))
+
+(defun vui--table-sticky-header (&optional pos)
+  "Return the header to pin for a window starting at POS.
+POS defaults to `window-start'; redisplay evaluates this per window,
+with that window selected, so each window pins the header of the
+sticky table it is scrolled into.  Returns the table's in-buffer
+header row - read live from the buffer, so it is always in sync with
+the current column widths - when POS is past the header row but
+before the table's end, and an empty string otherwise.
+
+The copy is prefixed with a stretch space reaching the start of the
+buffer text (see `vui--table-sticky-header-padding'): header-line
+content starts at the window edge (over the fringe), while buffer
+text starts after it, so without the prefix the pinned columns would
+not line up with the table body.  Percent signs are doubled because
+the result is a mode-line construct.  Never signals: redisplay runs
+this on every frame update, and an error here would loop."
+  (condition-case nil
+      (let* ((pos (or pos (window-start)))
+             (entry (cl-find-if
+                     (lambda (e)
+                       (let ((start (marker-position (car e)))
+                             (end (marker-position (cdr e))))
+                         (and start end (> pos start) (< pos end))))
+                     vui--table-sticky-registry)))
+        (if (null entry)
+            ""
+          (save-excursion
+            (goto-char (car entry))
+            (concat (vui--table-sticky-header-padding)
+                    (replace-regexp-in-string
+                     "%" "%%"
+                     (buffer-substring (line-beginning-position)
+                                       (line-end-position)))))))
+    (error "")))
+
+(defun vui--table-restore-header-line ()
+  "Restore the header line replaced by sticky table headers, if any.
+Only restores once no live sticky table remains in the buffer, so
+tearing down one instance leaves another instance's pinned header
+working."
+  (vui--table-prune-sticky-registry)
+  (when (and vui--table-saved-header-line
+             (null vui--table-sticky-registry))
+    (setq header-line-format (cdr vui--table-saved-header-line))
+    (kill-local-variable 'vui--table-saved-header-line)
+    (kill-local-variable 'vui--table-sticky-registry)))
+
+(defun vui--render-table-border (col-widths border-style position &optional cell-padding border-face)
+  "Render a table border line.
+COL-WIDTHS is list of column widths.
+BORDER-STYLE is :ascii or :unicode.
+POSITION is \\='top, \\='bottom, or \\='separator.
+CELL-PADDING is the padding added to each side of cell content.
+BORDER-FACE overrides `vui-table-border' for the border characters."
+  (let* ((chars (pcase border-style
+                  (:ascii
+                   (pcase position
+                     ('top '("+" "-" "+"))
+                     ('bottom '("+" "-" "+"))
+                     ('separator '("+" "-" "+"))))
+                  (:unicode
+                   (pcase position
+                     ('top '("┌" "─" "┬" "┐"))
+                     ('bottom '("└" "─" "┴" "┘"))
+                     ('separator '("├" "─" "┼" "┤"))))))
+         (face (or border-face 'vui-table-border))
+         (left (nth 0 chars))
+         (fill (nth 1 chars))
+         (mid (nth 2 chars))
+         (right (or (nth 3 chars) (nth 0 chars)))
+         (padding (or cell-padding 0))
+         ;; Glyph widths, measured wearing the border face like the
+         ;; data rows' separator (`vui--table-separators').  In a
+         ;; monospace font these are all one column; in a proportional
+         ;; font they need not be: Helvetica draws the rules and corners
+         ;; at 12px and the junctions at 9px.
+         (sep-w (vui--text-width (car (vui--table-separators border-style face))))
+         (fill-w (vui--text-width (vui--faced fill face)))
+         (left-w (vui--text-width (vui--faced left face)))
+         (mid-w (vui--text-width (vui--faced mid face)))
+         (right-w (vui--text-width (vui--faced right face)))
+         (last (1- (length col-widths)))
+         (start (point)))
+    ;; The vertical strokes have to line up: each junction on this row
+    ;; is centred on the data rows' separator at that boundary (centred,
+    ;; not left-aligned, so a 9px junction under a 12px separator puts
+    ;; its stroke on the same pixel).  Positions are computed from the
+    ;; separator centres in half-pixels, absolute from the row start,
+    ;; so rounding never accumulates across columns.  In a monospace
+    ;; font every glyph is one column and each rule comes out exactly
+    ;; WIDTH + 2*PADDING wide: byte-identical output.  The leftmost
+    ;; corner cannot start before the row does, so a corner wider than
+    ;; the separator is clamped there and overhangs on the right only.
+    (let ((centre sep-w)   ; twice the centre of the separator at the row start
+          (x 0))           ; pixel position after the last junction
+      ;; The left corner too: a narrow one starts a little in, so it is
+      ;; centred on the first separator like every other junction
+      (let ((at (max 0 (/ (- centre left-w) 2))))
+        (insert (vui--pad at))
+        (insert left)
+        (setq x (+ at left-w)))
+      (cl-loop for width in col-widths
+               for i from 0
+               do (let* ((junction (if (< i last) mid right))
+                         (junction-w (if (< i last) mid-w right-w))
+                         (span (+ width (vui--width (* 2 padding)))))
+                    ;; centre of the next separator, and where a junction
+                    ;; of this width must start to be centred on it
+                    (setq centre (+ centre (* 2 (+ sep-w span))))
+                    (let ((at (max x (/ (- centre junction-w) 2))))
+                      (insert (vui--border-segment (- at x) fill fill-w))
+                      (insert junction)
+                      (setq x (+ at junction-w)))))
+      ;; A right corner narrower than the separator ends the row short
+      ;; of the data rows; pad the difference so the rows measure the same
+      (let ((data-end (/ (+ centre sep-w) 2)))
+        (when (> data-end x)
+          (insert (vui--pad (- data-end x))))))
+    (put-text-property start (point) 'face face)
+    (insert "\n")))
+
+(defun vui--border-segment (width fill fill-w)
+  "Return a horizontal rule WIDTH units wide drawn with FILL glyphs.
+FILL-W is one FILL glyph's width.  Whole glyphs, and when WIDTH is not
+a multiple of FILL-W (only possible in `pixel' mode with a font whose
+border glyphs are not multiples of each other) spacers for the
+remainder, so the rule spans exactly from one junction to the next.
+The remainder is split evenly on both sides of the glyphs: a rule
+centred between its junctions with an equal small gap at each end
+reads as spacing, where one gap of up to a whole glyph on one side
+reads as a hole."
+  (if (or (<= width 0) (<= fill-w 0))
+      ""
+    (let* ((count (/ width fill-w))
+           (remainder (- width (* count fill-w)))
+           (rule (make-string count (string-to-char fill))))
+      (if (zerop remainder)
+          rule
+        (let ((before (/ remainder 2)))
+          (concat (vui--pad before) rule (vui--pad (- remainder before))))))))
+
+(defvar vui--table-separators-memo nil
+  "Alist of ((BORDER-STYLE . FACE) . (SEP . OVERFLOW-SEP)) strings.
+Table rows insert the same two propertized separator strings for every
+row of every table; building them per row was a measurable share of a
+large render.  Inserting copies, so the strings can be shared.")
+
+(defun vui--table-separators (border-style face)
+  "Return (SEP . OVERFLOW-SEP) for BORDER-STYLE drawn in FACE, memoized."
+  (let ((key (cons border-style face)))
+    (or (cdr (assoc key vui--table-separators-memo))
+        (let ((seps (cons (pcase border-style
+                            (:ascii (propertize "|" 'face face))
+                            (:unicode (propertize "│" 'face face))
+                            (_ " "))
+                          (pcase border-style
+                            (:ascii (propertize "¦" 'face face))
+                            (:unicode (propertize "¦" 'face face))
+                            (_ " ")))))
+          (push (cons key seps) vui--table-separators-memo)
+          seps))))
+
+(defun vui--render-table-row (cells col-widths columns border-style header-p &optional row-idx header-face border-face measured)
+  "Render a table row.
+CELLS is list of cell contents.
+COL-WIDTHS is list of column widths.
+COLUMNS is list of column specs.
+BORDER-STYLE is nil, :ascii, or :unicode.
+HEADER-P indicates if this is a header row.
+ROW-IDX is the row index for cursor tracking (nil for headers).
+HEADER-FACE overrides `vui-table-header' for header cells.
+BORDER-FACE overrides `vui-table-border' for column separators.
+MEASURED, when given, is the vector of (STRING . WIDTH) the sizing pass
+recorded for this row (see `vui--calculate-table-widths'); cells found
+there are not rendered to text and measured again.
+
+Handles :truncate and overflow:
+- If content > width and :truncate t: truncate with ...
+- If content > width and no :truncate: show up to width, use ¦ separator"
+  (let* ((sep-face (or border-face 'vui-table-border))
+         (seps (vui--table-separators border-style sep-face))
+         (sep (car seps))
+         (overflow-sep (cdr seps))
+         (cell-padding (if border-style (vui--text-width " ") 0))
+         ;; The same padding string goes on both sides of every cell in
+         ;; the row; build it once (it is shared, see `vui--spaces')
+         (cell-pad-str (if (> cell-padding 0) (vui--pad cell-padding) "")))
+    (when border-style
+      (insert sep))
+    (cl-loop for cell in cells
+             for width in col-widths
+             for col in columns
+             for i from 0
+             do (let* ((align (if header-p :left (or (plist-get col :align) :left)))
+                       (truncate-p (plist-get col :truncate))
+                       (grow (plist-get col :grow))
+                       (declared-width (vui--width (plist-get col :width)))
+                       (face (when header-p (or header-face 'vui-table-header)))
+                       ;; Get content as string (works for both vnodes and strings).
+                       ;; A header wears its face from here on, so it is
+                       ;; measured, truncated and inserted as the same text.
+                       (measure (and measured (< i (length measured))
+                                     (aref measured i)))
+                       (content (if measure
+                                    (car measure)
+                                  (vui--faced (vui--cell-to-string cell) face)))
+                       (content-width (if measure
+                                          (cdr measure)
+                                        (vui--text-width content)))
+                       ;; Check for overflow (content exceeds declared width)
+                       ;; No overflow if :grow t (column expands) or :truncate t (content truncated)
+                       (has-overflow (and declared-width
+                                          (not grow)
+                                          (> content-width declared-width)
+                                          (not truncate-p)))
+                       ;; Handle truncation or overflow
+                       (display-content
+                        (cond
+                         ;; Truncate if content exceeds width and :truncate is set
+                         ((and truncate-p declared-width (> content-width declared-width))
+                          (vui--truncate-string content declared-width "..."))
+                         ;; Overflow: show content up to width
+                         (has-overflow
+                          (vui--truncate-string content declared-width))
+                         ;; Normal case
+                         (t content)))
+                       (overflow-content
+                        (when has-overflow
+                          (substring content (length display-content))))
+                       ;; A truncated header gets its face back on the
+                       ;; ellipsis, before it is measured
+                       (display-content (vui--faced display-content face))
+                       ;; Untruncated content (the common case) is the
+                       ;; string already measured above
+                       (display-width (if (eq display-content content)
+                                          content-width
+                                        (vui--text-width display-content)))
+                       (padding (max 0 (- width display-width))))
+                  ;; Left cell padding
+                  (when (> cell-padding 0)
+                    (insert cell-pad-str))
+                  ;; Render cell content with alignment
+                  ;; For vnodes (buttons, etc.), render directly to preserve interactivity
+                  ;; For strings, insert with optional face
+                  ;; For button vnodes with truncate, set max-width so button truncates its label
+                  (let* ((is-vnode (and cell (not (stringp cell))))
+                         (render-cell
+                          (if (and is-vnode truncate-p declared-width
+                                   (vui-vnode-button-p cell))
+                              ;; Create a copy of the button with max-width set
+                              (vui-vnode-button--create
+                               :label (vui-vnode-button-label cell)
+                               :on-click (vui-vnode-button-on-click cell)
+                               :face (vui-vnode-button-face cell)
+                               :disabled-p (vui-vnode-button-disabled-p cell)
+                               :max-width declared-width
+                               :no-decoration (vui-vnode-button-no-decoration cell)
+                               :help-echo (vui-vnode-button-help-echo cell)
+                               :tab-order (vui-vnode-button-tab-order cell)
+                               :keymap (vui-vnode-button-keymap cell)
+                               :key (vui-vnode-key cell))
+                            cell))
+                         ;; Update path for table cells: (col row ...parent-path...)
+                         ;; Only for data rows (row-idx is non-nil)
+                         (vui--render-path
+                          (if (and is-vnode row-idx)
+                              (cons i (cons row-idx vui--render-path))
+                            vui--render-path)))
+                    (pcase align
+                      (:left
+                       (if is-vnode
+                           (vui--render-vnode render-cell)
+                         (insert display-content))
+                       (insert (vui--pad padding)))
+                      (:right
+                       (insert (vui--pad padding))
+                       (if is-vnode
+                           (vui--render-vnode render-cell)
+                         (insert display-content)))
+                      (:center
+                       (let* ((split (vui--split-padding padding))
+                              (left-pad (car split))
+                              (right-pad (cdr split)))
+                         (insert (vui--pad left-pad))
+                         (if is-vnode
+                             (vui--render-vnode render-cell)
+                           (insert display-content))
+                         (insert (vui--pad right-pad))))))
+                  ;; Right cell padding and column separator
+                  ;; When overflow, use padding + overflow separator + trimmed overflow content
+                  (cond
+                   ;; Overflow case: padding + overflow separator + overflow content (trimmed)
+                   ((and border-style has-overflow)
+                    (when (> cell-padding 0)
+                      (insert cell-pad-str))
+                    (insert overflow-sep)
+                    (insert (string-trim-left overflow-content)))
+                   ;; Normal case with border: padding + separator
+                   (border-style
+                    (when (> cell-padding 0)
+                      (insert cell-pad-str))
+                    (insert sep))
+                   ;; No border: space between cells
+                   (t
+                    (when (< i (1- (length cells)))
+                      (insert " "))))))
+    (insert "\n")))
+
+(defun vui--window-width ()
+  "Columns of the window showing the buffer currently being rendered.
+Not `(window-width)', which measures the SELECTED window: a tree
+mounted in a buffer displayed somewhere else - a side window, a popup
+frame that deliberately keeps focus elsewhere - would otherwise lay
+itself out to an unrelated window\='s width, and only look right once
+that window happened to be selected.
+
+The buffer is `vui--measure-buffer\='s, so a layout measured inside a
+temp buffer (a table sizing its cells) resolves against the window of
+the buffer it will land in, the same way `fill-column\=' is carried in.
+Falls back to the selected window when that buffer is not displayed
+anywhere.  A buffer shown in several windows resolves to the first one
+`get-buffer-window\=' returns, as `vui--on-window-size-change\=' does."
+  (if-let* ((window (get-buffer-window (vui--measure-buffer) t)))
+      (window-width window)
+    (window-width)))
+
+(defun vui--flex-resolve-width (width)
+  "Resolve a `vui-flex' WIDTH spec to a number at render time.
+WIDTH is a number, a function, or one of the symbols `fill-column'
+and `window'."
+  (vui--width
+   (cond
+    ((numberp width) width)
+    ((eq width 'fill-column) fill-column)
+    ((eq width 'window) (vui--window-width))
+    ((functionp width) (funcall width))
+    (t fill-column))))
+
+(defun vui--render-flex (vnode)
+  "Render a `vui-flex' VNODE: distribute its width among children."
+  (let* ((children (vui-vnode-flex-children vnode))
+         (spacing (vui--width (or (vui-vnode-flex-spacing vnode) 1)))
+         (indent (vui--width (or (vui-vnode-flex-indent vnode) 0)))
+         (justify (or (vui-vnode-flex-justify vnode) :start))
+         (total (max 0 (- (vui--flex-resolve-width (vui-vnode-flex-width vnode))
+                          indent)))
+         (flex-start (point))
+         ;; Classify children: growers carry a weight, the rest are
+         ;; measured at natural width.  The measure runs under a
+         ;; reconciliation cursor so a mounted component child measures
+         ;; at its current state (see `vui--measure-reconcile'); the
+         ;; cursor is a scratch copy, so the real pass below re-counts
+         ;; from the same starting index.  Static grower children are
+         ;; measured here as well - it advances the cursor past their
+         ;; components exactly as the real render will (a skipped
+         ;; grower would make every later unkeyed component measure
+         ;; against the wrong live instance) and saves re-measuring
+         ;; them at render time.  Function growers cannot be measured
+         ;; before allocation; give components inside them a :key.
+         (specs (let ((vui--measure-reconcile
+                       (and vui--current-instance
+                            (cons vui--current-instance vui--child-index))))
+                  (mapcar (lambda (child)
+                            (if (vui-vnode-flex-item-p child)
+                                (let ((inner (vui-vnode-flex-item-child child))
+                                      (grow (or (vui-vnode-flex-item-grow child) 1)))
+                                  (if (functionp inner)
+                                      (list :child inner :grow grow)
+                                    (list :child inner :grow grow
+                                          :grower-natural
+                                          (vui--measure-vnode-width inner))))
+                              (list :child child
+                                    :natural (vui--measure-vnode-width child))))
+                          children)))
+         (grow-total (cl-reduce #'+ (mapcar (lambda (s) (or (plist-get s :grow) 0))
+                                     specs)
+                      :initial-value 0))
+         (naturals (cl-reduce #'+ (mapcar (lambda (s) (or (plist-get s :natural) 0))
+                                   specs)
+                    :initial-value 0))
+         (sep-count (max 0 (1- (length specs))))
+         (leftover (max 0 (- total naturals (* spacing sep-count))))
+         ;; Everything above is in mode units.  The leftover is handed
+         ;; out in WHOLE COLUMNS, with the sub-column pixel remainder
+         ;; (always 0 in char mode) carried to one place: the last
+         ;; grower, or the last space-between gap.  Distributing raw
+         ;; pixels would give ASCII rows fractional shares that char
+         ;; mode never produces, breaking byte parity for no gain, and
+         ;; would leave a row short when a function grower rounds down.
+         (col (vui--column-width))
+         (leftover-cols (/ leftover col))
+         (leftover-rem (- leftover (* leftover-cols col))))
+    ;; Distribute leftover among growers, remainder to the last one
+    (when (> grow-total 0)
+      (let ((growers (cl-remove-if-not (lambda (s) (plist-get s :grow)) specs))
+            (assigned 0))
+        (dolist (spec growers)
+          (let ((share-cols (/ (* leftover-cols (plist-get spec :grow)) grow-total)))
+            (plist-put spec :share (* share-cols col))
+            (cl-incf assigned share-cols)))
+        (let ((last-grower (car (last growers))))
+          (plist-put last-grower :share (+ (plist-get last-grower :share)
+                                           (* (- leftover-cols assigned) col)
+                                           leftover-rem)))))
+    ;; Without growers, leftover goes to justify padding
+    (let* ((extra-cols (if (> grow-total 0) 0 leftover-cols))
+           (extra-rem (if (> grow-total 0) 0 leftover-rem))
+           (lead (pcase justify
+                   (:end (+ (* extra-cols col) extra-rem))
+                   (:center (* col (/ extra-cols 2)))
+                   (_ 0)))
+           (gap-base (if (and (eq justify :space-between) (> sep-count 0))
+                         (* col (/ extra-cols sep-count))
+                       0))
+           (gap-remainder (if (and (eq justify :space-between) (> sep-count 0))
+                              (% extra-cols sep-count)
+                            0))
+           (gap-index 0)
+           (prev-rendered-p nil)
+           (child-idx 0))
+      (when (> lead 0)
+        (insert (vui--pad lead)))
+      (dolist (spec specs)
+        (let ((sep-start (point))
+              (content-start nil)
+              (vui--render-path (cons child-idx vui--render-path)))
+          ;; Separator (plus space-between padding) if previous child rendered
+          (when prev-rendered-p
+            (insert (vui--pad spacing))
+            (when (> gap-base 0)
+              (insert (vui--pad gap-base)))
+            ;; The first GAP-REMAINDER gaps get one extra column; the
+            ;; last gap also absorbs the pixel remainder so the final
+            ;; child lands exactly on the right edge.
+            (when (< gap-index gap-remainder)
+              (insert (vui--pad col)))
+            (when (and (eq justify :space-between)
+                       (= gap-index (1- sep-count))
+                       (> extra-rem 0))
+              (insert (vui--pad extra-rem)))
+            (cl-incf gap-index))
+          (setq content-start (point))
+          (let ((child (plist-get spec :child))
+                (share (plist-get spec :share)))
+            ;; SHARE is in mode units (pixels under `pixel'), like
+            ;; `total' and the naturals it was carved from.
+            (cond
+             ;; Grower with a width-receiving function.  Its WIDTH is
+             ;; characters by contract (it feeds things like :size), so
+             ;; convert once here; pixel mode rounds down to whole
+             ;; columns, which is the best a character count can do.
+             ((and share (functionp child))
+              (vui--render-vnode (funcall child (vui--width-to-chars share))))
+             ;; Grower with a plain vnode: render it, then pad out to
+             ;; its share.  Padding directly in mode units keeps the
+             ;; sub-column remainder in pixel mode; going through a
+             ;; character-width box would drop it (and would convert
+             ;; the share a second time).  The natural width comes from
+             ;; the specs pass - measuring here would rebind the
+             ;; reconciliation cursor around a real render, where any
+             ;; nested measurement (a table sizing its cells) would
+             ;; consume it against the wrong parent.
+             (share
+              (let ((natural (or (plist-get spec :grower-natural) 0)))
+                (vui--render-vnode child)
+                (insert (vui--pad (max 0 (- share natural))))))
+             ;; Natural-width child
+             (t
+              (vui--render-vnode child))))
+          ;; Check if child actually rendered anything
+          (if (> (point) content-start)
+              (setq prev-rendered-p t)
+            ;; Child rendered nothing - remove the separator we added
+            (delete-region sep-start (point))))
+        (cl-incf child-idx)))
+    (vui--apply-region-props flex-start (point)
+                             (vui-vnode-flex-face vnode)
+                             (vui-vnode-flex-keymap vnode))))
+
+(defun vui--flex-wrap-specs (children)
+  "Measure CHILDREN of a wrapping flex into layout specs.
+Returns one plist per child, carrying both the constraint keys the
+layout core reads (:natural :min :grow) and the render keys the row
+renderers need (:child, :block with the measured lines, :function for
+a width-receiving function child).  Static children are measured once
+here; the measured lines are reused when a row is composed.  Runs
+under a reconciliation cursor so mounted components measure at their
+current state."
+  (let ((vui--measure-reconcile
+         (and vui--current-instance
+              (cons vui--current-instance vui--child-index))))
+    (mapcar
+     (lambda (child)
+       (if (vui-vnode-flex-item-p child)
+           (let* ((inner (vui-vnode-flex-item-child child))
+                  (grow (or (vui-vnode-flex-item-grow child) 1))
+                  (min-chars (vui-vnode-flex-item-min-width child))
+                  (min (and min-chars (vui--width min-chars))))
+             (if (functionp inner)
+                 ;; Width-receiving function: it renders at whatever
+                 ;; width the row assigns, so its floor doubles as the
+                 ;; width it occupies during partitioning.
+                 (list :child inner :function t
+                       :natural (or min 0) :min (or min 0) :grow grow)
+               ;; A static block renders at one width and cannot
+               ;; re-render narrower, so it is rigid: packing its row
+               ;; at a smaller floor would only overflow the row.
+               ;; :min-width can still raise the width it occupies.
+               (let ((block (vui--measure-block inner)))
+                 (list :child inner :block (car block)
+                       :natural (cdr block) :min min :rigid t
+                       :grow grow))))
+         (let ((block (vui--measure-block child)))
+           (list :child child :block (car block)
+                 :natural (cdr block) :rigid t :grow 0))))
+     children)))
+
+(defun vui--flex-wrap-rows (specs placements)
+  "Group SPECS with their PLACEMENTS into rows.
+Returns a list of rows, each a list of (SPEC . WIDTH) in source order."
+  (let ((rows nil)
+        (current nil)
+        (current-row 0))
+    (cl-mapc (lambda (spec placement)
+               (let ((row (plist-get placement :row)))
+                 (unless (= row current-row)
+                   (push (nreverse current) rows)
+                   (setq current nil
+                         current-row row))
+                 (push (cons spec (plist-get placement :width)) current)))
+             specs placements)
+    (when current
+      (push (nreverse current) rows))
+    (nreverse rows)))
+
+(defun vui--flex-render-inline-row (row spacing index)
+  "Render ROW of (SPEC . WIDTH) cells in place, separated by SPACING.
+INDEX is the first cell's child index, for render paths.  The same
+identity-preserving render as a non-wrapped flex: children render into
+the real buffer and pad out to their assigned width (a grower's share,
+or a :min-width above the content)."
+  (let ((prev-rendered-p nil))
+    (dolist (cell row)
+      (let* ((spec (car cell))
+             (width (cdr cell))
+             (child (plist-get spec :child))
+             (sep-start (point))
+             (content-start nil)
+             (vui--render-path (cons index vui--render-path)))
+        (when prev-rendered-p
+          (insert (vui--pad spacing)))
+        (setq content-start (point))
+        (cond
+         ((plist-get spec :function)
+          ;; Render the vnode produced at measure time (the content a
+          ;; field or button carries must land for real), padded out
+          ;; to the assignment if it renders short.
+          (vui--render-vnode (or (plist-get spec :vnode)
+                                 (funcall child (vui--width-to-chars width))))
+          (insert (vui--pad (max 0 (- width (plist-get spec :natural))))))
+         (t
+          (vui--render-vnode child)
+          (insert (vui--pad (max 0 (- width (plist-get spec :natural)))))))
+        (if (> (point) content-start)
+            (setq prev-rendered-p t)
+          ;; Child rendered nothing - remove the separator we added
+          (delete-region sep-start (point))))
+      (cl-incf index))))
+
+(defun vui--flex-render-composed-row (row spacing indent)
+  "Insert ROW of (SPEC . WIDTH) cells composed side by side as text.
+Every cell reuses its measured lines (static cells from the specs
+pass, function cells from the post-allocation measure).  Lines after
+the first are indented by INDENT (mode units).  Composition goes
+through `vui-layout-compose' with mode-aware measurement and padding,
+so a block wider than its assignment widens its column instead of
+breaking alignment."
+  (let* ((blocks (mapcar (lambda (cell) (plist-get (car cell) :block)) row))
+         (widths (mapcar #'cdr row))
+         (lines (vui-layout-compose blocks widths spacing
+                                    #'vui--text-width #'vui--pad))
+         (first t))
+    (dolist (line lines)
+      (unless first
+        (insert "\n")
+        (when (> indent 0)
+          (insert (vui--pad indent))))
+      (setq first nil)
+      (insert line))))
+
+(defun vui--render-flex-wrap (vnode)
+  "Render a `vui-flex' VNODE with :wrap - children partition into rows.
+Measures each child once, asks the pure core (`vui-layout-solve') for
+row and width placements, then renders row by row: a row whose blocks
+are all single-line renders inline (component and widget identity
+preserved, exactly like a non-wrapped flex), a row containing a
+multi-line block is composed as text.  Rows after the first start on a
+new line, indented by the flex's :indent."
+  (let* ((children (vui-vnode-flex-children vnode))
+         (spacing (vui--width (or (vui-vnode-flex-spacing vnode) 1)))
+         (indent (vui--width (or (vui-vnode-flex-indent vnode) 0)))
+         (total (max 0 (- (vui--flex-resolve-width (vui-vnode-flex-width vnode))
+                          indent)))
+         (flex-start (point))
+         ;; A child that renders nothing is dropped, like the
+         ;; non-wrapped flex removing its separator: it must not eat a
+         ;; gap or a column.  (Growers and function children stay -
+         ;; they occupy their assigned width even when empty.)
+         (specs (cl-remove-if
+                 (lambda (spec)
+                   (and (not (plist-get spec :function))
+                        (= 0 (plist-get spec :grow))
+                        (equal (plist-get spec :block) '(""))))
+                 (vui--flex-wrap-specs children)))
+         (placements (vui-layout-solve specs total spacing))
+         (rows (vui--flex-wrap-rows specs placements))
+         (first-row t)
+         (index 0))
+    ;; Function children can only render at their assigned width, so
+    ;; their blocks exist only now that allocation has run.  Measuring
+    ;; them here (not under the reconciliation cursor - allocation
+    ;; order no longer matches source order) makes a multi-line
+    ;; function child compose like any other block instead of breaking
+    ;; its row.
+    (dolist (row rows)
+      (dolist (cell row)
+        (let ((spec (car cell)))
+          (when (and (plist-get spec :function)
+                     (not (plist-get spec :block)))
+            (let* ((vnode (funcall (plist-get spec :child)
+                                   (vui--width-to-chars (cdr cell))))
+                   (block (vui--measure-block vnode)))
+              ;; Keep the vnode: the inline branch renders it for real
+              ;; instead of calling the function a second time.
+              (plist-put spec :vnode vnode)
+              (plist-put spec :block (car block))
+              (plist-put spec :natural (cdr block)))))))
+    (dolist (row rows)
+      (unless first-row
+        (insert "\n")
+        (when (> indent 0)
+          (insert (vui--pad indent))))
+      (setq first-row nil)
+      (if (cl-some (lambda (cell)
+                     (cdr (plist-get (car cell) :block)))
+                   row)
+          (vui--flex-render-composed-row row spacing indent)
+        (vui--flex-render-inline-row row spacing index))
+      (cl-incf index (length row)))
+    (vui--apply-region-props flex-start (point)
+                             (vui-vnode-flex-face vnode)
+                             (vui-vnode-flex-keymap vnode))))
+
+(defun vui--render-grid (vnode)
+  "Render a `vui-grid' VNODE: cells on equal tracks, rows in source order.
+Measures every static cell once (mounted components at their current
+state), asks the pure core for the responsive column count and track
+widths, widens any column whose content overflows its track - across
+all rows, so columns stay aligned - then renders row by row with the
+same identity rules as `vui--render-flex-wrap': single-line rows
+in place, rows containing a multi-line cell composed as text."
+  (let* ((children (vui-vnode-grid-children vnode))
+         (spacing (vui--width (or (vui-vnode-grid-spacing vnode) 1)))
+         (row-spacing (or (vui-vnode-grid-row-spacing vnode) 0))
+         (indent (vui--width (or (vui-vnode-grid-indent vnode) 0)))
+         (total (max 0 (- (vui--flex-resolve-width (vui-vnode-grid-width vnode))
+                          indent)))
+         (columns (max 1 (or (vui-vnode-grid-columns vnode) 2)))
+         (min-chars (vui-vnode-grid-min-column-width vnode))
+         (count (vui-layout-grid-columns
+                 columns (and min-chars (vui--width min-chars))
+                 total spacing))
+         (tracks (vui-layout-grid-tracks count total spacing))
+         (grid-start (point))
+         ;; Measure every cell once, under a reconciliation cursor so
+         ;; mounted components measure at current state.  Unlike flex,
+         ;; the tracks are known before anything renders, so function
+         ;; cells measure too - at their track width - and multi-line
+         ;; function output composes like any other block.
+         (cells (let ((vui--measure-reconcile
+                       (and vui--current-instance
+                            (cons vui--current-instance vui--child-index)))
+                     (col 0))
+                  (mapcar (lambda (child)
+                            (let* ((track (nth col tracks))
+                                   ;; A function cell is called once;
+                                   ;; the vnode it returned renders
+                                   ;; again in the inline branch.
+                                   (vnode (if (functionp child)
+                                              (funcall child
+                                                       (vui--width-to-chars track))
+                                            child))
+                                   (block (vui--measure-block vnode)))
+                              (setq col (% (1+ col) count))
+                              (list :child child
+                                    :function (and (functionp child) t)
+                                    :vnode (and (functionp child) vnode)
+                                    :block (car block)
+                                    :natural (cdr block))))
+                          children)))
+         ;; Effective column widths: content wider than its track
+         ;; widens the whole column, for every row.
+         (widths (copy-sequence tracks))
+         (first-row t)
+         (index 0))
+    (let ((col 0))
+      (dolist (cell cells)
+        (let ((natural (plist-get cell :natural)))
+          (when (and natural (> natural (nth col widths)))
+            (setcar (nthcdr col widths) natural)))
+        (setq col (% (1+ col) count))))
+    (dolist (row (seq-partition cells count))
+      (unless first-row
+        (insert "\n")
+        (dotimes (_ row-spacing) (insert "\n"))
+        (when (> indent 0)
+          (insert (vui--pad indent))))
+      (setq first-row nil)
+      (if (cl-some (lambda (cell) (cdr (plist-get cell :block))) row)
+          ;; Composed row: every cell reuses its measured lines.
+          (let* ((blocks (mapcar (lambda (cell) (plist-get cell :block)) row))
+                 (lines (vui-layout-compose
+                         blocks (cl-subseq widths 0 (length row)) spacing
+                         #'vui--text-width #'vui--pad))
+                 (first-line t))
+            (dolist (line lines)
+              (unless first-line
+                (insert "\n")
+                (when (> indent 0)
+                  (insert (vui--pad indent))))
+              (setq first-line nil)
+              (insert line)))
+        ;; Single-line row: render cells in place, padded to their
+        ;; column, identity preserved.  A function cell renders the
+        ;; vnode it produced during measurement (the same content, now
+        ;; landing for real so a field or button it returns works).
+        (let ((col 0))
+          (dolist (cell row)
+            (let ((vui--render-path (cons (+ index col) vui--render-path)))
+              (when (> col 0)
+                (insert (vui--pad spacing)))
+              (vui--render-vnode (or (plist-get cell :vnode)
+                                     (plist-get cell :child)))
+              (insert (vui--pad (max 0 (- (nth col widths)
+                                          (plist-get cell :natural))))))
+            (cl-incf col))))
+      (cl-incf index (length row)))
+    (vui--apply-region-props grid-start (point)
+                             (vui-vnode-grid-face vnode)
+                             (vui-vnode-grid-keymap vnode))))
+
+;;; Incremental rendering (issue #82)
+
+(defun vui--incremental-content-child-p (vnode)
+  "Return non-nil if VNODE is a plain-content leaf safe to patch by segment.
+Restricted to text and nil: these render to a single predictable
+segment, avoiding the separator/empty-render subtleties of other leaf
+types.  Anything else makes the container ineligible (full rebuild)."
+  (or (null vnode)
+      (vui-vnode-text-p vnode)))
+
+(defun vui--incremental-empty-child-p (vnode)
+  "Return non-nil if VNODE renders to nothing (dropped from segments).
+Matches the wholesale renderer, which skips nil and empty-text children
+without emitting a separator for them."
+  (or (null vnode)
+      (and (vui-vnode-text-p vnode)
+           (string-empty-p (vui-vnode-text-content vnode)))))
+
+(defun vui--incremental-eligible-p (vnode)
+  "Return non-nil if VNODE is an eligible container for incremental patching.
+Eligible: a `vui-fragment', or an unindented `vui-vstack', whose direct
+children are all text or nil."
+  (let ((children
+         (cond ((vui-vnode-fragment-p vnode) (vui-vnode-fragment-children vnode))
+               ((and (vui-vnode-vstack-p vnode)
+                     (= 0 (or (vui-vnode-vstack-indent vnode) 0)))
+                (vui-vnode-vstack-children vnode))
+               (t :ineligible))))
+    (and (listp children)
+         (cl-every #'vui--incremental-content-child-p children))))
+
+(defun vui--incremental-separator (vnode)
+  "Return the separator string inserted between VNODE's child segments."
+  (cond ((vui-vnode-fragment-p vnode) "")
+        ((vui-vnode-vstack-p vnode)
+         (make-string (1+ (or (vui-vnode-vstack-spacing vnode) 0)) ?\n))
+        (t "")))
+
+(defun vui--incremental-segments (vnode)
+  "Return VNODE's renderable child segments (empty children dropped)."
+  (cl-remove-if
+   #'vui--incremental-empty-child-p
+   (cond ((vui-vnode-fragment-p vnode) (vui-vnode-fragment-children vnode))
+         ((vui-vnode-vstack-p vnode) (vui-vnode-vstack-children vnode)))))
+
+(defun vui--render-segment (index child sep)
+  "Render CHILD at point as segment INDEX, inserting SEP first when INDEX>0.
+Return the number of characters inserted."
+  (let ((start (point)))
+    (when (> index 0) (insert sep))
+    (vui--render-vnode child)
+    (- (point) start)))
+
+(defun vui--vnode-equal (a b &optional equal-functions)
+  "Compare A and B like `equal', but strings must also match in properties.
+`equal' ignores string text properties, so two `vui-text' vnodes whose
+content strings differ only in properties (same characters, different
+face via `propertize') would compare equal and the patcher would skip
+the segment, leaving stale properties in the buffer.  Descends conses,
+records (vnode structs), and vectors; every string is compared with
+`equal-including-properties'.  Cost is the same order as `equal', which
+also walks the full structure.
+
+Functions compare by identity by default: a fresh closure means
+\"changed\", the right call for vnodes where a new handler must be
+re-attached.  With EQUAL-FUNCTIONS non-nil they compare with `equal'
+instead, which treats a same-source closure with an `equal' captured
+environment as unchanged - the historical behavior of the `:memo' and
+hook-deps comparisons (`vui--shallow-equal-plist',
+`vui--deps-equal-p'), where a fresh-but-equivalent closure in props or
+deps must not defeat the cache."
+  (cond
+   ((eq a b) t)
+   ((stringp a)
+    (and (stringp b) (equal-including-properties a b)))
+   ((consp a)
+    ;; Iterate over cdrs instead of recursing on them, so recursion
+    ;; depth tracks tree NESTING, not list length: a segment holding
+    ;; thousands of children must not blow `max-lisp-eval-depth'.
+    (let ((ok (consp b)))
+      (while (and ok (consp a) (consp b))
+        (setq ok (vui--vnode-equal (car a) (car b) equal-functions)
+              a (cdr a)
+              b (cdr b)))
+      (and ok (not (consp a)) (not (consp b))
+           ;; nil or dotted tails: same string-aware comparison
+           (vui--vnode-equal a b equal-functions))))
+   ;; Closures satisfy `recordp'; walking one with the string-aware
+   ;; comparison would descend into its captured environment.  Compare
+   ;; them by identity (vnodes) or plain `equal' (memo/deps) instead.
+   ((functionp a)
+    (and (functionp b)
+         (if equal-functions (equal a b) (eq a b))))
+   ((or (recordp a) (vectorp a))
+    (and (eq (type-of a) (type-of b))
+         (= (length a) (length b))
+         (let ((n (length a)) (ok t) (i 0))
+           (while (and ok (< i n))
+             (setq ok (vui--vnode-equal (aref a i) (aref b i) equal-functions)
+                   i (1+ i)))
+           ok)))
+   (t (equal a b))))
+
+(defun vui--patch-segments (start old-segs new-children sep)
+  "Patch the current buffer from START so its segments become NEW-CHILDREN.
+OLD-SEGS is a list of (VNODE . LENGTH) describing what is currently in the
+buffer starting at START.  NEW-CHILDREN is the new list of child vnodes
+\(nils already dropped).  SEP is the separator string between segments.
+
+Compares index by index: an unchanged segment is skipped (left in the
+buffer untouched, widgets and overlays included), a changed one is
+replaced in place, and the tail is appended or truncated.  Returns the
+new list of (VNODE . LENGTH)."
+  (goto-char start)
+  (let ((new-segs nil)
+        (i 0)
+        ;; A pending run of consecutive changed segments, reversed.
+        ;; Each entry is (INDEX OLD-SEG NEW-VNODE); OLD-SEG or NEW-VNODE
+        ;; may be nil (appended / truncated).
+        (run nil))
+    (cl-flet ((flush ()
+                ;; Replace a whole run of changed segments with one
+                ;; delete + render so the all-changed case collapses to a
+                ;; single bulk operation (no per-segment overhead).
+                (when run
+                  (let ((entries (nreverse run))
+                        (p (point))
+                        (old-total 0))
+                    (dolist (e entries)
+                      (when (nth 1 e)
+                        (setq old-total (+ old-total (cdr (nth 1 e))))))
+                    (delete-region p (+ p old-total))
+                    (dolist (e entries)
+                      (when (nth 2 e)
+                        (push (cons (nth 2 e)
+                                    (vui--render-segment (nth 0 e) (nth 2 e) sep))
+                              new-segs))))
+                  (setq run nil))))
+      (while (or old-segs new-children)
+        (let ((old (car old-segs))
+              (new (car new-children)))
+          (if (and old new (vui--vnode-equal (car old) new))
+              ;; unchanged: flush any pending run, then leave it in place
+              (progn (flush)
+                     (forward-char (cdr old))
+                     (push old new-segs))
+            ;; changed / appended / truncated: accumulate into the run
+            (push (list i old new) run)))
+        (when old-segs (setq old-segs (cdr old-segs)))
+        (when new-children (setq new-children (cdr new-children)))
+        (setq i (1+ i)))
+      (flush))
+    (nreverse new-segs)))
+
+(defun vui--component-container-p (vnode)
+  "Non-nil if VNODE is a fragment or unindented vstack of only components.
+These are the containers the component-list patcher can patch by
+position, skipping children that bail out of re-rendering."
+  (let* ((raw (cond ((vui-vnode-fragment-p vnode)
+                     (vui-vnode-fragment-children vnode))
+                    ((and (vui-vnode-vstack-p vnode)
+                          (= 0 (or (vui-vnode-vstack-indent vnode) 0)))
+                     (vui-vnode-vstack-children vnode))
+                    (t :no)))
+         (children (and (listp raw) (remq nil raw))))
+    (and children (cl-every #'vui-vnode-component-p children))))
+
+(defun vui--instance-may-bail-p (instance)
+  "Non-nil if INSTANCE can skip re-rendering entirely.
+True only for a mounted instance that opted in with `:should-update',
+whose should-update reports no change for the current props/state, and
+none of whose consumed context values changed.  This is the structural
+bailout: skipping it leaves the instance's buffer region (text and
+widgets) untouched."
+  (let* ((def (vui-instance-def instance))
+         (su (vui-component-def-should-update def)))
+    (and (vui-instance-mounted-p instance)
+         su
+         (vui-instance-r-len instance)
+         (not (funcall su
+                       (vui-instance-props instance)
+                       (vui-instance-state instance)
+                       (vui-instance-prev-props instance)
+                       (vui-instance-prev-state instance)))
+         (vui--instance-contexts-unchanged-p instance))))
+
+(defun vui--patch-component-list (instance vtree)
+  "Patch INSTANCE's buffer (a list of component children) to match VTREE.
+Point starts at the list's beginning.  Walks the new component vnodes
+against the existing child instances by position, reusing instances by
+key, skipping those that bail out (leaving their buffer region intact),
+re-rendering changed ones in place, inserting new children, and deleting
+removed ones.  Pushes the resulting child instances onto
+`vui--new-children' in order so the caller's reconcile tail finalizes
+the children list and unmounts whatever was removed."
+  (let* ((sep (vui--incremental-separator vtree))
+         (sep-len (length sep))
+         (old-children (vui-instance-children instance))
+         (new-vnodes (remq nil (vui--incremental-segments vtree)))
+         (i 0))
+    (goto-char (point-min))
+    (dolist (vnode new-vnodes)
+      (let* ((type (vui-vnode-component-type vnode))
+             (key (vui-vnode-key vnode))
+             (children (vui-vnode-component-children vnode))
+             (props (vui-vnode-component-props vnode))
+             (props-wc (if children
+                           (plist-put (copy-sequence props) :children children)
+                         props))
+             (old-at-i (nth i old-children))
+             (same-pos (and old-at-i
+                            (eq type (vui-component-def-name
+                                      (vui-instance-def old-at-i)))
+                            (equal key (vui-vnode-key
+                                        (vui-instance-vnode old-at-i)))))
+             (old-seg-len (+ (if (> i 0) sep-len 0)
+                             (if old-at-i (or (vui-instance-r-len old-at-i) 0) 0)))
+             (chosen (cond
+                      (same-pos old-at-i)
+                      ;; key match elsewhere: reuse the instance (preserve
+                      ;; its state) even though it moved
+                      ((and key
+                            (cl-find-if
+                             (lambda (c)
+                               (and (eq type (vui-component-def-name
+                                              (vui-instance-def c)))
+                                    (equal key (vui-vnode-key
+                                                (vui-instance-vnode c)))))
+                             old-children)))
+                      (t nil))))
+        ;; reconcile props onto the chosen instance, or create a new one
+        (if chosen
+            (progn (setf (vui-instance-props chosen) props-wc)
+                   (setf (vui-instance-vnode chosen) vnode))
+          (setq chosen (vui--create-instance vnode instance)))
+        (if (and same-pos (vui--instance-may-bail-p chosen))
+            ;; bail: leave separator+content in place, advance past it
+            (forward-char old-seg-len)
+          ;; render the chosen instance here, replacing what was at i
+          (let ((p (point)))
+            (when (and old-at-i (> old-seg-len 0))
+              (vui--forget-region-fields p (+ p old-seg-len))
+              (vui--remove-widget-overlays p (+ p old-seg-len))
+              (delete-region p (+ p old-seg-len)))
+            (when (> i 0) (insert sep))
+            (let ((s (point)))
+              (vui--render-instance chosen)
+              (setf (vui-instance-r-len chosen) (- (point) s)))))
+        (push chosen vui--new-children))
+      (setq i (1+ i)))
+    ;; delete the buffer regions of any leftover (removed) old children;
+    ;; not pushed to `vui--new-children', so the tail unmounts them
+    (dolist (old (nthcdr i old-children))
+      (let* ((seg-len (+ (if (> i 0) sep-len 0)
+                         (or (vui-instance-r-len old) 0)))
+             (p (point)))
+        (vui--forget-region-fields p (+ p seg-len))
+        (vui--remove-widget-overlays p (+ p seg-len))
+        (delete-region p (+ p seg-len))
+        (setq i (1+ i))))))
+
+(defun vui--render-record-compatible-p (instance vtree)
+  "Return non-nil if INSTANCE's render record can be patched toward VTREE.
+Requires a record for the same container kind and separator as VTREE."
+  (let ((record (vui-instance-render-record instance)))
+    (and record
+         (plist-member record :segs)
+         (eq (type-of (plist-get record :vnode)) (type-of vtree))
+         (equal (vui--incremental-separator (plist-get record :vnode))
+                (vui--incremental-separator vtree)))))
+
+(defun vui--commit-root (vtree)
+  "Commit the root VTREE into the current buffer.
+Patches incrementally when `vui-incremental-render' is on and VTREE is
+an eligible flat content container; otherwise erases and rebuilds.
+Maintains the instance's render record either way.  Used as the commit
+function of the root `vui--render-instance' call."
+  (let* ((instance vui--current-instance)
+         (record (vui-instance-render-record instance)))
+    (cond
+     ;; Whole-tree identity unchanged: the same vtree object as last
+     ;; commit (what should-update=nil and memoization produce) means
+     ;; the buffer already matches - skip everything (O(1)).  This is
+     ;; always on: it only ever skips provably-unchanged work, costs one
+     ;; `eq', and needs no bookkeeping, so it does not depend on the
+     ;; experimental `vui-incremental-render' flag.
+     ((and record (eq vtree (plist-get record :vnode)))
+      nil)
+     ;; Stream-tail patch: a flat container whose first child is a live
+     ;; stream.  The stream's region is already current (append /
+     ;; update-last keep the buffer in sync), so leave it untouched and
+     ;; re-render only the content after it - O(content), not O(N items).
+     ;; Always on: it only ever reproduces what a wholesale rebuild would
+     ;; (byte-identical), and falls back below for any other shape, so it
+     ;; needs no opt-in - and stateful stream rows depend on it leaving the
+     ;; region intact regardless of the experimental flag.
+     ((and (eq (plist-get record :kind) 'stream-tail)
+           (vui--stream-tail-eligible vtree))
+      (let ((elig (vui--stream-tail-eligible vtree)))
+        (vui--patch-stream-tail vtree (nth 0 elig) (nth 1 elig)))
+      (setf (vui-instance-render-record instance)
+            (list :kind 'stream-tail :vnode vtree)))
+     ;; Content patch: flat content container, reuse unchanged segments.
+     ((and vui-incremental-render
+           (eq (plist-get record :kind) 'content)
+           (vui--incremental-eligible-p vtree)
+           (vui--render-record-compatible-p instance vtree))
+      (let ((segs (vui--patch-segments
+                   (point-min)
+                   (plist-get record :segs)
+                   (vui--incremental-segments vtree)
+                   (vui--incremental-separator vtree))))
+        (setf (vui-instance-render-record instance)
+              (list :kind 'content :vnode vtree :segs segs))))
+     ;; Component patch: flat list of components, skip those that bail.
+     ((and vui-incremental-render
+           (eq (plist-get record :kind) 'components)
+           (vui--component-container-p vtree)
+           (equal (vui--incremental-separator (plist-get record :vnode))
+                  (vui--incremental-separator vtree)))
+      (vui--patch-component-list instance vtree)
+      (setf (vui-instance-render-record instance)
+            (list :kind 'components :vnode vtree)))
+     ;; Content eligible, no compatible record: rebuild via the patch
+     ;; path from empty, capturing per-segment lengths for next time.
+     ((and vui-incremental-render (vui--incremental-eligible-p vtree))
+      (setq widget-field-list nil widget-field-new nil)
+      (vui--remove-widget-overlays)
+      (erase-buffer)
+      (let ((segs (vui--patch-segments
+                   (point-min) nil
+                   (vui--incremental-segments vtree)
+                   (vui--incremental-separator vtree))))
+        (setf (vui-instance-render-record instance)
+              (list :kind 'content :vnode vtree :segs segs))))
+     ;; Component eligible, no compatible record: wholesale render (the
+     ;; component branch captures per-instance lengths), mark for patch.
+     ((and vui-incremental-render (vui--component-container-p vtree))
+      (setq widget-field-list nil widget-field-new nil)
+      (vui--remove-widget-overlays)
+      (erase-buffer)
+      (vui--render-vnode vtree)
+      (setf (vui-instance-render-record instance)
+            (list :kind 'components :vnode vtree)))
+     ;; Wholesale rebuild (default / ineligible).  Always record the
+     ;; vnode so the eq short-circuit above can skip an unchanged tree on
+     ;; the next commit even with the flag off; the patch paths stay
+     ;; disabled (no :segs / :components kind, so they never match).
+     (t
+      (setq widget-field-list nil widget-field-new nil)
+      (vui--remove-widget-overlays)
+      (erase-buffer)
+      (vui--render-vnode vtree)
+      ;; If a stream just became live in this render, mark the record so
+      ;; the next commit can patch around it instead of re-emitting it.
+      (setf (vui-instance-render-record instance)
+            (list :kind (if (vui--stream-tail-eligible vtree)
+                            'stream-tail 'wholesale)
+                  :vnode vtree))))))
+
+;;; Streaming - imperative append-only regions (issue #82)
+;;
+;; A `vui-stream' is an escape hatch from "re-render the whole tree from
+;; state" for the one shape where that is fundamentally too expensive: an
+;; append-only log that grows without bound (a chat transcript, a build
+;; log).  The declarative path rebuilds all N items on every append, so a
+;; stream of N is O(N^2); a stream owns its buffer region and appends ONE
+;; item in O(1), never touching the existing N.
+;;
+;; The handle (a `vui-stream-handle') holds the region markers and the
+;; item list.  Place it in the render tree with `(vui-stream handle)' so
+;; it gets a region and participates in layout; drive it imperatively
+;; with `(vui-stream-append handle vnode)'.  The item list is the source
+;; of truth: append writes one region in O(1) when the stream is live,
+;; and a full re-render (e.g. a sibling's state change) re-emits the list
+;; so the buffer stays identical to what a plain list would render.
+
+(cl-defstruct (vui-stream-handle (:constructor vui--stream-handle-create)
+                                 (:copier nil))
+  "State for a `vui-stream': its buffer region and items.
+ITEMS-REV holds the appended vnodes in REVERSE order, so append is O(1)
+\(a `push'); render reverses once.  BUFFER and the REGION-* markers are
+bound when the stream is first rendered, and are nil until then."
+  buffer
+  region-start
+  region-end
+  last-start        ; Marker at the start of the last item (for update-last)
+  (items-rev nil)
+  (nodes nil)       ; Live `vui-stream-node's (open, not finalized); bounds append cost
+  (separator "\n"))
+
+(defun vui-make-stream (&optional separator)
+  "Create a `vui-stream-handle'.  SEPARATOR goes between items (default newline).
+Prefer `vui-use-stream' inside a component; use this directly only when
+you manage the handle's lifetime yourself."
+  (vui--stream-handle-create :separator (or separator "\n")))
+
+(defun vui-use-stream (&optional separator)
+  "Return a stable `vui-stream-handle' for the current component.
+Like the other hooks, call it unconditionally in render; the same handle
+is returned across re-renders.  Place it with `(vui-stream HANDLE)' and
+append to it with `(vui-stream-append HANDLE VNODE)'.  SEPARATOR (the
+string between items, default a newline) is used only on first creation."
+  (let ((ref (vui--get-or-create-ref nil)))
+    (or (car ref)
+        (setcar ref (vui-make-stream separator)))))
+
+(defun vui-stream (handle &rest props)
+  "Create a stream vnode that anchors HANDLE's region in the render tree.
+PROPS may carry :key for reconciliation."
+  (vui-vnode-stream--create :handle handle :key (plist-get props :key)))
+
+(defun vui--stream-bind-region (handle buffer start end)
+  "Point HANDLE's markers at BUFFER region [START, END) after a render.
+START stays put (top boundary); END stays before text inserted at its
+position too, so the separator the parent container inserts right after
+the stream does not get pulled into the region - `vui-stream-append'
+repositions END explicitly instead."
+  (setf (vui-stream-handle-buffer handle) buffer)
+  (let ((s (or (vui-stream-handle-region-start handle) (make-marker)))
+        (e (or (vui-stream-handle-region-end handle) (make-marker))))
+    (set-marker s start buffer)
+    (set-marker e end buffer)
+    (set-marker-insertion-type s nil)
+    (set-marker-insertion-type e nil)
+    (setf (vui-stream-handle-region-start handle) s
+          (vui-stream-handle-region-end handle) e)))
+
+(defun vui--stream-set-last-start (handle pos buffer)
+  "Record POS in BUFFER as the start of HANDLE's last item."
+  (let ((m (or (vui-stream-handle-last-start handle) (make-marker))))
+    (set-marker m pos buffer)
+    (set-marker-insertion-type m nil)
+    (setf (vui-stream-handle-last-start handle) m)))
+
+(defun vui--stream-render (handle)
+  "Render HANDLE's items at point and bind its region around them.
+Used by the `vui-vnode-stream' branch of `vui--render-vnode'.
+
+During a measure pass the items render for their width only: the
+handle keeps its real buffer and markers.  A measure renders into a
+throwaway temp buffer, and binding the live region there would leave
+the handle pointing at a killed buffer, silently dropping every
+subsequent streamed append."
+  (let ((sep (vui-stream-handle-separator handle))
+        (start (point))
+        (first t)
+        (last-start nil))
+    (dolist (item (reverse (vui-stream-handle-items-rev handle)))
+      ;; Component rows are inline instances that render and persist on
+      ;; their own; a full re-emit cannot reproduce them, and (because the
+      ;; stream-tail patch leaves the region intact) does not run once rows
+      ;; exist.  Skip them defensively here.
+      (unless (vui-instance-p item)
+        (unless first (insert sep))
+        (setq first nil)
+        (setq last-start (point))
+        (vui--render-vnode item)))
+    (unless vui--measuring-p
+      (vui--stream-bind-region handle (current-buffer) start (point))
+      (when last-start
+        (vui--stream-set-last-start handle last-start (current-buffer))))))
+
+(defun vui--stream-request-rerender (handle)
+  "Re-render the root of HANDLE's buffer so the layout reflects new items."
+  (let ((buf (vui-stream-handle-buffer handle)))
+    (when (and buf (buffer-live-p buf))
+      (when-let* ((root (vui-get-instance buf)))
+        (vui-rerender root)))))
+
+(defun vui--stream-region-empty-p (handle)
+  "Non-nil when HANDLE's region is live and zero-width."
+  (let ((s (vui-stream-handle-region-start handle))
+        (e (vui-stream-handle-region-end handle)))
+    (and s (marker-position s) e (marker-position e)
+         (= (marker-position s) (marker-position e)))))
+
+(defun vui--stream-relay-empty-transition (handle was-empty &optional node)
+  "Re-lay HANDLE's tree when an in-place edit crossed the empty boundary.
+WAS-EMPTY is whether the whole stream region was zero-width before the
+edit.  When its emptiness changed, the separators the container emitted
+around the stream are stale (it drops a zero-output child), the mirror
+of the empty -> non-empty append and the emptying
+`vui-stream-remove-last' - so re-lay once so the buffer matches a plain
+render.  The re-lay re-binds the handle's markers; when NODE (the edited
+node) is the last item, re-seat its markers on the fresh region so it
+stays updatable, like `vui-stream-open' does after the empty stream's
+first render."
+  (let ((s (vui-stream-handle-region-start handle))
+        (e (vui-stream-handle-region-end handle)))
+    (when (and s (marker-position s) e (marker-position e)
+               (not (eq (and was-empty t)
+                        (= (marker-position s) (marker-position e)))))
+      (vui--stream-request-rerender handle)
+      (when (and node
+                 (eq (vui--stream-node-cell node)
+                     (vui-stream-handle-items-rev handle)))
+        (let ((buf (vui-stream-handle-buffer handle))
+              (ls (vui-stream-handle-last-start handle))
+              (end (vui-stream-handle-region-end handle)))
+          (when (and buf (buffer-live-p buf)
+                     ls (marker-position ls) end (marker-position end))
+            (vui--stream-node-bind node (marker-position ls)
+                                   (marker-position end) buf)))))))
+
+(defun vui-stream-append (handle vnode)
+  "Append VNODE to HANDLE's stream and return HANDLE.
+When the stream is live and already non-empty, this writes exactly one
+region in O(1) - it never re-renders or walks the existing items - and
+content below the region shifts down with it.
+
+VNODE may be a content vnode (text/fragment) or a `vui-component'.  A
+component is mounted as a STATEFUL ROW: it gets its own region and
+re-renders only that region when its state changes (a collapsible tool
+card, say), independent of how many items are above it.  A component row
+requires the stream to be live and non-empty first (the empty -> non-empty
+transition does a full re-render, which cannot re-emit an inline row); a
+component appended to an empty stream falls back to a plain child render."
+  (if (vui-vnode-component-p vnode)
+      (vui--stream-append-row handle vnode)
+    (vui--stream-append-content handle vnode))
+  handle)
+
+(defun vui--stream-append-content (handle vnode)
+  "Append content VNODE (text/fragment) to HANDLE's stream."
+  (let ((prev-last (car (vui-stream-handle-items-rev handle)))
+        (buf (vui-stream-handle-buffer handle))
+        (start (vui-stream-handle-region-start handle))
+        (end (vui-stream-handle-region-end handle)))
+    (push vnode (vui-stream-handle-items-rev handle))
+    (cond
+     ;; Not live yet: emitted on the next render.
+     ((not (and buf (buffer-live-p buf) end (marker-position end)))
+      nil)
+     ;; Empty -> non-empty: the surrounding separators change, so re-lay
+     ;; the whole tree once.  (Only the very first item pays this.)
+     ((= (marker-position start) (marker-position end))
+      (vui--stream-request-rerender handle))
+     ;; Live and non-empty: O(1) imperative insert at the region end.
+     (t
+      (with-current-buffer buf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              ;; Stream text is ephemeral UI, not document history.
+              (buffer-undo-list t))
+          (save-excursion
+            (goto-char (marker-position end))
+            (insert (vui-stream-handle-separator handle))
+            (vui--stream-set-last-start handle (point) buf)
+            (vui--render-vnode vnode)
+            ;; If the previous last item was a component row, END is that
+            ;; row's own marker - do NOT move it (that would corrupt the
+            ;; row's region); install a fresh marker.  Otherwise reuse the
+            ;; stream's own END marker.
+            (if (vui-instance-p prev-last)
+                (setf (vui-stream-handle-region-end handle)
+                      (copy-marker (point) nil))
+              (set-marker end (point))))))))))
+
+(defun vui--stream-append-row (handle vnode)
+  "Append component VNODE as a stateful inline row at HANDLE's tail."
+  (let ((buf (vui-stream-handle-buffer handle))
+        (start (vui-stream-handle-region-start handle))
+        (end (vui-stream-handle-region-end handle))
+        (sep (vui-stream-handle-separator handle)))
+    (cond
+     ;; Not live, or still empty: a row needs a live, non-empty stream.
+     ;; Record the vnode and lay it out with a full render (it renders as a
+     ;; plain child component, not a scoped row - the documented fallback).
+     ((or (not (and buf (buffer-live-p buf) end (marker-position end)))
+          (= (marker-position start) (marker-position end)))
+      (push vnode (vui-stream-handle-items-rev handle))
+      (when (and buf (buffer-live-p buf))
+        (vui--stream-request-rerender handle))
+      nil)                              ; no inline instance in the fallback
+     (t
+      (with-current-buffer buf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              (buffer-undo-list t))
+          (save-excursion
+            (goto-char (marker-position end))
+            (insert sep)
+            (let* ((row-start (point))
+                   (row (vui-mount-inline vnode (point))))
+              (vui--stream-set-last-start handle row-start buf)
+              ;; Share the row's region-end as the stream's end: when the
+              ;; row re-renders on its own (grows/shrinks), its marker moves
+              ;; and the stream end - and the box below - stay correct.
+              (setf (vui-stream-handle-region-end handle)
+                    (vui-instance-region-end row))
+              (push row (vui-stream-handle-items-rev handle))
+              row))))))))   ; return the inline instance (or nil on fallback)
+
+(defun vui--string-prefix-equal-including-properties-p (o n)
+  "Return non-nil when O is a prefix of N, text properties included.
+Equivalent to (equal-including-properties O (substring N 0 (length O)))
+but allocation-free: this is the per-chunk check of the update-last
+extend fast path, where copying the prefix on every streamed token adds
+up to O(n^2) garbage over a message's lifetime.  Characters are compared
+with `compare-strings' (no copy); the text-property intervals of both
+strings are then walked in lockstep over the first (length O)
+characters, comparing property lists with `equal' at each interval
+start.  A property change in N at exactly (length O) lies outside the
+compared range and does not disqualify the prefix.  Property lists are
+compared in order, which can reject a reordered-but-equivalent plist
+that `equal-including-properties' would accept; for the fast path that
+only means a full re-render, never a wrong answer."
+  (let ((len (length o)))
+    (and (<= len (length n))
+         (eq t (compare-strings o 0 len n 0 len))
+         (let ((pos 0) (ok t))
+           (while (and ok (< pos len))
+             (if (not (equal (text-properties-at pos o)
+                             (text-properties-at pos n)))
+                 (setq ok nil)
+               ;; Both interval starts matched; jump to the nearer next
+               ;; change (in either string), clamped to the prefix end.
+               (setq pos (min (or (next-property-change pos o) len)
+                              (or (next-property-change pos n) len)
+                              len))))
+           ok))))
+
+(defun vui-stream-update-last (handle vnode)
+  "Replace HANDLE's last item with VNODE, re-rendering only its region.
+This is the in-progress message in a streaming agent UI: as tokens
+arrive, update the last item with the message-so-far.  The cost depends
+on that one item, not on the number of items above it, so the transcript
+can be arbitrarily long.  A no-op when the stream is empty or not live.
+
+For a content last item VNODE must be a content vnode (text/fragment).
+For a component ROW, pass a `vui-component' of the same type: the row's
+props are updated in place and the row re-renders only its own region,
+keeping its state."
+  (let ((last (car (vui-stream-handle-items-rev handle))))
+    (cond
+     ((null last) nil)
+     ;; Component row: update its props in place (state preserved); the row
+     ;; re-renders only its region and its END marker (shared as the
+     ;; stream's) follows.
+     ((vui-instance-p last)
+      (when (and (vui-vnode-component-p vnode)
+                 (eq (vui-vnode-component-type vnode)
+                     (vui-component-def-name (vui-instance-def last))))
+        (let* ((props (vui-vnode-component-props vnode))
+               (children (vui-vnode-component-children vnode))
+               (props-wc (if children
+                             (plist-put (copy-sequence props) :children children)
+                           props)))
+          (vui-update last props-wc))))
+     ;; Content: rewrite just that item's region.
+     (t
+      (let* ((old (car (vui-stream-handle-items-rev handle)))
+             ;; If the last item is a live NODE, route through the node API so
+             ;; its own markers stay valid - update-last is sugar for "update
+             ;; the most-recent live node".
+             (node (cl-find (vui-stream-handle-items-rev handle)
+                            (vui-stream-handle-nodes handle)
+                            :key #'vui--stream-node-cell))
+             ;; Fast path: the new text simply EXTENDS the old one (a message
+             ;; streaming in token by token).  Append only the new suffix
+             ;; instead of re-rendering the whole item.  The win is redisplay -
+             ;; only the freshly inserted text is marked dirty and redrawn,
+             ;; instead of the entire (growing) message getting torn down on
+             ;; every token, which is what makes a long reply feel laggy.
+             (suffix (and (vui-vnode-text-p old) (vui-vnode-text-p vnode)
+                          (equal (vui-vnode-text-face old) (vui-vnode-text-face vnode))
+                          (equal (vui-vnode-text-properties old)
+                                 (vui-vnode-text-properties vnode))
+                          (let ((o (vui-vnode-text-content old))
+                                (n (vui-vnode-text-content vnode)))
+                            ;; The prefix must match INCLUDING text
+                            ;; properties: appending just the suffix would
+                            ;; otherwise leave the prefix's stale properties
+                            ;; in the buffer.
+                            (and (> (length n) (length o))
+                                 (vui--string-prefix-equal-including-properties-p o n)
+                                 (substring n (length o)))))))
+        (if (and node (vui--stream-node-start node)
+                 (marker-position (vui--stream-node-start node)))
+            ;; Live node: extend -> append-to (O(delta)); else replace.  Both
+            ;; keep the node's start/end markers correct.
+            (if suffix
+                (vui-stream-append-to
+                 node (vui-vnode-text--create
+                       :content suffix
+                       :face (vui-vnode-text-face vnode)
+                       :properties (vui-vnode-text-properties vnode)))
+              (vui-stream-update node vnode))
+          ;; Legacy path: rewrite [last-start, region-end] directly.
+          (let ((buf (vui-stream-handle-buffer handle))
+                (ls (vui-stream-handle-last-start handle))
+                (end (vui-stream-handle-region-end handle)))
+            (setcar (vui-stream-handle-items-rev handle) vnode)
+            (when (and buf (buffer-live-p buf)
+                       ls (marker-position ls) end (marker-position end))
+              (let ((was-empty (vui--stream-region-empty-p handle)))
+                (with-current-buffer buf
+                  (let ((inhibit-read-only t)
+                        (inhibit-modification-hooks t)
+                        (buffer-undo-list t))
+                    (save-excursion
+                      (if suffix
+                          (progn
+                            (goto-char (marker-position end))
+                            (vui--render-vnode
+                             (vui-vnode-text--create
+                              :content suffix
+                              :face (vui-vnode-text-face vnode)
+                              :properties (vui-vnode-text-properties vnode)))
+                            (set-marker end (point)))
+                        (delete-region (marker-position ls) (marker-position end))
+                        (goto-char (marker-position ls))
+                        (vui--render-vnode vnode)
+                        (set-marker end (point))))))
+                (vui--stream-relay-empty-transition handle was-empty)))))))))
+  handle)
+
+;; --- Random-access nodes: address a region by ref, not just "the last" ---
+;;
+;; `vui-stream-update-last' can only touch the most recently appended item.
+;; A NODE is a stable ref to ONE region that survives later appends: open
+;; it, keep the ref, and grow / rewrite / freeze it wherever it has drifted
+;; to.  This is the streaming-agent primitive - an in-flight reply while
+;; tool cards and follow-up messages land below it.  See the design note,
+;; docs/design/vui-stream-nodes.org.
+;;
+;; The load-bearing invariant: a live node costs the buffer one region's
+;; markers, and Emacs walks the whole marker list on each insert, so append
+;; is O(live nodes).  `vui-stream-finalize' drops a node's markers (demoting
+;; it to static text), keeping the live set bounded by CONCURRENCY rather
+;; than stream length - which is what keeps append O(1) no matter how long
+;; the transcript grows (measured in the design note).
+
+(cl-defstruct (vui-stream-node (:constructor vui--stream-node-create)
+                               (:conc-name vui--stream-node-)
+                               (:copier nil))
+  "A live, addressable region inside a `vui-stream'.
+Returned by `vui-stream-open'; pass it to `vui-stream-append-to',
+`vui-stream-update', and `vui-stream-finalize'.
+
+HANDLE is the owning stream.  CELL is the cons in HANDLE's ITEMS-REV whose
+car is this node's current vnode - kept in sync so a wholesale re-render
+re-emits the streamed content.  START and END are markers bounding a
+CONTENT node's region; both are nil once finalized (and nil throughout for
+a component node).  INSTANCE is the inline component for a COMPONENT node
+\(a stateful row), which owns its own region markers; nil for a content
+node.  PARENT and CHILDREN are reserved for a future section tree (see the
+design note) and unused today."
+  handle cell start end instance parent children)
+
+(defun vui--stream-vnode-combine (a b)
+  "Combine vnodes A and B into the one vnode their renders concatenate to.
+Used by `vui-stream-append-to' to keep the model in sync with the buffer:
+two text vnodes with the same face and properties merge into one (the
+common streaming case); anything else is grouped in a `vui-fragment',
+which renders its children back to back with no separator."
+  (cond
+   ((and (vui-vnode-text-p a) (vui-vnode-text-p b)
+         (equal (vui-vnode-text-face a) (vui-vnode-text-face b))
+         (equal (vui-vnode-text-properties a) (vui-vnode-text-properties b)))
+    (vui-vnode-text--create
+     :content (concat (vui-vnode-text-content a) (vui-vnode-text-content b))
+     :face (vui-vnode-text-face a)
+     :properties (vui-vnode-text-properties a)))
+   ((vui-vnode-fragment-p a)
+    (vui-vnode-fragment--create
+     :children (append (vui-vnode-fragment-children a) (list b))))
+   (t
+    (vui-vnode-fragment--create :children (list a b)))))
+
+(defun vui--stream-node-bind (node start end buffer)
+  "Bind NODE's markers to BUFFER region [START, END).
+Both markers take insertion type nil so that text inserted at END (a later
+item, or a sibling growing) lands AFTER the node rather than being pulled
+into it - the node's own edits reposition END explicitly."
+  (let ((s (or (vui--stream-node-start node) (make-marker)))
+        (e (or (vui--stream-node-end node) (make-marker))))
+    (set-marker s start buffer)
+    (set-marker e end buffer)
+    (set-marker-insertion-type s nil)
+    (set-marker-insertion-type e nil)
+    (setf (vui--stream-node-start node) s
+          (vui--stream-node-end node) e)))
+
+(defun vui--stream-sync-end (handle pos)
+  "Advance HANDLE's region-end to POS after an edit grew the LAST node.
+An insert AT a type-nil marker does not move it, so editing the node that
+sits at the stream's end leaves region-end pointing inside the node; bring
+it back to the true end so the next plain append lands after everything.
+A no-op when the edited node is not the last (region-end sits past POS and
+has already shifted on its own)."
+  (let ((end (vui-stream-handle-region-end handle)))
+    (when (and end (marker-position end) (>= pos (marker-position end)))
+      (set-marker end pos))))
+
+(defun vui-stream-open (handle vnode)
+  "Append VNODE to HANDLE as a LIVE node and return that node.
+Unlike `vui-stream-append' (static text you can never touch again), the
+returned node is a stable ref: `vui-stream-append-to' grows it,
+`vui-stream-update' rewrites it, and `vui-stream-finalize' freezes it -
+each regardless of how many items are appended below it afterwards.  This
+is the streaming-agent primitive: open a node for the in-flight reply,
+keep the ref, and append token deltas to it even as tool cards and later
+messages land underneath.
+
+A live node holds one region's markers until finalized; keep the live set
+bounded by concurrency (finalize a message when its turn ends) and append
+stays O(1) - see docs/design/vui-stream-nodes.org.  Like a component row,
+a node wants the stream live and non-empty first; opening the only item of
+an empty stream pays the one full re-render the empty -> non-empty
+transition always costs.  Open that first item from a command or async
+callback, not from inside another component's render, so the one-time
+re-render runs synchronously and binds the node (otherwise it is deferred
+and the returned node stays unbound until the next render).
+
+VNODE is usually a content vnode (text/fragment).  It may also be a
+`vui-component', mounted as a stateful inline ROW: the returned node then
+updates it OUT OF ORDER with `vui-stream-update' (props refresh, state
+preserved) no matter where it has drifted to - a tool card that flips
+running -> result while later messages sit below it.  A component node owns
+its markers for its life (it must, to stay interactive), so `finalize' only
+stops tracking it; `append-to' / `before' / `after' / `remove' are
+content-only and no-op on a component node for now."
+  (if (vui-vnode-component-p vnode)
+      ;; Component node: a stateful inline row addressable by ref.  The row
+      ;; owns its own region markers, so the node carries no start/end.
+      (let* ((row (vui--stream-append-row handle vnode))
+             (node (vui--stream-node-create
+                    :handle handle
+                    :cell (vui-stream-handle-items-rev handle)
+                    ;; Only a genuine inline row counts; on the empty-stream
+                    ;; fallback `append-row' returns nil, so the node degrades
+                    ;; to an inert content-style node rather than pointing at
+                    ;; some other (e.g. root) instance.
+                    :instance (and (vui-instance-p row)
+                                   (vui--inline-p row) row))))
+        (push node (vui-stream-handle-nodes handle))
+        node)
+    ;; Content node: its own start/end markers bound around the inserted text.
+    (progn
+      (vui--stream-append-content handle vnode)
+      (let ((buf (vui-stream-handle-buffer handle))
+            (ls (vui-stream-handle-last-start handle))
+            (end (vui-stream-handle-region-end handle))
+            (node (vui--stream-node-create
+                   :handle handle
+                   :cell (vui-stream-handle-items-rev handle))))
+        (when (and buf (buffer-live-p buf)
+                   ls (marker-position ls) end (marker-position end))
+          (vui--stream-node-bind node (marker-position ls) (marker-position end) buf))
+        (push node (vui-stream-handle-nodes handle))
+        node))))
+
+(defun vui-stream-append-to (node vnode)
+  "Append VNODE's content at the end of live NODE's region; return NODE.
+The streaming primitive: each delta costs O(delta) - only the new text is
+inserted, and only it is marked dirty for redisplay - no matter how long
+the node has grown or how many items sit below it.  VNODE is typically a
+text vnode carrying the freshly arrived tokens.  A no-op once NODE has been
+finalized, and on a component node (append-to is content-only)."
+  (let* ((handle (vui--stream-node-handle node))
+         (cell (vui--stream-node-cell node))
+         (buf (vui-stream-handle-buffer handle))
+         (end (vui--stream-node-end node)))
+    ;; Only touch a live CONTENT node.  A component node (instance set) or a
+    ;; finalized/unbound node (end nil) is left alone - mutating the model
+    ;; (setcar) without a matching buffer edit would desync items-rev.
+    (when (and (not (vui--stream-node-instance node))
+               buf (buffer-live-p buf) end (marker-position end))
+      ;; Keep the model in sync so a wholesale re-render re-emits the whole
+      ;; accumulated node, not just the latest delta.
+      (when cell
+        (setcar cell (vui--stream-vnode-combine (car cell) vnode)))
+      (let ((was-empty (vui--stream-region-empty-p handle)))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (save-excursion
+              (goto-char (marker-position end))
+              (vui--render-vnode vnode)
+              (set-marker end (point))
+              (vui--stream-sync-end handle (point)))))
+        (vui--stream-relay-empty-transition handle was-empty node)))
+    node))
+
+(defun vui-stream-update (node vnode)
+  "Replace live NODE's whole region with VNODE; return NODE.
+Use when the content changes wholesale (a tool card going from \"running\"
+to its result), as opposed to `vui-stream-append-to' which grows it.  Cost
+is O(VNODE), independent of the items around it.  A no-op once NODE has
+been finalized.
+
+For a COMPONENT node (opened with a `vui-component'), pass a vnode of the
+same type: the row's props are refreshed in place and it re-renders only
+its own region, keeping its state - the out-of-order counterpart of
+`vui-stream-update-last' on a row."
+  (let ((instance (vui--stream-node-instance node)))
+    (if instance
+        ;; Component node: refresh props in place (state preserved); the row
+        ;; re-renders only its own region regardless of where it sits.
+        (when (and (vui-vnode-component-p vnode)
+                   (eq (vui-vnode-component-type vnode)
+                       (vui-component-def-name (vui-instance-def instance))))
+          (let* ((props (vui-vnode-component-props vnode))
+                 (children (vui-vnode-component-children vnode))
+                 (props-wc (if children
+                               (plist-put (copy-sequence props) :children children)
+                             props)))
+            (vui-update instance props-wc)))
+      ;; Content node: rewrite its region.  Only touch a live node - mutating
+      ;; the model (setcar) on a finalized/unbound node without a buffer edit
+      ;; would desync items-rev (e.g. clobbering a still-live row instance).
+      (let* ((handle (vui--stream-node-handle node))
+             (cell (vui--stream-node-cell node))
+             (buf (vui-stream-handle-buffer handle))
+             (start (vui--stream-node-start node))
+             (end (vui--stream-node-end node)))
+        (when (and buf (buffer-live-p buf)
+                   start (marker-position start) end (marker-position end))
+          (when cell (setcar cell vnode))
+          (let ((was-empty (vui--stream-region-empty-p handle)))
+            (with-current-buffer buf
+              (let ((inhibit-read-only t)
+                    (inhibit-modification-hooks t)
+                    (buffer-undo-list t))
+                (save-excursion
+                  (delete-region (marker-position start) (marker-position end))
+                  (goto-char (marker-position start))
+                  (vui--render-vnode vnode)
+                  (set-marker end (point))
+                  (vui--stream-sync-end handle (point)))))
+            (vui--stream-relay-empty-transition handle was-empty node))))))
+  node)
+
+(defun vui-stream-finalize (node)
+  "Finalize NODE: drop its markers, demoting it to static text; return NODE.
+The text stays exactly as rendered, but the node can no longer be updated -
+and the buffer no longer carries a marker for it, so appends elsewhere stop
+paying for it.  This is what enforces the load-bearing invariant: the live
+set stays bounded by concurrency, not stream length.  Call it when a
+message's turn ends.  Idempotent.
+
+For a COMPONENT node this only stops tracking the node (the inline row keeps
+its own markers and stays interactive); the node ref just goes inert."
+  (let ((handle (vui--stream-node-handle node)))
+    (when-let* ((s (vui--stream-node-start node))) (set-marker s nil))
+    (when-let* ((e (vui--stream-node-end node))) (set-marker e nil))
+    (setf (vui--stream-node-start node) nil
+          (vui--stream-node-end node) nil
+          (vui--stream-node-instance node) nil
+          (vui-stream-handle-nodes handle)
+          (delq node (vui-stream-handle-nodes handle))))
+  node)
+
+(defun vui-stream-before (node vnode)
+  "Insert VNODE as a new live node directly above NODE; return the new node.
+The new node is itself a stable ref (`vui-stream-append-to' /
+`vui-stream-update' / `vui-stream-finalize' it).  This is the out-of-order
+insert: a card or notification that belongs above an item already on
+screen.  A no-op returning nil if NODE is not live."
+  (let* ((handle (vui--stream-node-handle node))
+         (cell (vui--stream-node-cell node))
+         (buf (vui-stream-handle-buffer handle))
+         (sep (vui-stream-handle-separator handle))
+         (start (vui--stream-node-start node))
+         ;; NODE is the last item when its cell heads items-rev.  Inserting
+         ;; above it moves its start, so the handle's last-start (used by
+         ;; `vui-stream-update-last') must follow to the re-seated start.
+         (last-p (eq cell (vui-stream-handle-items-rev handle))))
+    (when (and buf (buffer-live-p buf) start (marker-position start))
+      (let ((new (vui--stream-node-create :handle handle)))
+        ;; items-rev is reverse render order, so an item ABOVE NODE is OLDER
+        ;; and sits just after NODE's cell.
+        (setcdr cell (cons vnode (cdr cell)))
+        (setf (vui--stream-node-cell new) (cdr cell))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (save-excursion
+              (goto-char (marker-position start))
+              (let ((x-start (point)))
+                (vui--render-vnode vnode)
+                (let ((x-end (point)))
+                  (insert sep)
+                  ;; NODE's content now begins after the inserted separator.
+                  (set-marker start (point))
+                  (when last-p
+                    (vui--stream-set-last-start handle (point) buf))
+                  (vui--stream-node-bind new x-start x-end buf))))))
+        (push new (vui-stream-handle-nodes handle))
+        new))))
+
+(defun vui-stream-after (node vnode)
+  "Insert VNODE as a new live node directly below NODE; return the new node.
+Like `vui-stream-before' on the other side of NODE.  A no-op returning nil
+if NODE is not live."
+  (let* ((handle (vui--stream-node-handle node))
+         (cell (vui--stream-node-cell node))
+         (buf (vui-stream-handle-buffer handle))
+         (sep (vui-stream-handle-separator handle))
+         (end (vui--stream-node-end node)))
+    (when (and buf (buffer-live-p buf) end (marker-position end))
+      (let ((new (vui--stream-node-create :handle handle))
+            (head (vui-stream-handle-items-rev handle)))
+        ;; An item BELOW NODE is NEWER and sits just before NODE's cell.
+        (if (eq cell head)
+            (progn
+              (setf (vui-stream-handle-items-rev handle) (cons vnode head))
+              (setf (vui--stream-node-cell new)
+                    (vui-stream-handle-items-rev handle)))
+          (let ((prev head))
+            (while (and (cdr prev) (not (eq (cdr prev) cell)))
+              (setq prev (cdr prev)))
+            (setcdr prev (cons vnode cell))
+            (setf (vui--stream-node-cell new) (cdr prev))))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (save-excursion
+              (goto-char (marker-position end))
+              (insert sep)
+              (let ((x-start (point)))
+                (vui--render-vnode vnode)
+                (let ((x-end (point)))
+                  (vui--stream-node-bind new x-start x-end buf)
+                  (vui--stream-sync-end handle x-end)
+                  ;; If NODE was the last item, the new node is now last:
+                  ;; last-start (used by `vui-stream-update-last') follows it.
+                  (when (eq cell head)
+                    (vui--stream-set-last-start handle x-start buf)))))))
+        (push new (vui-stream-handle-nodes handle))
+        new))))
+
+(defun vui-stream-remove (node)
+  "Remove NODE: delete its region and one adjoining separator, then drop it.
+For an ephemeral item that should disappear (a transient notification).
+Releases NODE's marker like `vui-stream-finalize'.  A no-op returning nil
+if NODE is not live."
+  (let* ((handle (vui--stream-node-handle node))
+         (cell (vui--stream-node-cell node))
+         (buf (vui-stream-handle-buffer handle))
+         (seplen (length (vui-stream-handle-separator handle)))
+         (start (vui--stream-node-start node))
+         (end (vui--stream-node-end node))
+         (head (vui-stream-handle-items-rev handle)))
+    (when (and buf (buffer-live-p buf)
+               start (marker-position start) end (marker-position end))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              (buffer-undo-list t)
+              (s (marker-position start))
+              (e (marker-position end)))
+          ;; Swallow exactly one separator so the survivors stay singly
+          ;; separated: the one before NODE if anything renders above it,
+          ;; else the one after, else (the only item) none.
+          (cond
+           ((cdr cell) (delete-region (max (point-min) (- s seplen)) e))
+           ((not (eq cell head)) (delete-region s (min (point-max) (+ e seplen))))
+           (t (delete-region s e)))))
+      ;; splice NODE's cell out of items-rev
+      (if (eq cell head)
+          (setf (vui-stream-handle-items-rev handle) (cdr cell))
+        (let ((prev head))
+          (while (and (cdr prev) (not (eq (cdr prev) cell)))
+            (setq prev (cdr prev)))
+          (when (cdr prev) (setcdr prev (cdr cell)))))
+      (vui-stream-finalize node)
+      ;; If NODE was the last item, the handle's last-start now dangles in the
+      ;; deleted span - re-point it at the new last item so a later content
+      ;; `vui-stream-update-last' rewrites the right region.  When that item is
+      ;; static (no live marker), clear last-start so update-last safely
+      ;; no-ops until the next append rather than corrupting it.
+      (when (eq cell head)
+        (let* ((next (cdr cell))
+               (n (and next (cl-find next (vui-stream-handle-nodes handle)
+                                     :key #'vui--stream-node-cell)))
+               (ns (and n (vui--stream-node-start n))))
+          (if (and ns (marker-position ns))
+              (vui--stream-set-last-start handle (marker-position ns) buf)
+            (when-let* ((ls (vui-stream-handle-last-start handle)))
+              (set-marker ls nil)))))
+      ;; Emptying the stream changes the surrounding layout (the container
+      ;; drops the now-empty child and its separator), the mirror of the
+      ;; empty -> non-empty transition - re-lay once so the buffer matches a
+      ;; plain render.
+      (when (null (vui-stream-handle-items-rev handle))
+        (vui--stream-request-rerender handle)))
+    nil))
+
+;; --- Box-update independence: re-render around a live stream, not it ---
+;;
+;; A re-render driven by a sibling's state change (the "box" below the
+;; stream) would erase the whole buffer and re-emit every stream item,
+;; making that update O(N).  When the root is a flat container whose FIRST
+;; child is a live stream, the stream's region is already current (appends
+;; and update-last keep the buffer in sync), so we can leave it untouched
+;; and re-render only the content after it - O(content), independent of N.
+;; Anything else (a child before the stream, more than one stream, an
+;; indented/faced vstack) falls back to a wholesale rebuild, which is
+;; always correct.  Gated behind `vui-incremental-render'.
+
+(defun vui--stream-live-p (handle)
+  "Non-nil if HANDLE is a stream rendered live in the current buffer."
+  (and (vui-stream-handle-p handle)
+       (eq (vui-stream-handle-buffer handle) (current-buffer))
+       (let ((s (vui-stream-handle-region-start handle))
+             (e (vui-stream-handle-region-end handle)))
+         (and s (marker-position s) e (marker-position e)))))
+
+(defun vui--stream-tail-eligible (vtree)
+  "Return (HANDLE SUFFIX) when VTREE is a flat container whose first child
+is a live stream and no other child is a stream; else nil.  SUFFIX is the
+list of vnodes after the stream.  Only plain (indent 0, no face/keymap)
+vstacks and fragments qualify."
+  (let ((children
+         (cond ((vui-vnode-fragment-p vtree) (vui-vnode-fragment-children vtree))
+               ((and (vui-vnode-vstack-p vtree)
+                     (= 0 (or (vui-vnode-vstack-indent vtree) 0))
+                     (null (vui-vnode-vstack-face vtree))
+                     (null (vui-vnode-vstack-keymap vtree)))
+                (vui-vnode-vstack-children vtree))
+               (t :no))))
+    (when (listp children)
+      (let ((cs (remq nil children)))
+        (when (and cs (vui-vnode-stream-p (car cs))
+                   (not (cl-some #'vui-vnode-stream-p (cdr cs))))
+          (let ((h (vui-vnode-stream-handle (car cs))))
+            (when (and (vui--stream-live-p h)
+                       ;; The stream must be NON-EMPTY.  The patch leaves the
+                       ;; stream region untouched; for an empty stream that
+                       ;; means the first appended item (which re-renders via
+                       ;; this path) would never be emitted.  Stay wholesale
+                       ;; until there is content; then patch.
+                       (/= (marker-position (vui-stream-handle-region-start h))
+                           (marker-position (vui-stream-handle-region-end h))))
+              (list h (cdr cs)))))))))
+
+(defun vui--render-children-as (vtree children)
+  "Render CHILDREN as a container shaped like VTREE; return chars written.
+Reuses the real renderer so inter-child separators, empty-drop, and
+component reconciliation all match a wholesale render exactly."
+  (let ((start (point)))
+    (vui--render-vnode
+     (if (vui-vnode-fragment-p vtree)
+         (vui-vnode-fragment--create :children children)
+       (vui-vnode-vstack--create
+        :children children
+        :spacing (vui-vnode-vstack-spacing vtree)
+        :indent 0)))
+    (- (point) start)))
+
+(defun vui--patch-stream-tail (vtree handle suffix)
+  "Re-render only the content after HANDLE's region, leaving the region.
+SUFFIX is the list of vnodes after the stream in VTREE.  The stream is
+non-empty (live), so the suffix is separated from it by one container
+separator, which we drop if the suffix renders to nothing (matching a
+wholesale render's empty-child handling)."
+  (let* ((sep (vui--incremental-separator vtree))
+         (from (marker-position (vui-stream-handle-region-end handle))))
+    (vui--forget-region-fields from (point-max))
+    (vui--remove-widget-overlays from (point-max))
+    (delete-region from (point-max))
+    (goto-char from)
+    (let ((p (point)))
+      (insert sep)
+      (when (= 0 (vui--render-children-as vtree suffix))
+        (delete-region p (point))))))
+
+(defun vui--render-vnode (vnode)
+  "Render VNODE into the current buffer at point."
+  (cond
+   ;; Text node
+   ((vui-vnode-text-p vnode)
+    (let ((start (point))
+          (content (vui-vnode-text-content vnode))
+          (face (vui-vnode-text-face vnode))
+          (props (vui-vnode-text-properties vnode)))
+      (insert content)
+      (when (or face props)
+        (let ((end (point)))
+          (when face
+            (put-text-property start end 'face face))
+          (when props
+            (add-text-properties start end props))))))
+
+   ;; Fragment - render all children
+   ((vui-vnode-fragment-p vnode)
+    (let ((children (vui-vnode-fragment-children vnode))
+          (idx 0))
+      (dolist (child children)
+        (let ((vui--render-path (cons idx vui--render-path)))
+          (vui--render-vnode child))
+        (cl-incf idx))))
+
+   ;; Newline
+   ((vui-vnode-newline-p vnode)
+    (insert "\n"))
+
+   ;; Space
+   ((vui-vnode-space-p vnode)
+    (insert (vui--pad (vui--width (vui-vnode-space-width vnode)))))
+
+   ;; Button - a button.el text button (marker-free; see issue #107)
+   ((vui-vnode-button-p vnode)
+    (let* ((label (vui-vnode-button-label vnode))
+           (on-click (vui-vnode-button-on-click vnode))
+           (face (vui-vnode-button-face vnode))
+           (disabled (vui-vnode-button-disabled-p vnode))
+           (max-width (vui--width (vui-vnode-button-max-width vnode)))
+           (no-decoration (vui-vnode-button-no-decoration vnode))
+           (help-echo (vui-vnode-button-help-echo vnode))
+           (tab-order (vui-vnode-button-tab-order vnode))
+           (keymap (vui-vnode-button-keymap vnode))
+           ;; Brackets add 2 chars around the label unless :no-decoration
+           (bracket-width (if no-decoration 0 (vui--text-width "[]")))
+           (display-label
+            (if (and max-width (> (+ (vui--text-width label) bracket-width) max-width))
+                ;; Need truncation: available = max-width - brackets - 3 (...)
+                (let ((available (- max-width bracket-width (vui--text-width "..."))))
+                  (if (<= available 0)
+                      "..."  ; Just show [...] or ... for very small widths
+                    (concat (substring label 0 (vui--index-of
+                                                label
+                                                (min available (vui--text-width label))))
+                            "...")))
+              label))
+           (text (if no-decoration display-label (concat "[" display-label "]")))
+           ;; Capture instance context for callback
+           (captured-instance vui--current-instance)
+           (captured-root vui--root-instance)
+           ;; Capture current path for cursor tracking (reverse stack to get root-first order)
+           (captured-path (reverse vui--render-path))
+           ;; Wrap callback with error handling
+           (wrapped-click (vui--wrap-event-callback "on-click" on-click captured-instance)))
+      (apply #'vui--insert-text-button text
+             ;; A disabled button stays tabbable but inert
+             (lambda (_button)
+               (when (and wrapped-click (not disabled))
+                 (let ((vui--current-instance captured-instance)
+                       (vui--root-instance captured-root))
+                   (funcall wrapped-click))))
+             'face (if disabled 'widget-inactive (or face 'link))
+             ;; A disabled button should not advertise clickability: no hover
+             ;; highlight and no follow-link cursor (it is inert)
+             'mouse-face (unless disabled 'highlight)
+             'follow-link (not disabled)
+             ;; Store path and label for cursor tracking; a reconciliation
+             ;; key tells same-label buttons apart (see `vui--widget-identity')
+             :vui-path captured-path
+             :vui-tag label
+             (append
+              ;; Only pass help-echo when explicitly set (not :default);
+              ;; nil disables the tooltip, a string sets a custom one
+              (unless (eq help-echo :default)
+                (list 'help-echo help-echo))
+              (when tab-order
+                (list :vui-tab-order tab-order))
+              ;; A custom keymap composes over `vui--button-keymap' so vui
+              ;; nav (TAB/S-TAB) and RET/mouse activation still work
+              (when keymap
+                (list 'keymap (make-composed-keymap keymap vui--button-keymap)))
+              (when-let* ((key (vui-vnode-button-key vnode)))
+                (list :vui-key key))))))
+
+   ;; Checkbox - a button.el text button toggling [ ]/[X]
+   ((vui-vnode-checkbox-p vnode)
+    (let* ((checked (vui-vnode-checkbox-checked-p vnode))
+           (on-change (vui-vnode-checkbox-on-change vnode))
+           (label (vui-vnode-checkbox-label vnode))
+           (captured-instance vui--current-instance)
+           (captured-root vui--root-instance)
+           ;; Capture current path for cursor tracking (reverse stack to get root-first order)
+           (captured-path (reverse vui--render-path))
+           ;; Wrap callback with error handling
+           (wrapped-change (vui--wrap-event-callback "on-change" on-change captured-instance)))
+      (apply #'vui--insert-text-button (if checked "[X]" "[ ]")
+             (lambda (_button)
+               (when wrapped-change
+                 (let ((vui--current-instance captured-instance)
+                       (vui--root-instance captured-root))
+                   ;; Toggling flips the current state
+                   (funcall wrapped-change (not checked)))))
+             'face 'link
+             :vui-path captured-path
+             ;; A checkbox has no label, so its :key is its only stable
+             ;; cursor identity (see `vui--widget-identity')
+             (when-let* ((key (vui-vnode-checkbox-key vnode)))
+               (list :vui-key key)))
+      (when label
+        (insert " " label))))
+
+   ;; Select (dropdown via completing-read)
+   ((vui-vnode-select-p vnode)
+    (let* ((value (vui-vnode-select-value vnode))
+           (options (vui-vnode-select-options vnode))
+           (on-change (vui-vnode-select-on-change vnode))
+           (prompt (vui-vnode-select-prompt vnode))
+           ;; Normalize options to (LABEL . VALUE); plain options serve
+           ;; as their own label
+           (normalized (mapcar (lambda (option)
+                                 (if (consp option)
+                                     (cons (cdr option) (car option))
+                                   (cons (if (stringp option)
+                                             option
+                                           (format "%s" option))
+                                         option)))
+                               options))
+           (current-label (or (car (rassoc value normalized))
+                              (and value (format "%s" value))))
+           (captured-instance vui--current-instance)
+           (captured-root vui--root-instance)
+           ;; Capture current path for cursor tracking (reverse stack to get root-first order)
+           (captured-path (reverse vui--render-path))
+           ;; Wrap callback with error handling
+           (wrapped-change (vui--wrap-event-callback "on-change" on-change captured-instance)))
+      ;; The label is bracketed like a button; :vui-tag keeps the bare
+      ;; label so cursor identity is stable as the selection changes
+      (let ((label (format "%s" (or current-label "Select..."))))
+        (apply #'vui--insert-text-button (concat "[" label "]")
+               (lambda (_button)
+                 (let* ((vui--current-instance captured-instance)
+                        (vui--root-instance captured-root)
+                        (choice (completing-read prompt
+                                                 (mapcar #'car normalized)
+                                                 nil t nil nil
+                                                 current-label))
+                        (chosen (assoc choice normalized)))
+                   (when (and wrapped-change chosen)
+                     ;; Pass the option's VALUE, not its label
+                     (funcall wrapped-change (cdr chosen)))))
+               'face 'link
+               :vui-path captured-path
+               ;; The label reflects the current selection, so cursor
+               ;; identity leans on :vui-key (see `vui--widget-identity')
+               :vui-tag label
+               (when-let* ((key (vui-vnode-select-key vnode)))
+                 (list :vui-key key))))))
+
+   ;; Horizontal stack
+   ;; Children that render to nothing (e.g., components returning nil)
+   ;; are skipped and don't affect spacing.
+   ((vui-vnode-hstack-p vnode)
+    (let ((spacing (vui--width (or (vui-vnode-hstack-spacing vnode) 1)))
+          ;; Stays in characters: an hstack never inserts its own indent,
+          ;; it only hands it down to nested vstacks, and :indent is a
+          ;; character-unit slot that accumulates through nesting.
+          (indent (or (vui-vnode-hstack-indent vnode) 0))
+          (children (vui-vnode-hstack-children vnode))
+          (container-start (point))
+          (space-str nil)
+          (prev-rendered-p nil)
+          (child-idx 0))
+      (setq space-str (vui--pad spacing))
+      (dolist (child children)
+        (let ((sep-start (point))
+              (content-start nil)
+              (vui--render-path (cons child-idx vui--render-path)))
+          ;; Only insert separator if previous child actually rendered something
+          (when prev-rendered-p
+            (insert space-str))
+          (setq content-start (point))
+          ;; Propagate indent to child vstacks (for multi-line content)
+          ;; Set skip-first-indent because the first line continues horizontally
+          (if (and (vui-vnode-vstack-p child) (> indent 0))
+              (vui--render-vnode
+               (vui-vnode-vstack--create
+                :children (vui-vnode-vstack-children child)
+                :spacing (vui-vnode-vstack-spacing child)
+                :indent (+ indent (or (vui-vnode-vstack-indent child) 0))
+                :skip-first-indent t
+                :face (vui-vnode-vstack-face child)
+                :keymap (vui-vnode-vstack-keymap child)
+                :key (vui-vnode-vstack-key child)))
+            (vui--render-vnode child))
+          ;; Check if child actually rendered anything
+          (if (> (point) content-start)
+              (setq prev-rendered-p t)
+            ;; Child rendered nothing - remove the separator we added
+            (delete-region sep-start (point))))
+        (cl-incf child-idx))
+      (vui--apply-region-props container-start (point)
+                               (vui-vnode-hstack-face vnode)
+                               (vui-vnode-hstack-keymap vnode))))
+
+   ;; Vertical stack
+   ;; Joins children with \n. newline children render as empty string,
+   ;; effectively adding an extra \n (blank line) via the join.
+   ;; Children that render to nothing (e.g., components returning nil)
+   ;; are skipped and don't affect spacing.
+   ((vui-vnode-vstack-p vnode)
+    (let ((spacing (or (vui-vnode-vstack-spacing vnode) 0))
+          (indent (or (vui-vnode-vstack-indent vnode) 0))
+          (skip-first-indent (vui-vnode-vstack-skip-first-indent vnode))
+          (children (vui-vnode-vstack-children vnode))
+          (container-start (point))
+          (indent-str nil)
+          (prev-rendered-p nil)
+          (child-idx 0))
+      ;; INDENT stays in characters (it accumulates into nested
+      ;; children's :indent below); convert only for the inserted string.
+      (setq indent-str (vui--pad (vui--width indent)))
+      (dolist (child children)
+        (let ((vui--render-path (cons child-idx vui--render-path)))
+          ;; newline children are intentional blank lines - always "render"
+          (if (vui-vnode-newline-p child)
+              (progn
+                ;; Add separator if previous child rendered
+                (when prev-rendered-p
+                  (insert "\n")
+                  (dotimes (_ spacing) (insert "\n")))
+                ;; newline itself doesn't insert anything, but counts as rendered
+                (setq prev-rendered-p t))
+            ;; Non-newline children: track if they produce output
+            (let* ((skip-this-indent (and (not prev-rendered-p) skip-first-indent))
+                   (sep-start (point))
+                   (content-start nil))
+              ;; Add separator newline (plus spacing) before child if prev rendered
+              (when prev-rendered-p
+                (insert "\n")
+                (dotimes (_ spacing) (insert "\n")))
+              (cond
+               ;; Propagate indent to nested vstacks (they handle their own indentation)
+               ;; Also propagate skip-first-indent if this is the first child we're skipping
+               ((and (vui-vnode-vstack-p child) (> indent 0))
+                ;; Nested vstacks handle their own indent, measure from here
+                (setq content-start (point))
+                (vui--render-vnode
+                 (vui-vnode-vstack--create
+                  :children (vui-vnode-vstack-children child)
+                  :spacing (vui-vnode-vstack-spacing child)
+                  :indent (+ indent (or (vui-vnode-vstack-indent child) 0))
+                  :skip-first-indent skip-this-indent
+                  :face (vui-vnode-vstack-face child)
+                  :keymap (vui-vnode-vstack-keymap child)
+                  :key (vui-vnode-vstack-key child))))
+               ;; Propagate indent to hstacks (for multi-line children inside hstack)
+               ((and (vui-vnode-hstack-p child) (> indent 0))
+                (unless skip-this-indent
+                  (insert indent-str))
+                ;; Measure after indent insertion
+                (setq content-start (point))
+                (vui--render-vnode
+                 (vui-vnode-hstack--create
+                  :children (vui-vnode-hstack-children child)
+                  :spacing (vui-vnode-hstack-spacing child)
+                  :indent (+ indent (or (vui-vnode-hstack-indent child) 0))
+                  :face (vui-vnode-hstack-face child)
+                  :keymap (vui-vnode-hstack-keymap child)
+                  :key (vui-vnode-hstack-key child))))
+               ;; Propagate indent to flex rows so they subtract it
+               ;; from their available width
+               ((and (vui-vnode-flex-p child) (> indent 0))
+                (unless skip-this-indent
+                  (insert indent-str))
+                (setq content-start (point))
+                (vui--render-vnode
+                 (vui-vnode-flex--create
+                  :children (vui-vnode-flex-children child)
+                  :spacing (vui-vnode-flex-spacing child)
+                  :width (vui-vnode-flex-width child)
+                  :justify (vui-vnode-flex-justify child)
+                  :indent (+ indent (or (vui-vnode-flex-indent child) 0))
+                  :wrap (vui-vnode-flex-wrap child)
+                  :face (vui-vnode-flex-face child)
+                  :keymap (vui-vnode-flex-keymap child)
+                  :key (vui-vnode-flex-key child))))
+               ;; Propagate indent to grids the same way
+               ((and (vui-vnode-grid-p child) (> indent 0))
+                (unless skip-this-indent
+                  (insert indent-str))
+                (setq content-start (point))
+                (vui--render-vnode
+                 (vui-vnode-grid--create
+                  :children (vui-vnode-grid-children child)
+                  :columns (vui-vnode-grid-columns child)
+                  :min-column-width (vui-vnode-grid-min-column-width child)
+                  :width (vui-vnode-grid-width child)
+                  :spacing (vui-vnode-grid-spacing child)
+                  :row-spacing (vui-vnode-grid-row-spacing child)
+                  :indent (+ indent (or (vui-vnode-grid-indent child) 0))
+                  :face (vui-vnode-grid-face child)
+                  :keymap (vui-vnode-grid-keymap child)
+                  :key (vui-vnode-grid-key child))))
+               ;; Tables: render with indent, then add indent after internal newlines
+               ((and (vui-vnode-table-p child) (> indent 0))
+                (unless skip-this-indent
+                  (insert indent-str))
+                (setq content-start (point))
+                (vui--render-vnode child)
+                ;; Add indent after each internal newline
+                (save-excursion
+                  (goto-char content-start)
+                  (while (search-forward "\n" nil t)
+                    (insert indent-str))))
+               ;; Other children: insert indent (if needed) and render
+               (t
+                (when (and (> indent 0) (not skip-this-indent))
+                  (insert indent-str))
+                ;; Measure after indent insertion
+                (setq content-start (point))
+                (vui--render-vnode child)))
+              ;; Check if child actually rendered anything
+              (if (> (point) content-start)
+                  (setq prev-rendered-p t)
+                ;; Child rendered nothing - remove separator and any indent we added
+                (delete-region sep-start (point))))))
+        (cl-incf child-idx))
+      (vui--apply-region-props container-start (point)
+                               (vui-vnode-vstack-face vnode)
+                               (vui-vnode-vstack-keymap vnode))))
+
+   ;; Fixed-width box
+   ((vui-vnode-box-p vnode)
+    (let* ((width (vui--width (vui-vnode-box-width vnode)))
+           (align (or (vui-vnode-box-align vnode) :left))
+           (pad-left (vui--width (or (vui-vnode-box-padding-left vnode) 0)))
+           (pad-right (vui--width (or (vui-vnode-box-padding-right vnode) 0)))
+           (child (vui-vnode-box-child vnode))
+           (box-start (point))
+           (pad-left-str (vui--pad pad-left))
+           ;; First render to temp buffer to measure width.
+           ;; Isolate the measure pass like table cells do: without the
+           ;; rebindings, a component inside the box would be reconciled
+           ;; twice per render (duplicate child entries, shifted indexes
+           ;; for keyless siblings) and would mount inside the temp buffer.
+           (content-width (let ((vui--measure-buffer (vui--measure-buffer)))
+                            (with-temp-buffer
+                              (let ((vui--current-instance nil)
+                                    (vui--root-instance nil)
+                                    (vui--new-children nil)
+                                    (vui--child-index 0)
+                                    (vui--measuring-p t)
+                                    (vui--pending-effects nil))
+                                (vui--render-vnode child))
+                              (vui--text-width (buffer-string)))))
+           (inner-width (- width pad-left pad-right))
+           (padding (max 0 (- inner-width content-width))))
+      ;; Insert left padding
+      (insert pad-left-str)
+      ;; Record start position for post-processing newlines
+      (let ((content-start (point)))
+        ;; Render content with alignment (render properly to get widgets)
+        (pcase align
+          (:left
+           (vui--render-vnode child)
+           (insert (vui--pad padding)))
+          (:right
+           (insert (vui--pad padding))
+           (vui--render-vnode child))
+          (:center
+           (let* ((split (vui--split-padding padding))
+                  (left-pad (car split))
+                  (right-pad (cdr split)))
+             (insert (vui--pad left-pad))
+             (vui--render-vnode child)
+             (insert (vui--pad right-pad)))))
+        ;; Add left padding after each newline for block indentation
+        (when (> pad-left 0)
+          (save-excursion
+            (goto-char content-start)
+            (while (search-forward "\n" nil t)
+              (insert pad-left-str)))))
+      ;; Insert right padding
+      (insert (vui--pad pad-right))
+      (vui--apply-region-props box-start (point)
+                               (vui-vnode-box-face vnode)
+                               (vui-vnode-box-keymap vnode))))
+
+   ;; Table layout
+   ((vui-vnode-table-p vnode)
+    (let* ((columns (vui-vnode-table-columns vnode))
+           (rows (vui-vnode-table-rows vnode))
+           (border (vui-vnode-table-border vnode))
+           (header-face (vui-vnode-table-header-face vnode))
+           (border-face (vui-vnode-table-border-face vnode))
+           (has-header (cl-some (lambda (c) (plist-get c :header)) columns))
+           (sticky (and (vui-vnode-table-sticky-header vnode) has-header))
+           ;; Calculate column widths
+           ;; The sizing pass renders and measures every cell; keep that
+           ;; per row so the row pass does not do it a second time
+           (measures (make-hash-table :test #'eq))
+           (col-widths (vui--calculate-table-widths columns rows border
+                                                    header-face measures)))
+      ;; The pinned copy of a sticky header is display-only text in the
+      ;; header line, out of reach of vui navigation and buttons -
+      ;; require plain string headers so nothing looks interactive
+      ;; without being so
+      (when sticky
+        (dolist (col columns)
+          (let ((header (plist-get col :header)))
+            (unless (or (null header) (stringp header))
+              (error "vui-table: :sticky-header requires plain string headers, got %S"
+                     header)))))
+      ;; Cell padding when borders are enabled
+      (let ((cell-padding (if border 1 0))
+            (row-idx 0)
+            (header-row-start nil))
+        ;; Render header if any column has one
+        (when has-header
+          (when border
+            (vui--render-table-border col-widths border 'top cell-padding
+                                      border-face))
+          (setq header-row-start (point))
+          (vui--render-table-row
+           (mapcar (lambda (c) (or (plist-get c :header) "")) columns)
+           col-widths columns border 'header nil header-face border-face)
+          (when border
+            (vui--render-table-border col-widths border 'separator cell-padding
+                                      border-face)))
+        ;; Render data rows
+        (let ((first-row (not has-header)))
+          (when (and border first-row)
+            (vui--render-table-border col-widths border 'top cell-padding
+                                      border-face))
+          (dolist (row rows)
+            (if (eq row :separator)
+                ;; Render separator line
+                (when border
+                  (vui--render-table-border col-widths border 'separator
+                                            cell-padding border-face))
+              ;; Render data row with row index for path tracking
+              (vui--render-table-row row col-widths columns border nil row-idx
+                                     nil border-face (gethash row measures))
+              (cl-incf row-idx)))
+          (when border
+            (vui--render-table-border col-widths border 'bottom cell-padding
+                                      border-face)))
+        ;; Remove trailing newline - tables emit content only, no trailing newline
+        (when (eq (char-before) ?\n)
+          (delete-char -1))
+        ;; Sticky header: register the table's region so redisplay can
+        ;; pin the header row while the window is scrolled into the
+        ;; body.  Skipped during measure passes, which run in a temp
+        ;; buffer: only the real render may touch the target buffer's
+        ;; header line.
+        (when (and sticky header-row-start (not vui--measuring-p))
+          (vui--table-register-sticky header-row-start (point))))))
+
+   ;; Field (editable text input)
+   ((vui-vnode-field-p vnode)
+    (let* ((value (vui-vnode-field-value vnode))
+           (size (vui-vnode-field-size vnode))
+           (field-key (vui-vnode-field-key vnode))
+           (on-change (vui-vnode-field-on-change vnode))
+           (on-submit (vui-vnode-field-on-submit vnode))
+           (secret-p (vui-vnode-field-secret-p vnode))
+           (user-face (vui-vnode-field-face vnode))
+           (placeholder (vui-vnode-field-placeholder vnode))
+           ;; Capture instance context for callback
+           (captured-instance vui--current-instance)
+           (captured-root vui--root-instance)
+           ;; Capture current path for cursor tracking (reverse stack to get root-first order)
+           (captured-path (reverse vui--render-path))
+           ;; Wrap callbacks with error handling
+           (wrapped-change (vui--wrap-event-callback "on-change" on-change captured-instance))
+           (wrapped-submit (vui--wrap-event-callback "on-submit" on-submit captured-instance)))
+      (let ((w (widget-create 'editable-field
+                              ;; TAB/S-TAB in a field use vui's unified nav
+                              ;; (which also stops on text buttons); editing
+                              ;; keys fall through to `widget-field-keymap'
+                              :keymap (make-composed-keymap
+                                       vui--field-nav-keymap widget-field-keymap)
+                              :size (or size 20)
+                              :value value
+                              :secret (when secret-p ?*)
+                              :value-face user-face  ; Always use user face for field content
+                              :notify (lambda (widget &rest _)
+                                        (when wrapped-change
+                                          (let ((vui--current-instance captured-instance)
+                                                (vui--root-instance captured-root))
+                                            (funcall wrapped-change (widget-value widget)))))
+                              :action (lambda (widget &optional _event)
+                                        (when wrapped-submit
+                                          (let ((vui--current-instance captured-instance)
+                                                (vui--root-instance captured-root))
+                                            (funcall wrapped-submit (widget-value widget))))))))
+        ;; Store path for cursor tracking
+        (widget-put w :vui-path captured-path)
+        ;; Store key on widget for vui-field-value lookup
+        (when field-key
+          (widget-put w :vui-key field-key))
+        ;; Store placeholder on widget; rendered after widget-setup
+        ;; by `vui--setup-field-placeholders'
+        (when placeholder
+          (widget-put w :vui-placeholder placeholder)))))
+
+   ;; Flexible-width row
+   ((vui-vnode-flex-p vnode)
+    (if (vui-vnode-flex-wrap vnode)
+        (vui--render-flex-wrap vnode)
+      (vui--render-flex vnode)))
+
+   ;; Responsive grid
+   ((vui-vnode-grid-p vnode)
+    (vui--render-grid vnode))
+
+   ;; Flex item outside vui-flex: render the child at natural width
+   ((vui-vnode-flex-item-p vnode)
+    (let ((child (vui-vnode-flex-item-child vnode)))
+      (vui--render-vnode (if (functionp child) (funcall child 0) child))))
+
+   ;; Styled region - render children, then apply face/keymap on top
+   ((vui-vnode-region-p vnode)
+    (let ((start (point))
+          (children (vui-vnode-region-children vnode))
+          (idx 0))
+      (dolist (child children)
+        (let ((vui--render-path (cons idx vui--render-path)))
+          (vui--render-vnode child))
+        (cl-incf idx))
+      (vui--apply-region-props start (point)
+                               (vui-vnode-region-face vnode)
+                               (vui-vnode-region-keymap vnode))))
+
+   ;; Component - reconcile and render
+   ((vui-vnode-component-p vnode)
+    (let ((live (and vui--measuring-p
+                     vui--measure-live-parent
+                     (vui--measure-live-match vnode))))
+      (if live
+          ;; Measure pass over a mounted component: render what the
+          ;; instance will render - its render function over current
+          ;; state - instead of a throwaway initial-state instance.
+          ;; The live instance is only read, never touched; the real
+          ;; render still reconciles and re-renders it.  The descent
+          ;; rebinds the live parent so nested components match the
+          ;; instance's own children the same way.
+          (progn
+            (cl-incf vui--child-index)
+            (let ((vtree (vui--measure-instance-vtree live vnode)))
+              (let ((vui--measure-live-parent live)
+                    (vui--child-index 0))
+                (vui--render-vnode vtree))))
+        ;; No live counterpart (real render, or measuring a component
+        ;; that is not mounted here): reconcile and render.  A
+        ;; throwaway subtree has no live children to match below it.
+        (let* ((vui--measure-live-parent nil)
+               (instance (vui--reconcile-component vnode vui--current-instance)))
+          ;; Track this child for future reconciliation
+          (push instance vui--new-children)
+          ;; Record the instance's rendered length so the component-list
+          ;; incremental patcher can skip or replace it by position - only
+          ;; needed (and only paid for) when the flag is on.
+          (if vui-incremental-render
+              (let ((start (point)))
+                (vui--render-instance instance)
+                (setf (vui-instance-r-len instance) (- (point) start)))
+            (vui--render-instance instance))))))
+
+   ;; Stream - (re-)emit the handle's items and bind its region
+   ((vui-vnode-stream-p vnode)
+    (vui--stream-render (vui-vnode-stream-handle vnode)))
+
+   ;; Context provider - push context and render children
+   ((vui-vnode-provider-p vnode)
+    (let* ((context (vui-vnode-provider-context vnode))
+           (value (vui-vnode-provider-value vnode))
+           (children (vui-vnode-provider-children vnode))
+           ;; Push new binding onto context stack
+           (vui--context-stack
+            (cons (vui-context-binding--create
+                   :context context
+                   :value value)
+                  vui--context-stack)))
+      ;; Render all children with the new context
+      (dolist (child children)
+        (vui--render-vnode child))))
+
+   ;; Error boundary - catch errors from children
+   ((vui-vnode-error-boundary-p vnode)
+    (let* ((boundary-key (or (vui-vnode-error-boundary-id vnode)
+                             ;; No explicit id: derive a stable identity
+                             ;; from the boundary's position in the tree
+                             (cons :vui-path (reverse vui--render-path))))
+           (fallback (vui-vnode-error-boundary-fallback vnode))
+           (on-error (vui-vnode-error-boundary-on-error vnode))
+           (children (vui-vnode-error-boundary-children vnode))
+           (table (vui--error-boundary-table))
+           ;; Check if we already have a caught error for this boundary
+           (existing-error (gethash boundary-key table)))
+      (if existing-error
+          ;; Already have an error - render fallback
+          (when fallback
+            (let ((fallback-vnode (funcall fallback existing-error)))
+              (vui--render-vnode fallback-vnode)))
+        ;; No error yet - try to render children
+        (condition-case err
+            (dolist (child children)
+              (vui--render-vnode child))
+          (error
+           ;; Store the error for this boundary
+           (puthash boundary-key err table)
+           ;; Call on-error callback if provided
+           (when on-error
+             (funcall on-error err))
+           ;; Render fallback
+           (when fallback
+             (let ((fallback-vnode (funcall fallback err)))
+               (vui--render-vnode fallback-vnode))))))))
+
+   ;; String shorthand
+   ((stringp vnode)
+    (insert vnode))
+
+   ;; Nil - skip
+   ((null vnode)
+    nil)
+
+   (t
+    (error "Unknown vnode type: %S" (type-of vnode)))))
+
+;;; Public API
+
+(defun vui-render (vnode &optional buffer)
+  "Render VNODE tree into BUFFER (default: current buffer).
+Clears the buffer before rendering.  A component tree previously
+mounted in BUFFER is unmounted first: erasing destroys its output,
+and a live instance left behind would re-render the old UI over this
+one from a timer, an async callback, or a window resize."
+  (with-current-buffer (or buffer (current-buffer))
+    ;; TODO: Implement cursor preservation across re-renders.
+    ;; Should track position relative to logical elements (keys/components),
+    ;; not buffer positions. Will be part of component instance system.
+    (let ((inhibit-read-only t))
+      ;; Enable vui-mode (this also sets up the keymap hierarchy)
+      (unless (derived-mode-p 'vui-mode)
+        (vui-mode))
+      ;; Tear down a previously mounted tree, as `vui-mount' does when
+      ;; it takes over a buffer.
+      (when vui--root-instance
+        (vui--unmount-root vui--root-instance)
+        (kill-local-variable 'vui--root-instance))
+      (when vui--inline-instances
+        (dolist (inline-instance vui--inline-instances)
+          (vui--unmount-root inline-instance))
+        (kill-local-variable 'vui--inline-instances))
+      ;; Drop stale field bookkeeping before erasing.  A `vui-field'
+      ;; from a previous render installs `widget-after-change' on
+      ;; `after-change-functions' and lingers in `widget-field-list';
+      ;; the `erase-buffer' below would otherwise fire that hook against
+      ;; the just-deleted field and signal (number-or-marker-p nil).
+      ;; Clearing the lists (as the component re-render path does) also
+      ;; keeps dead widgets from piling up across renders.
+      (setq widget-field-list nil widget-field-new nil)
+      (remove-overlays)
+      (erase-buffer)
+      ;; A previous render's sticky table header must not outlive it;
+      ;; rendering a sticky table below installs a fresh one
+      (vui--table-restore-header-line)
+      (vui--render-vnode vnode)
+      ;; Setup widgets for keyboard navigation
+      (widget-setup)
+      (vui--setup-field-placeholders)
+      (goto-char (point-min)))))
+
+(defun vui-render-to-buffer (buffer-name vnode)
+  "Render VNODE into a buffer named BUFFER-NAME.
+Creates the buffer if it doesn't exist, switches to it."
+  (let ((buf (get-buffer-create buffer-name)))
+    (vui-render vnode buf)
+    (switch-to-buffer buf)
+    buf))
+
+(defun vui-mount (component-vnode &optional buffer-name)
+  "Mount a component as root and render to BUFFER-NAME.
+COMPONENT-VNODE should be created with `vui-component'.
+BUFFER-NAME defaults to \"*vui*\".
+Returns the root instance."
+  (let* ((buf-name (or buffer-name "*vui*"))
+         (buf (get-buffer-create buf-name))
+         (instance (vui--create-instance component-vnode nil))
+         ;; Clear pending effects before initial render
+         (vui--pending-effects nil))
+    ;; Store buffer reference in instance for re-rendering
+    (setf (vui-instance-buffer instance) buf)
+    (with-current-buffer buf
+      (let ((inhibit-read-only t)
+            ;; The render is not something to undo, and `widget-setup'
+            ;; clears the undo list at the end of it anyway; recording
+            ;; it would only copy the erased text, properties included,
+            ;; into undo to be thrown away.  Same for re-renders, see
+            ;; `vui--rerender-buffer'.
+            (buffer-undo-list t))
+        ;; Tear down any previously mounted tree first so its lifecycle
+        ;; cleanups run and its stale async callbacks detach.  Without
+        ;; this, the old tree stays live and a timer created by it can
+        ;; re-render the old UI over the new mount.
+        (when vui--root-instance
+          (vui--unmount-root vui--root-instance))
+        ;; A full mount owns the whole buffer: tear down inline
+        ;; instances too, since erasing destroys their regions
+        (when vui--inline-instances
+          (dolist (inline-instance vui--inline-instances)
+            (vui--unmount-root inline-instance))
+          (kill-local-variable 'vui--inline-instances))
+        ;; Enable vui-mode (this also sets up the keymap hierarchy)
+        (unless (derived-mode-p 'vui-mode)
+          (vui-mode))
+        ;; Drop stale field bookkeeping before erasing, as `vui-render'
+        ;; does: a `vui-field' from the previous mount lingers in
+        ;; `widget-field-list' with `widget-after-change' still on
+        ;; `after-change-functions'; `remove-overlays' deletes its
+        ;; overlay, so the `erase-buffer' below would fire that hook
+        ;; against a dead field and signal (number-or-marker-p nil).
+        (setq widget-field-list nil widget-field-new nil)
+        (remove-overlays)
+        (erase-buffer)
+        ;; The previous mount's sticky table header must not leak into
+        ;; this one; the new tree installs its own if it has one
+        (vui--table-restore-header-line)
+        ;; Store root instance for state updates
+        (setq-local vui--root-instance instance)
+        ;; Release component resources when the buffer is killed
+        (add-hook 'kill-buffer-hook #'vui--teardown-on-kill nil t)
+        ;; Reflow window-width-dependent layouts on resize (see
+        ;; `vui-rerender-on-resize-default')
+        (when vui-rerender-on-resize-default
+          (vui-rerender-on-resize))
+        (let ((vui--root-instance instance))
+          ;; Queue re-render requests (sync resolve, vui-set-state with
+          ;; nil delay) until commit and effects are done
+          (setq vui--rendering-p t)
+          (unwind-protect
+              (progn
+                (vui--render-instance instance)
+                ;; widget-setup installs before-change-functions that
+                ;; prevent editing outside of editable fields - no need
+                ;; for buffer-read-only
+                (widget-setup)
+                (vui--setup-field-placeholders)
+                ;; Run effects after initial render
+                (vui--run-pending-effects))
+            (setq vui--rendering-p nil))
+          ;; Run any re-renders requested during render/effects
+          (vui--flush-queued-rerenders))
+        (goto-char (point-min)))
+      ;; Outside the `buffer-undo-list' binding: leave the list empty, as
+      ;; `widget-setup' did before the render stopped recording.
+      (setq buffer-undo-list nil))
+    (switch-to-buffer buf)
+    instance))
+
+(defun vui-mount-inline (component-vnode &optional position)
+  "Mount COMPONENT-VNODE inline at POSITION in the current buffer.
+
+Unlike `vui-mount', this does not take over the buffer: the
+component renders into a managed region at POSITION (default:
+point) inside the existing buffer content.  The buffer's major mode
+is left untouched, and a buffer can host any number of inline
+instances alongside its regular content.
+
+The region is ephemeral UI, not document content: vui rewrites it
+on every state update, keeps those rewrites out of the undo
+history, and removes the region when the instance is unmounted.
+Manual edits inside the region (outside of input fields) are
+overwritten by the next re-render.
+
+POSITION must not fall strictly inside another inline instance's
+region.
+
+Returns the instance.  Pass it to `vui-unmount' to dismiss the UI
+and run the full teardown lifecycle (which also happens
+automatically when the buffer is killed), or drive it with
+`vui-rerender' / `vui-update' / `vui-update-props'.
+
+Example - an ephemeral form that dismisses itself on submit:
+
+  (let* ((form nil))
+    (setq form
+          (vui-mount-inline
+           (vui-component \\='server-query-form
+             :on-submit (lambda (params)
+                          (vui-unmount form)
+                          (run-query params))))))"
+  (let ((pos (or position (point))))
+    (when (cl-find-if (lambda (instance)
+                        (let ((s (vui-instance-region-start instance))
+                              (e (vui-instance-region-end instance)))
+                          (and s e (marker-position s)
+                               (> pos (marker-position s))
+                               (< pos (marker-position e)))))
+                      vui--inline-instances)
+      (error "Position %d is inside an existing inline VUI instance" pos))
+    (let ((instance (vui--create-instance component-vnode nil))
+          (start (make-marker))
+          (end (make-marker)))
+      (setf (vui-instance-buffer instance) (current-buffer))
+      (set-marker start pos)
+      (set-marker end pos)
+      ;; Text typed by the user at the boundaries stays outside the
+      ;; region: START advances past insertions at its position, END
+      ;; stays before them.  Render itself repositions both markers
+      ;; explicitly.
+      (set-marker-insertion-type start t)
+      (set-marker-insertion-type end nil)
+      (setf (vui-instance-region-start instance) start)
+      (setf (vui-instance-region-end instance) end)
+      (push instance vui--inline-instances)
+      ;; Release component resources when the buffer is killed
+      (add-hook 'kill-buffer-hook #'vui--teardown-on-kill nil t)
+      ;; Reflow window-width-dependent layouts on resize (see
+      ;; `vui-rerender-on-resize-default')
+      (when vui-rerender-on-resize-default
+        (vui-rerender-on-resize))
+      (vui--rerender-instance instance)
+      instance)))
+
+(defun vui-inline-instance-at (&optional position)
+  "Return the inline VUI instance whose region contains POSITION.
+POSITION defaults to point.  Returns nil when POSITION is not inside
+any region mounted via `vui-mount-inline' in the current buffer."
+  (let ((pos (or position (point))))
+    (cl-find-if (lambda (instance)
+                  (let ((s (vui-instance-region-start instance))
+                        (e (vui-instance-region-end instance)))
+                    (and s e (marker-position s)
+                         (>= pos (marker-position s))
+                         (<= pos (marker-position e)))))
+                vui--inline-instances)))
+
+(defun vui-get-instance (&optional buffer)
+  "Return the root component instance mounted in BUFFER.
+BUFFER defaults to the current buffer and may be a buffer object or
+a buffer name.  Returns nil if BUFFER does not exist or has no
+mounted VUI instance.
+
+Use this together with `vui-rerender', `vui-update', and
+`vui-update-props' to drive a mounted UI from outside:
+
+  (when-let* ((instance (vui-get-instance \"*sidebar*\")))
+    (vui-update instance (list :note note)))
+
+The instance returned is the root - the component passed to
+`vui-mount'.  Note that updating its props does not reach state a
+component seeded from those props (see `vui-update'); to push data
+into a nested component, use `vui-with-async-context' instead.  See
+the External Updates guide."
+  (when-let* ((buf (get-buffer (or buffer (current-buffer)))))
+    (when (buffer-live-p buf)
+      (buffer-local-value 'vui--root-instance buf))))
+
+(defun vui--teardown-on-kill ()
+  "Run the unmount lifecycle for this buffer's mounted instances.
+Installed buffer-locally on `kill-buffer-hook' by `vui-mount' and
+`vui-mount-inline' so components release their resources (timers,
+processes, subscriptions) when the buffer is killed."
+  (when vui--root-instance
+    (vui--unmount-root vui--root-instance)
+    (kill-local-variable 'vui--root-instance))
+  (when vui--inline-instances
+    (dolist (instance vui--inline-instances)
+      (vui--unmount-root instance))
+    (kill-local-variable 'vui--inline-instances)))
+
+(defun vui--unmount-inline (instance)
+  "Tear down inline INSTANCE and remove its region from the buffer.
+Returns INSTANCE, or nil if it was already unmounted."
+  (when (vui-instance-buffer instance)
+    (let ((buffer (vui-instance-buffer instance))
+          (start (vui-instance-region-start instance))
+          (end (vui-instance-region-end instance)))
+      ;; Run cleanups and detach first, so the tree cannot re-render
+      ;; into the region we are about to delete
+      (vui--unmount-root instance)
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq vui--inline-instances (delq instance vui--inline-instances))
+          (when (and start (marker-position start))
+            (let ((inhibit-read-only t)
+                  (inhibit-modification-hooks t)
+                  ;; Managed UI text is not part of the undo history
+                  (buffer-undo-list t)
+                  (pos (marker-position start))
+                  (end-pos (marker-position end)))
+              (vui--remove-widget-overlays pos end-pos)
+              (vui--forget-region-fields pos end-pos)
+              (delete-region pos end-pos)))
+          ;; Put back the header line a sticky table header replaced
+          (vui--table-restore-header-line)))
+      (when start (set-marker start nil))
+      (when end (set-marker end nil))
+      (setf (vui-instance-region-start instance) nil)
+      (setf (vui-instance-region-end instance) nil)
+      instance)))
+
+(defun vui-unmount (&optional buffer-or-instance)
+  "Unmount a VUI instance, running its full teardown lifecycle.
+
+BUFFER-OR-INSTANCE selects what to unmount:
+- nil, a buffer, or a buffer name: the instance mounted in that
+  buffer (default: current buffer) via `vui-mount'.  The buffer's
+  content is erased, but the buffer itself is not killed.
+- an instance returned by `vui-mount-inline': its managed region is
+  removed from the host buffer; the rest of the buffer is untouched.
+- an instance returned by `vui-mount': same as passing its buffer.
+
+The teardown lifecycle runs for every component in the tree:
+on-unmount hooks, effect cleanup functions, cleanup functions
+returned from on-mount, and cancellation of pending async processes
+and deferred renders.
+
+After unmounting, async callbacks created via
+`vui-with-async-context' or `vui-async-callback' that captured this
+tree become no-ops.
+
+Returns the unmounted instance, or nil if nothing was mounted."
+  (cond
+   ((vui-instance-p buffer-or-instance)
+    (if (vui--inline-p buffer-or-instance)
+        (vui--unmount-inline buffer-or-instance)
+      (when-let* ((buffer (vui-instance-buffer buffer-or-instance)))
+        (vui-unmount buffer))))
+   (t
+    (when-let* ((instance (vui-get-instance buffer-or-instance)))
+      (let ((buf (vui-instance-buffer instance)))
+        (vui--unmount-root instance)
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (kill-local-variable 'vui--root-instance)
+            ;; Inhibit modification hooks while erasing: a `vui-field' in
+            ;; the buffer installs an after-change hook that runs
+            ;; `widget-after-change' against the now half-removed field and
+            ;; signals (number-or-marker-p nil).  The render path inhibits
+            ;; these hooks for the same reason; teardown must too.
+            (let ((inhibit-read-only t)
+                  (inhibit-modification-hooks t))
+              (remove-overlays)
+              (erase-buffer))
+            ;; Put back the header line a sticky table header replaced
+            (vui--table-restore-header-line))))
+      instance))))
+
+(provide 'vui)
+;;; vui.el ends here

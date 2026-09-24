@@ -1,0 +1,122 @@
+;;; pai-provider-openai-test.el --- Tests for the OpenAI provider -*- lexical-binding: t; -*-
+
+;;; Code:
+
+(require 'ert)
+(require 'pai-core)
+(require 'pai-models)
+(require 'pai-provider)
+(require 'pai-provider-openai)
+
+(defun pai-openai-test--model ()
+  (pai-make-model :id "gpt-4o" :api 'openai-completions
+                  :provider "test-openai" :base-url "http://localhost:1234/v1"))
+
+(defun pai-openai-test--run (frames model)
+  (let* ((events '())
+         (parser (pai-openai-make-parser model (lambda (ev) (push ev events))))
+         (on-frame (plist-get parser :on-frame)))
+    (dolist (f frames) (funcall on-frame f))
+    (funcall (plist-get parser :on-close) 0)
+    (nreverse events)))
+
+(ert-deftest pai-openai-build-request ()
+  (let* ((model (pai-openai-test--model))
+         (ctx (pai-context (list (pai-system-message "sys") (pai-user-message "hi"))
+                           (list (list :name "bash" :description "run"
+                                       :parameters (list :type "object")))))
+         (req (pai-openai-build-request model ctx '(:api-key "k" :max-tokens 500)))
+         (body (plist-get req :body)))
+    (should (equal (plist-get req :url) "http://localhost:1234/v1/chat/completions"))
+    (should (equal (plist-get body :model) "gpt-4o"))
+    (should (equal (cdr (assoc "Authorization" (plist-get req :headers))) "Bearer k"))
+    (should (equal (plist-get body :max_completion_tokens) 500))
+    (should (equal (plist-get (plist-get body :stream_options) :include_usage) t))
+    (should (= (length (plist-get body :messages)) 2))
+    (should (equal (plist-get (car (plist-get body :messages)) :role) "system"))
+    (should (equal (plist-get (car (plist-get body :tools)) :type) "function"))))
+
+(ert-deftest pai-openai-messages-tool-call-and-result ()
+  (let* ((msgs (list (pai-user-message "go")
+                     (pai-assistant-message :content (list (pai-text "using tool")
+                                                           (pai-tool-call "c1" "bash" '(:command "ls"))))
+                     (pai-tool-result-message :tool-call-id "c1" :tool-name "bash" :content "files")))
+         (out (pai-openai--messages msgs))
+         (assistant (nth 1 out))
+         (tool (nth 2 out)))
+    (should (equal (plist-get assistant :role) "assistant"))
+    (should (= (length (plist-get assistant :tool_calls)) 1))
+    (should (equal (plist-get (plist-get (car (plist-get assistant :tool_calls)) :function) :name) "bash"))
+    ;; arguments must be a JSON string, not an object
+    (should (stringp (plist-get (plist-get (car (plist-get assistant :tool_calls)) :function) :arguments)))
+    (should (equal (plist-get tool :role) "tool"))
+    (should (equal (plist-get tool :tool_call_id) "c1"))
+    (should (equal (plist-get tool :content) "files"))))
+
+(ert-deftest pai-openai-assistant-only-tool-call-has-null-content ()
+  (let* ((msgs (list (pai-assistant-message :content (list (pai-tool-call "c1" "bash" '(:command "ls"))))))
+         (out (pai-openai--messages msgs)))
+    (should (eq (plist-get (car out) :content) :null))))
+
+(defconst pai-openai-test--text-frames
+  '((:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}")
+    (:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}")
+    (:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}")
+    (:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}")
+    (:data "{\"id\":\"cc1\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}")
+    (:data "[DONE]")))
+
+(ert-deftest pai-openai-parse-text-stream ()
+  (let* ((events (pai-openai-test--run pai-openai-test--text-frames (pai-openai-test--model)))
+         (done (car (last events)))
+         (msg (plist-get done :message)))
+    (should (eq (plist-get done :type) 'done))
+    (should (eq (plist-get done :reason) 'stop))
+    (should (equal (pai-content-text (plist-get msg :content)) "Hello world"))
+    (let ((u (plist-get msg :usage)))
+      (should (= (plist-get u :input) 10))
+      (should (= (plist-get u :output) 5))
+      (should (= (plist-get u :total-tokens) 15)))))
+
+(defconst pai-openai-test--tool-frames
+  '((:data "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}")
+    (:data "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\"}}]},\"finish_reason\":null}]}")
+    (:data "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]},\"finish_reason\":null}]}")
+    (:data "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}")
+    (:data "[DONE]")))
+
+(ert-deftest pai-openai-parse-tool-stream ()
+  (let* ((events (pai-openai-test--run pai-openai-test--tool-frames (pai-openai-test--model)))
+         (done (car (last events)))
+         (msg (plist-get done :message))
+         (tcs (pai-message-tool-calls msg)))
+    (should (eq (plist-get done :reason) 'tool-use))
+    (should (= (length tcs) 1))
+    (should (equal (plist-get (car tcs) :name) "bash"))
+    (should (equal (plist-get (plist-get (car tcs) :arguments) :command) "ls"))))
+
+(ert-deftest pai-openai-tool-choice-and-cache-key ()
+  (let* ((model (pai-openai-test--model))
+         (ctx (pai-context (list (pai-user-message "hi"))
+                           (list (list :name "bash" :description "d" :parameters (list :type "object")))))
+         (b1 (plist-get (pai-openai-build-request model ctx '(:tool-choice required :session-id "sess-1")) :body))
+         (b2 (plist-get (pai-openai-build-request model ctx '(:tool-choice (tool . "bash"))) :body)))
+    (should (equal (plist-get b1 :tool_choice) "required"))
+    (should (equal (plist-get b1 :prompt_cache_key) "sess-1"))
+    (should (equal (plist-get (plist-get (plist-get b2 :tool_choice) :function) :name) "bash"))))
+
+(ert-deftest pai-openai-error-preserves-partial ()
+  ;; A mid-stream transport error keeps the partial assistant content.
+  (let* ((events '())
+         (parser (pai-openai-make-parser (pai-openai-test--model) (lambda (ev) (push ev events))))
+         (on-frame (plist-get parser :on-frame)))
+    (funcall on-frame '(:data "{\"choices\":[{\"delta\":{\"content\":\"partial answer\"},\"finish_reason\":null}]}"))
+    (funcall (plist-get parser :on-error) "connection reset")
+    (let* ((last (car events)) (msg (plist-get last :message)))
+      (should (eq (plist-get last :type) 'error))
+      (should (equal (pai-content-text (plist-get msg :content)) "partial answer"))
+      (should (eq (plist-get msg :stop-reason) 'error))
+      (should (equal (plist-get msg :error-message) "connection reset")))))
+
+(provide 'pai-provider-openai-test)
+;;; pai-provider-openai-test.el ends here
