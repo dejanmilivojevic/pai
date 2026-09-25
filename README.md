@@ -181,8 +181,14 @@ lists, tables and code blocks survive, and only long prose lines are wrapped.
 
 ## Usage
 
-- `M-x pai` — open (or switch to) the chat buffer for the current project.
-- `M-x pai-new-session` — open a fresh session buffer.
+- `M-x pai` — open (or go back to) the chat for the current project; `C-u M-x pai`
+  opens another instance.
+- `M-x pai-new-session` — open another instance (a fresh session buffer) in a window
+  of its own. Run as many instances as you like, for one project or several; each
+  has its own session, settings and extension state.
+- `M-x pai-switch` — pick among the open instances (working/idle, project), or open
+  a new one. `/resume` never opens a session that another instance has open: it
+  switches you there instead.
 
 In the chat buffer type at the `❯` prompt and press `RET` to send. Assistant
 text streams in; tool calls render as `⚙ tool …` blocks with their results.

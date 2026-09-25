@@ -409,6 +409,101 @@ first argument: accepting a value neither chains nor offers it again."
     (pai-compaction-summarize (list (pai-user-message "x")) (pai-model "faux"))
     (should (equal seen "abcdefgh"))))
 
+;;;; Several instances
+
+(defmacro pai-ui-test--with-project (dir &rest body)
+  "Run BODY with a temp pai home and project DIR; kill the pai buffers made."
+  (declare (indent 1))
+  `(let* ((home (make-temp-file "pai-inst-home" t))
+          (,dir (file-name-as-directory (make-temp-file "pai-inst" t)))
+          (pai-directory home)
+          (pai-default-model "faux")
+          (before (buffer-list)))
+     (unwind-protect
+         (save-window-excursion
+           (pai-ext-reset)
+           (let ((default-directory ,dir)) ,@body))
+       (dolist (b (buffer-list))
+         (unless (memq b before)
+           (when (eq (buffer-local-value 'major-mode b) 'pai-mode) (kill-buffer b))))
+       (ignore-errors (delete-directory ,dir t))
+       (ignore-errors (delete-directory home t)))))
+
+(ert-deftest pai-ui-several-instances-of-one-project ()
+  (pai-ui-test--with-project dir
+    (let* ((a (pai dir))
+           (again (pai dir))
+           (b (pai dir t))              ; C-u M-x pai
+           (c (pai-new-session dir)))
+      (should (eq a again))            ; plain `pai' goes back
+      (should-not (eq a b))
+      (should-not (memq c (list a b)))
+      ;; independent sessions
+      (should (= 3 (length (delete-dups
+                            (mapcar (lambda (bf) (pai-session-id (buffer-local-value 'pai--session bf)))
+                                    (list a b c))))))
+      (should (equal (pai-instances dir) (seq-filter (lambda (x) (memq x (list a b c)))
+                                                     (buffer-list))))
+      ;; `pai' returns to the most recently used one
+      (switch-to-buffer b)
+      (switch-to-buffer (get-buffer-create "*scratch*"))
+      (should (eq (pai dir) b)))))
+
+(ert-deftest pai-ui-pai-never-picks-a-subagent-session ()
+  (pai-ui-test--with-project dir
+    (let* ((mine (pai dir))
+           (child (generate-new-buffer "*pai: child*")))
+      (with-current-buffer child
+        (setq pai-subagent-session mine)
+        (pai--setup dir))
+      ;; the child is the most recent pai-mode buffer of the project...
+      (switch-to-buffer child)
+      (switch-to-buffer (get-buffer-create "*scratch*"))
+      (should-not (memq child (pai-instances dir)))
+      ;; ... but `pai' still goes to the user's own chat
+      (should (eq (pai dir) mine)))))
+
+(ert-deftest pai-ui-pai-switch-picks-or-opens-an-instance ()
+  (pai-ui-test--with-project dir
+    (let* ((a (pai dir))
+           (b (pai-new-session dir)))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_p choices &rest _)
+                   (should (member pai--new-instance-choice choices))
+                   (car (member (pai--instance-label a) choices)))))
+        (should (eq (pai-switch) a)))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _) pai--new-instance-choice)))
+        (let ((c (pai-switch)))
+          (should (buffer-live-p c))
+          (should-not (memq c (list a b)))
+          (should (eq (buffer-local-value 'major-mode c) 'pai-mode)))))))
+
+(ert-deftest pai-ui-resume-will-not-open-a-session-twice ()
+  "Two instances must never append to one session file."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "answer A" :stop-reason stop))
+  (pai-ui-test--with-project dir
+    (let* ((a (pai dir))
+           (b (pai-new-session dir)))
+      (with-current-buffer a (pai-ui-test--type-and-send "hello from A"))
+      (let ((a-file (pai-session-file (buffer-local-value 'pai--session a)))
+            (b-session (buffer-local-value 'pai--session b)))
+        (should (file-exists-p a-file))
+        (with-current-buffer b
+          (let ((offered nil))
+            (cl-letf (((symbol-function 'pai-completing-read-preview)
+                       (lambda (_p choices &rest _)
+                         (setq offered choices)
+                         (car (rassoc a-file choices)))))
+              (pai-resume-command "" (list :buffer b)))
+            ;; listed as open elsewhere
+            (should (string-match-p (regexp-quote (format "(open in %s)" (buffer-name a)))
+                                    (car (rassoc a-file offered)))))
+          ;; b kept its own session and was sent to a instead
+          (should (eq pai--session b-session))
+          (should (string-match-p "is open in" (buffer-string))))))))
+
 ;;;; The cached host mode line
 
 (ert-deftest pai-ui-mode-line-is-cached-per-window ()

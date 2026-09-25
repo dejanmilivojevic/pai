@@ -1335,7 +1335,10 @@ message; identical labels are disambiguated with a \" <N>\" suffix."
                                                         (nth 5 (file-attributes f)))
                                     (pai--session-preview f))))
                      (n (puthash base (1+ (gethash base seen 0)) seen)))
-                (cons (if (> n 1) (format "%s <%d>" base n) base) f)))
+                (cons (concat (if (> n 1) (format "%s <%d>" base n) base)
+                              (let ((other (pai--session-open-elsewhere f)))
+                                (if other (format "  (open in %s)" (buffer-name other)) "")))
+                      f)))
             (pai-session-list dir))))
 
 (defun pai-resume-command (_args ctx)
@@ -1349,8 +1352,16 @@ message; identical labels are disambiguated with a \" <N>\" suffix."
                                                         #'pai-preview-session-file
                                                         nil nil :preview-resume)))
                (file (cdr (assoc label choices))))
-          (if (not file)
-              (pai--render-note "No session selected")
+          (cond
+           ((not file)
+            (pai--render-note "No session selected"))
+           ;; two instances appending to one session file would interleave it
+           ((pai--session-open-elsewhere file)
+            (let ((other (pai--session-open-elsewhere file)))
+              (pai--render-note (format "That session is open in %s; switched there."
+                                        (buffer-name other)))
+              (pop-to-buffer other)))
+           (t
             (pai-ext-emit 'session-before-switch (pai--ext-context) :reason 'resume)
             (let ((loaded (pai-session-load file)))
               (setq pai--session loaded
@@ -1363,7 +1374,7 @@ message; identical labels are disambiguated with a \" <N>\" suffix."
               (pai--render-note (let ((preview (pai--session-preview file)))
                                   (if (string-empty-p preview)
                                       "Resumed session"
-                                    (format "Resumed session: %s" preview)))))))))
+                                    (format "Resumed session: %s" preview))))))))))
     nil))
 
 (defun pai--open-forked-buffer (fork &optional initial-input)
@@ -2785,36 +2796,108 @@ With SESSION, adopt it instead of creating a fresh one (used by fork/clone)."
   (format "*pai: %s*"
           (file-name-nondirectory (directory-file-name (expand-file-name dir)))))
 
+;;;; Instances
+;;
+;; Any number of pai chats (instances) can run side by side, for one
+;; project or several: each buffer has its own session, settings and
+;; extension state.  `pai' goes back to the most recently used instance of
+;; the project (never a subagent's session), `C-u M-x pai' and
+;; `pai-new-session' open another one, and `pai-switch' picks among them.
+
+(defun pai--dir (dir)
+  "Return DIR normalized for comparing projects."
+  (file-name-as-directory (file-truename (expand-file-name dir))))
+
+(defun pai-instances (&optional dir)
+  "Return the live pai chat buffers the user runs, most recently used first.
+Subagents' sessions are left out.  With DIR, only instances of that project."
+  (let ((dir (and dir (pai--dir dir))))
+    (seq-filter (lambda (buffer)
+                  (with-current-buffer buffer
+                    (and (eq major-mode 'pai-mode)
+                         (not (pai-subagent-session-p buffer))
+                         (or (null dir) (equal dir (pai--dir default-directory))))))
+                (buffer-list))))
+
+(defun pai--display-new-instance (buffer)
+  "Show BUFFER, a new instance, in a window of its own when possible.
+The current chat stays visible next to it."
+  (pop-to-buffer buffer '((display-buffer-reuse-window
+                           display-buffer-pop-up-window
+                           display-buffer-use-some-window)
+                          (inhibit-same-window . t))))
+
 ;;;###autoload
-(defun pai (&optional cwd)
-  "Open the pai agent chat buffer for CWD (default `default-directory')."
-  (interactive)
-  (let* ((dir (file-name-as-directory (file-truename (or cwd default-directory))))
-         (existing (seq-find
-                    (lambda (buffer)
-                      (with-current-buffer buffer
-                        (and (eq major-mode 'pai-mode)
-                             (equal dir (file-name-as-directory
-                                         (file-truename default-directory))))))
-                    (buffer-list)))
-         (buf (or existing (generate-new-buffer (pai--buffer-name dir)))))
-    (unless existing
-      (with-current-buffer buf (pai--setup dir)))
-    (pop-to-buffer buf)
-    (goto-char (point-max))
-    buf))
+(defun pai (&optional cwd new)
+  "Open the pai agent chat for CWD (default `default-directory').
+Go back to the project's most recently used instance, or start one.  With
+a prefix argument (NEW) always open another instance, see
+`pai-new-session'; `pai-switch' picks among open ones."
+  (interactive (list nil current-prefix-arg))
+  (let* ((dir (pai--dir (or cwd default-directory)))
+         (existing (and (not new) (car (pai-instances dir)))))
+    (if (not existing)
+        (pai-new-session dir)
+      (pop-to-buffer existing)
+      (goto-char (point-max))
+      existing)))
 
 ;;;###autoload
 (defun pai-new-session (&optional cwd)
-  "Open a fresh pai session buffer for CWD."
+  "Open another pai instance (a fresh session buffer) for CWD.
+It opens in a window of its own; instances run independently, each with
+its own session."
   (interactive)
-  (let* ((dir (or cwd default-directory))
+  (let* ((dir (pai--dir (or cwd default-directory)))
+         ;; opened from a chat: keep that chat visible next to the new one
+         (from-chat (eq (buffer-local-value 'major-mode (window-buffer (selected-window)))
+                        'pai-mode))
          (buf (generate-new-buffer (pai--buffer-name dir))))
     (with-current-buffer buf
       (pai--setup dir))
-    (pop-to-buffer buf)
-    (goto-char (point-max))
+    (if from-chat
+        (pai--display-new-instance buf)
+      (pop-to-buffer buf))
+    (with-current-buffer buf (goto-char (point-max)))
     buf))
+
+(defun pai--instance-label (buffer)
+  "Return a one-line description of instance BUFFER for `pai-switch'."
+  (with-current-buffer buffer
+    (format "%-28s %-10s %s"
+            (buffer-name buffer)
+            (if pai--active "working" "idle")
+            (abbreviate-file-name default-directory))))
+
+(defconst pai--new-instance-choice "+ new instance here"
+  "The `pai-switch' choice that opens another instance.")
+
+;;;###autoload
+(defun pai-switch ()
+  "Switch to one of the open pai instances, or open a new one."
+  (interactive)
+  (let* ((instances (pai-instances))
+         (choices (mapcar (lambda (b) (cons (pai--instance-label b) b)) instances))
+         (pick (completing-read "pai instance: "
+                                (append (mapcar #'car choices) (list pai--new-instance-choice))
+                                nil t)))
+    (if (equal pick pai--new-instance-choice)
+        (pai-new-session)
+      (let ((buffer (cdr (assoc pick choices))))
+        (pop-to-buffer buffer)
+        (goto-char (point-max))
+        buffer))))
+
+(defun pai--session-open-elsewhere (file)
+  "Return another live pai buffer that has session FILE open, or nil."
+  (let ((file (and file (file-truename file))))
+    (seq-find (lambda (buffer)
+                (and (not (eq buffer (current-buffer)))
+                     (let ((s (buffer-local-value 'pai--session buffer)))
+                       (and s (pai-session-file s)
+                            (equal (file-truename (pai-session-file s)) file)))))
+              (seq-filter (lambda (b) (eq (buffer-local-value 'major-mode b) 'pai-mode))
+                          (buffer-list)))))
 
 (provide 'pai-ui)
 ;;; pai-ui.el ends here
