@@ -483,6 +483,132 @@ produces (here with a tool call) must not resume the loop."
     (should (= streams 1))
     (should (plist-get (car events) :aborted))))
 
+;;;; Pausing between turns (compaction mid-run)
+
+(defvar pai-agent-test--streams nil "Scripted assistant messages (dynamically bound).")
+(defvar pai-agent-test--contexts nil "Recorded request contexts (dynamically bound).")
+
+(defun pai-agent-test--scripted-stream (streams contexts)
+  "Return a stream-fn answering from STREAMS (a list of messages) in order.
+Each request's context messages are pushed onto the symbol CONTEXTS."
+  (lambda (_m ctx _o emit)
+    (set contexts (cons (plist-get ctx :messages) (symbol-value contexts)))
+    (funcall emit (list :type 'done :message (pop (symbol-value streams))))
+    nil))
+
+(ert-deftest pai-agent-before-turn-pauses-and-resumes-with-new-context ()
+  (let* ((tool (list :name "echo" :deferred nil :parameters '(:type "object")
+                     :execute (lambda (_a _c _u done) (funcall done (pai-tool-ok-result "r")))))
+         (pai-agent-test--streams
+          (list (pai-assistant-message :content (list (pai-tool-call "c1" "echo" nil))
+                                       :stop-reason 'tool-use)
+                (pai-assistant-message :content (list (pai-text "done")) :stop-reason 'stop)))
+         (pai-agent-test--contexts nil)
+         (resume nil) (hook-calls 0) (completed nil)
+         (compacted (list (pai-user-message "SUMMARY"))))
+    (let ((run (pai-agent-run
+                (list (pai-user-message "go"))
+                (pai-context nil (list tool))
+                (list :model (pai-model "faux")
+                      :stream-fn (pai-agent-test--scripted-stream
+                                  'pai-agent-test--streams 'pai-agent-test--contexts)
+                      :before-turn (lambda (_ctx r) (cl-incf hook-calls) (setq resume r) t))
+                #'ignore
+                (lambda (_m) (setq completed t)))))
+      ;; paused after the tool turn: no second request yet
+      (should (= hook-calls 1))
+      (should (= (length pai-agent-test--contexts) 1))
+      (should (pai-agent-paused-p run))
+      (should-not completed)
+      (funcall resume (list :messages compacted))
+      (should-not (pai-agent-paused-p run))
+      (should completed)
+      ;; the next request went out with the replaced context
+      (should (= (length pai-agent-test--contexts) 2))
+      (should (equal (pai-content-text (pai-message-content (car (car pai-agent-test--contexts))))
+                     "SUMMARY"))
+      ;; not offered again for the same turn
+      (should (= hook-calls 1)))))
+
+(ert-deftest pai-agent-before-turn-declined-continues ()
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "echo" :arguments (:msg "a"))) :stop-reason tool-use)
+                 '(:text "end" :stop-reason stop))
+  (let* ((calls 0)
+         (out (pai-agent-test--run (list (pai-user-message "go"))
+                                   (list :model (pai-model "faux")
+                                         :tools (list (pai-agent-test--echo-tool))
+                                         :before-turn (lambda (_c _r) (cl-incf calls) nil)))))
+    (should (= calls 1))
+    (should (equal (pai-content-text (pai-message-content (car (last (cdr out))))) "end"))))
+
+(ert-deftest pai-agent-abort-while-paused-drops-resume ()
+  (let* ((resume nil) (streams 0) (events nil)
+         (tool (list :name "echo" :deferred nil :parameters '(:type "object")
+                     :execute (lambda (_a _c _u done) (funcall done (pai-tool-ok-result "r")))))
+         (run (pai-agent-run
+               (list (pai-user-message "go"))
+               (pai-context nil (list tool))
+               (list :model (pai-model "faux")
+                     :stream-fn (lambda (_m _c _o emit)
+                                  (cl-incf streams)
+                                  (funcall emit (list :type 'done :message
+                                                      (pai-assistant-message
+                                                       :content (list (pai-tool-call "c1" "echo" nil))
+                                                       :stop-reason 'tool-use)))
+                                  nil)
+                     :before-turn (lambda (_c r) (setq resume r) t))
+               (lambda (e) (push e events)))))
+    (pai-agent-abort run)
+    (funcall resume (list :messages nil))
+    (should (= streams 1))
+    (should (plist-get (car events) :aborted))))
+
+(ert-deftest pai-agent-recover-error-retries-turn ()
+  (let* ((pai-agent-test--streams
+          (list (pai-assistant-message :stop-reason 'error
+                                       :error-message "prompt is too long: 210000 tokens")
+                (pai-assistant-message :content (list (pai-text "recovered")) :stop-reason 'stop)))
+         (pai-agent-test--contexts nil)
+         (seen nil)
+         (run (pai-agent-run
+               (list (pai-user-message "go"))
+               (pai-context nil nil)
+               (list :model (pai-model "faux")
+                     :stream-fn (pai-agent-test--scripted-stream
+                                 'pai-agent-test--streams 'pai-agent-test--contexts)
+                     :recover-error (lambda (msg ctx resume)
+                                      (setq seen (list msg ctx))
+                                      (funcall resume (list :messages (list (pai-user-message "SMALL"))))
+                                      t))
+               #'ignore)))
+    (should (equal (plist-get (car seen) :error-message) "prompt is too long: 210000 tokens"))
+    ;; the failed message is not in the context handed to the hook
+    (should-not (memq (car seen) (plist-get (cadr seen) :messages)))
+    (should (= (length pai-agent-test--contexts) 2))
+    (should (equal (pai-content-text (pai-message-content (car (car pai-agent-test--contexts))))
+                   "SMALL"))
+    (should (pai-run-finished run))
+    (should (equal (pai-content-text (pai-message-content
+                                      (car (last (plist-get (pai-run-context run) :messages)))))
+                   "recovered"))))
+
+(ert-deftest pai-agent-recover-error-declined-ends-run ()
+  (let* ((pai-agent-test--streams
+          (list (pai-assistant-message :stop-reason 'error :error-message "boom")))
+         (pai-agent-test--contexts nil)
+         (resumed nil) (completed nil))
+    (pai-agent-run (list (pai-user-message "go")) (pai-context nil nil)
+                   (list :model (pai-model "faux")
+                         :stream-fn (pai-agent-test--scripted-stream
+                                     'pai-agent-test--streams 'pai-agent-test--contexts)
+                         :recover-error (lambda (_m _c resume) (setq resumed resume) t))
+                   #'ignore (lambda (_m) (setq completed t)))
+    (should-not completed)
+    (funcall resumed)                   ; recovery failed: end with the error
+    (should completed)
+    (should (= (length pai-agent-test--contexts) 1))))
+
 (ert-deftest pai-agent-abort-calls-handlers-once ()
   (let* ((calls 0)
          (run (pai-agent-run nil (pai-context nil nil)

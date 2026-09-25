@@ -358,6 +358,48 @@ finally to the built-in `pai-compact'.  Return the winning plist or nil."
           (throw 'done ret))))
     nil))
 
+(defun pai-ext-run-compact-async (messages ctx callback &rest props)
+  "Run `compact' handlers over MESSAGES without blocking; call CALLBACK once.
+Like `pai-ext-run-compact', but the event also carries `:callback', so a
+handler with slow work (an LLM call) can finish later: it returns
+`(:async CANCEL)' and eventually calls the callback once with its result, or
+with nil to decline.  CANCEL is a function of no arguments stopping that
+work, or nil.  Handlers that ignore `:callback' answer synchronously as
+usual.  CALLBACK receives the first result, or nil when every handler
+declined.  Return a function that cancels the pending work; CALLBACK is
+not called after cancelling."
+  (let* ((state (list :cancel nil :cancelled nil))
+         (handlers (pai-ext--handlers 'compact))
+         (next nil))
+    (setq next
+          (lambda ()
+            (if (null handlers)
+                (funcall callback nil)
+              (let* ((entry (pop handlers))
+                     (answered nil)
+                     (respond (lambda (ret)
+                                (unless (or answered (plist-get state :cancelled))
+                                  (setq answered t)
+                                  (plist-put state :cancel nil)
+                                  (if (and ret (plist-get ret :messages))
+                                      (funcall callback ret)
+                                    (funcall next)))))
+                     (ret (pai-ext--call
+                           entry
+                           (append (list :type 'compact :messages messages
+                                         :callback (lambda (r) (funcall respond r)))
+                                   props)
+                           ctx)))
+                (if (and (consp ret) (plist-member ret :async))
+                    (unless answered (plist-put state :cancel (plist-get ret :async)))
+                  (funcall respond ret))))))
+    (funcall next)
+    (lambda ()
+      (plist-put state :cancelled t)
+      (let ((cancel (plist-get state :cancel)))
+        (plist-put state :cancel nil)
+        (when (functionp cancel) (ignore-errors (funcall cancel)))))))
+
 (defun pai-ext-run-system-prompt-sections (ctx)
   "Collect extra system-prompt sections from `system-prompt-sections' handlers.
 Each handler returns a plist of (:NAME TEXT ...) sections, or nil.  Return the

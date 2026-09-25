@@ -305,5 +305,132 @@ the meter collapse."
     (should-not (seq-find #'pai-tool-result-message-p new))
     (should-not (plist-get (car new) :deferred-schemas))))
 
+;;;; Mid-run compaction (pi's split turn)
+
+(defun pai-compaction-test--long-run (n)
+  "Return one prompt followed by an agent run of N tool turns."
+  (cons (pai-user-message "Please build the timeline widget")
+        (cl-loop for i from 0 below n append
+                 (let ((id (format "c%d" i)))
+                   (list (pai-assistant-message
+                          :content (list (pai-text (make-string 300 ?w))
+                                         (pai-tool-call id "read" (list :path "f")))
+                          :stop-reason 'tool-use)
+                         (pai-tool-result-message :tool-call-id id :tool-name "read"
+                                                  :content (make-string 300 ?r)))))))
+
+(ert-deftest pai-compaction-cut-splits-a-single-long-run ()
+  "One prompt then a long run: the cut lands inside the run, at an assistant."
+  (let* ((msgs (pai-compaction-test--long-run 20))
+         (cut (pai-compaction--find-cut-index msgs 1000)))
+    (should (> cut 0))
+    (should (eq (pai-message-role (nth cut msgs)) 'assistant))
+    ;; the turn it splits starts at the prompt
+    (should (eql (pai-compaction--split-turn msgs cut) 0))))
+
+(ert-deftest pai-compaction-cut-falls-back-before-large-tool-results ()
+  "Tool results larger than keep-recent at the end still leave a cut."
+  (let* ((msgs (list (pai-user-message (make-string 900 ?a))
+                     (pai-assistant-message :content (list (pai-text "x")))
+                     (pai-user-message "go")
+                     (pai-assistant-message :content (list (pai-tool-call "c1" "read" nil))
+                                            :stop-reason 'tool-use)
+                     (pai-tool-result-message :tool-call-id "c1" :tool-name "read"
+                                              :content (make-string 3000 ?r))))
+         (cut (pai-compaction--find-cut-index msgs 100)))
+    (should (= cut 3))
+    (should (eql (pai-compaction--split-turn msgs cut) 2))))
+
+(ert-deftest pai-compaction-no-split-at-a-user-message ()
+  (let ((msgs (list (pai-user-message "a") (pai-assistant-message) (pai-user-message "b"))))
+    (should-not (pai-compaction--split-turn msgs 2))))
+
+(ert-deftest pai-compaction-split-turn-summarizes-prefix-separately ()
+  (pai-faux-reset)
+  (pai-faux-push '(:text "TURN PREFIX: build the timeline widget" :stop-reason stop))
+  (let* ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 1000))
+         (pai-settings--project nil)
+         (msgs (cons (pai-system-message "SYS") (pai-compaction-test--long-run 20)))
+         (result (pai-compact msgs (pai-model "faux")))
+         (summary (plist-get result :summary)))
+    (should result)
+    ;; no history before the prompt: pi's placeholder, then the turn context
+    (should (string-prefix-p "No prior history." summary))
+    (should (string-match-p "\\*\\*Turn Context (split turn):\\*\\*" summary))
+    (should (string-match-p "TURN PREFIX" summary))
+    ;; the prefix was summarized with pi's turn-prefix prompt
+    (should (string-match-p "PREFIX of a turn"
+                            (pai-json-encode (plist-get pai-faux-last-context :messages))))
+    ;; the kept tail opens at an assistant message and pairs stay intact
+    (let ((new (plist-get result :messages)))
+      (should (pai-system-message-p (nth 0 new)))
+      (should (pai-user-message-p (nth 1 new)))
+      (should (pai-assistant-message-p (nth 2 new)))
+      (should (eq (pai-repair-tool-pairing new) new)))))
+
+(ert-deftest pai-compaction-split-turn-with-history-makes-two-calls ()
+  (pai-faux-reset)
+  (pai-faux-push '(:text "HISTORY" :stop-reason stop) '(:text "PREFIX" :stop-reason stop))
+  (let* ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 1000))
+         (pai-settings--project nil)
+         (msgs (append (list (pai-user-message (make-string 600 ?o))
+                             (pai-assistant-message :content (list (pai-text "old"))))
+                       (pai-compaction-test--long-run 20)))
+         (summary (plist-get (pai-compact msgs (pai-model "faux")) :summary)))
+    (should (string-match-p "\\`HISTORY\n\n---\n\n\\*\\*Turn Context (split turn):\\*\\*\n\nPREFIX\\'"
+                            summary))))
+
+(ert-deftest pai-compaction-length-capped-summary-fails ()
+  "Like pi, a summary cut off by the token cap is not used."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "## Goal\ntrunc" :stop-reason length))
+  (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 3))
+        (pai-settings--project nil))
+    (should-not (pai-compact (list (pai-user-message (make-string 200 ?a))
+                                   (pai-assistant-message :content (list (pai-text "b")))
+                                   (pai-user-message (make-string 8 ?c))
+                                   (pai-assistant-message :content (list (pai-text "d"))))
+                             (pai-model "faux")))))
+
+(ert-deftest pai-compaction-async-cancel ()
+  (let* ((emit nil) (got :none) (killed nil)
+         (pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 3))
+         (pai-settings--project nil))
+    (cl-letf (((symbol-function 'pai-provider-stream) (lambda (_m _c _o e) (setq emit e) 'handle))
+              ((symbol-function 'pai-provider-abort) (lambda (h) (setq killed h))))
+      (let ((cancel (pai-compact-async
+                     (list (pai-user-message (make-string 200 ?a))
+                           (pai-assistant-message :content (list (pai-text "b")))
+                           (pai-user-message (make-string 8 ?c))
+                           (pai-assistant-message :content (list (pai-text "d"))))
+                     (pai-model "faux") nil (lambda (r) (setq got r)))))
+        (should (functionp cancel))
+        (should (eq got :none))
+        (funcall cancel)
+        (should (eq killed 'handle))
+        (should (equal got '(:error "cancelled")))
+        ;; a late stream event changes nothing
+        (funcall emit (list :type 'done :message (pai-assistant-message
+                                                  :content (list (pai-text "late"))
+                                                  :stop-reason 'stop)))
+        (should (equal got '(:error "cancelled")))))))
+
+(ert-deftest pai-compaction-context-overflow-p ()
+  (cl-flet ((err (text) (pai-assistant-message :stop-reason 'error :error-message text)))
+    (should (pai-context-overflow-p (err "prompt is too long: 213462 tokens > 200000 maximum")))
+    (should (pai-context-overflow-p (err "This model's maximum context length is 128000 tokens")))
+    (should (pai-context-overflow-p (err "Your input exceeds the context window of this model")))
+    (should-not (pai-context-overflow-p (err "rate limit: too many tokens per minute")))
+    (should-not (pai-context-overflow-p (err "HTTP 500: overloaded")))
+    ;; a length stop with no output and a full window (silent truncation)
+    (should (pai-context-overflow-p
+             (pai-assistant-message :stop-reason 'length
+                                    :usage (pai-usage :input 127500 :output 0))
+             128000))
+    (should-not (pai-context-overflow-p
+                 (pai-assistant-message :stop-reason 'length
+                                        :usage (pai-usage :input 1000 :output 0))
+                 128000))))
+
 (provide 'pai-compaction-test)
 ;;; pai-compaction-test.el ends here

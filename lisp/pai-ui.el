@@ -81,6 +81,24 @@
 (defvar-local pai--output-marker nil "Marker at the end of the transcript region.")
 (defvar-local pai--input-marker nil "Marker at the start of the editable input region.")
 (defvar-local pai--steering-queue nil "Queued steering messages typed during a run.")
+
+(defvar-local pai--compaction nil
+  "State plist of the asynchronous compaction in progress, or nil.
+Its `:cancel' function stops it (see `pai--compaction-cancel').")
+
+(defvar-local pai--compact-request nil
+  "A `/compact' typed during a run, (:instructions S), or nil.
+The run compacts at its next turn boundary, or when it ends.")
+
+(defvar-local pai--compact-failed-at nil
+  "Context tokens when automatic compaction last found nothing or failed.
+It is not tried again until the context grew by the keep-recent budget, so a
+context that cannot shrink does not trigger a summary at every turn.")
+
+(defvar-local pai--overflow-retried nil
+  "Non-nil once a context overflow was compacted and retried in this run.
+Like pi, overflow recovery is attempted once until a turn succeeds.")
+
 (defvar-local pai--status "idle" "Short status string for the header line.")
 (defvar-local pai--assistant-open nil "Non-nil while an assistant block is being rendered.")
 (defvar-local pai--reasoning nil "Thinking level for this buffer, or nil.")
@@ -315,6 +333,8 @@ prompt is re-pinned to the bottom of the window."
     ('tool-execution-end (pai--render-tool-end event))
     ('turn-end
      (mapc #'pai--commit-message (plist-get event :tool-results))
+     (unless (memq (plist-get (plist-get event :message) :stop-reason) '(error aborted))
+       (setq pai--overflow-retried nil))
      (pai--schedule-usage-refresh))
     ('agent-end
      ;; Normally everything was committed as it completed; this catches the rest.
@@ -332,7 +352,13 @@ prompt is re-pinned to the bottom of the window."
                 (pai--render-note "— interrupted —" 'pai-error-face))
        (pai--render-note "— ready —"))
      (unless pai--steering-queue
-       (pai-ext-emit 'agent-settled (pai--ext-context))))
+       (pai-ext-emit 'agent-settled (pai--ext-context)))
+     ;; a /compact typed during the run that found no turn boundary
+     (let ((request pai--compact-request))
+       (setq pai--compact-request nil)
+       (when (and request (not (plist-get event :aborted)))
+         (pai--compact-async 'manual (plist-get request :instructions)
+                             (lambda (_ok) (unless pai--active (pai--set-status "idle")))))))
     (_ nil)))
 
 (defun pai--commit-message (message)
@@ -432,7 +458,15 @@ and extension widgets update while the agent works, not only at the end."
           :get-steering-messages
           (lambda ()
             (with-current-buffer buf
-              (prog1 (nreverse pai--steering-queue) (setq pai--steering-queue nil)))))))
+              (prog1 (nreverse pai--steering-queue) (setq pai--steering-queue nil))))
+          :before-turn
+          (lambda (_context resume)
+            (when (buffer-live-p buf)
+              (with-current-buffer buf (pai--before-turn resume))))
+          :recover-error
+          (lambda (message _context resume)
+            (when (buffer-live-p buf)
+              (with-current-buffer buf (pai--recover-error message resume)))))))
 
 ;;;; Status / header line
 
@@ -867,83 +901,267 @@ when the kept tail maps back to session entries; see
 
 (defun pai--compaction-tick (buffer entry state)
   "Redraw compaction progress for ENTRY/STATE in BUFFER.
-Compaction blocks Emacs; timers still fire inside the blocking wait, but
-nothing is redrawn unless asked, so this forces a redisplay."
+A blocking compaction (STATE without `:async') gets timers but no redraws
+while it waits, so this forces a redisplay and echoes the progress; an
+asynchronous one only updates its activity line."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (let ((detail (pai--compaction-detail state)))
         (plist-put entry :stream-chars (plist-get state :chars))
         (pai-activity-update entry :detail detail)
-        (let ((message-log-max nil))
-          (message "pai: compacting context %s · %s"
-                   (pai-activity-fmt-duration (pai-activity-elapsed entry)) detail))
-        (redisplay t)))))
+        (unless (plist-get state :async)
+          (let ((message-log-max nil))
+            (message "pai: compacting context %s · %s"
+                     (pai-activity-fmt-duration (pai-activity-elapsed entry)) detail))
+          (redisplay t))))))
+
+(defun pai--compact-begin (reason messages note &optional async)
+  "Announce a compaction of MESSAGES for REASON; return its state plist.
+NOTE is rendered in the transcript.  ASYNC marks a compaction that does not
+block Emacs."
+  (let* ((buffer (current-buffer))
+         (state (list :chars 0 :async async :reason reason :buffer buffer
+                      :messages messages :before (length messages)
+                      :what (format "%d messages, ~%s tokens" (length messages)
+                                    (pai-activity-fmt-count
+                                     (pai-estimate-context-tokens messages)))))
+         (entry nil))
+    (pai-ext-emit 'session-before-compact (pai--ext-context) :reason reason)
+    (pai--render-note (format note reason (plist-get state :what)))
+    (pai--set-status "compacting…")
+    (setq entry (pai-activity-start :prefix "cmp" :kind "compaction" :glyph "🗜"
+                                    :label (format "compact·%s" reason)
+                                    :detail (pai--compaction-detail state)))
+    (plist-put state :entry entry)
+    (pai--compaction-tick buffer entry state)
+    (plist-put state :timer
+               (run-at-time pai-compaction-progress-interval pai-compaction-progress-interval
+                            #'pai--compaction-tick buffer entry state))
+    state))
+
+(defun pai--compact-progress (state)
+  "Return a function counting streamed summary text into STATE."
+  (lambda (delta)
+    (plist-put state :chars (+ (plist-get state :chars) (length delta)))))
+
+(defun pai--compact-apply (result state)
+  "Make compaction RESULT of STATE's messages the live context.  Return t."
+  (let* ((messages (plist-get state :messages))
+         (strategy (or (plist-get result :strategy) "summary"))
+         (took (pai-activity-fmt-duration (pai-activity-elapsed (plist-get state :entry)))))
+    (setq pai--context-messages (plist-get result :messages)
+          pai--compact-failed-at nil)
+    (pai--refresh-context-tokens)
+    (when pai--session
+      (pai-session-append pai--session (pai--compaction-entry result messages)))
+    (pai-ext-emit 'session-compact (pai--ext-context)
+                  :reason (plist-get state :reason) :strategy strategy)
+    (pai--render-note (format "Compacted context%s (%d → %d messages) in %s."
+                              (if (equal strategy "summary") ""
+                                (format " [%s]" strategy))
+                              (plist-get state :before) (length pai--context-messages) took))
+    (message "pai: context compacted in %s (%d → %d messages)"
+             took (plist-get state :before) (length pai--context-messages))
+    t))
+
+(defun pai--compact-end (state outcome &optional status)
+  "Close compaction STATE with OUTCOME; set the buffer STATUS when given."
+  (let ((timer (plist-get state :timer)))
+    (when (timerp timer) (cancel-timer timer)))
+  (let ((buffer (plist-get state :buffer)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (pai-activity-finish (plist-get state :entry) outcome)
+        (when status (pai--set-status status))))))
+
+(defun pai--compact-model ()
+  "Return the model compaction summaries use."
+  (or (ignore-errors (pai-scoped-model :compact pai--model)) pai--model))
 
 (defun pai--compact-now (custom-instructions &optional reason)
   "Compact the live context now with optional CUSTOM-INSTRUCTIONS.  Return non-nil on success.
 REASON is `manual' (default) or `auto'.  An extension `compact' handler may
 take over; otherwise the built-in LLM summary (`pai-compact') is used.
 
-Compaction blocks Emacs until it finishes, so it is made visible: a note in
-the transcript, the header status, a live line above the prompt and the echo
-area show elapsed time and how much of the summary has been written.  C-g
-aborts it safely, leaving the context unchanged."
+During a run the compaction is queued instead and `queued' is returned: the
+run pauses at its next turn boundary and compacts without blocking Emacs
+\(see `pai--compact-async').
+
+Otherwise compaction blocks Emacs until it finishes, so it is made visible: a
+note in the transcript, the header status, a live line above the prompt and
+the echo area show elapsed time and how much of the summary has been
+written.  C-g aborts it safely, leaving the context unchanged."
   (require 'pai-compaction)
-  (let* ((model (or (ignore-errors (pai-scoped-model :compact pai--model)) pai--model))
-         (reason (or reason 'manual))
-         (messages pai--context-messages)
-         (before (length messages))
-         (buffer (current-buffer))
-         (state (list :chars 0
-                      :what (format "%d messages, ~%s tokens" before
-                                    (pai-activity-fmt-count
-                                     (pai-estimate-context-tokens messages)))))
-         (entry nil) (timer nil) (outcome "failed"))
-    (unless model (user-error "No compact model selected; use /model first"))
-    (pai-ext-emit 'session-before-compact (pai--ext-context) :reason reason)
-    (pai--render-note
-     (format "Compacting context (%s): %s.  Emacs is busy until it finishes; C-g aborts."
-             reason (plist-get state :what)))
-    (pai--set-status "compacting…")
-    (setq entry (pai-activity-start :prefix "cmp" :kind "compaction" :glyph "🗜"
-                                    :label (format "compact·%s" reason)
-                                    :detail (pai--compaction-detail state)))
-    (pai--compaction-tick buffer entry state)
-    (setq timer (run-at-time pai-compaction-progress-interval pai-compaction-progress-interval
-                             #'pai--compaction-tick buffer entry state))
-    (unwind-protect
-        (let* ((pai-compaction-progress-function
-                (lambda (delta)
-                  (plist-put state :chars (+ (plist-get state :chars) (length delta)))))
-               (result (or (pai--compact-by-extension custom-instructions reason model)
-                           (pai-compact messages model custom-instructions)))
-               (strategy (and result (or (plist-get result :strategy) "summary")))
-               (took (pai-activity-fmt-duration (pai-activity-elapsed entry))))
-          (setq outcome "completed")
-          (prog1 (and result t)
+  (cond
+   ((or pai--active pai--compaction)
+    (setq pai--compact-request (list :instructions custom-instructions))
+    (pai--render-note "Compaction queued: the run pauses at its next turn boundary to compact.")
+    'queued)
+   (t
+    (let* ((model (pai--compact-model))
+           (reason (or reason 'manual))
+           (messages pai--context-messages)
+           (state nil) (outcome "failed"))
+      (unless model (user-error "No compact model selected; use /model first"))
+      (setq state (pai--compact-begin
+                   reason messages
+                   "Compacting context (%s): %s.  Emacs is busy until it finishes; C-g aborts."))
+      (unwind-protect
+          (let* ((pai-compaction-progress-function (pai--compact-progress state))
+                 (result (or (pai--compact-by-extension custom-instructions reason model)
+                             (pai-compact messages model custom-instructions))))
+            (setq outcome "completed")
             (if result
-                (progn
-                  (setq pai--context-messages (plist-get result :messages))
-                  (pai--refresh-context-tokens)
-                  (when pai--session
-                    (pai-session-append pai--session (pai--compaction-entry result messages)))
-                  (pai-ext-emit 'session-compact (pai--ext-context)
-                                :reason reason :strategy strategy)
-                  (pai--render-note (format "Compacted context%s (%d → %d messages) in %s."
-                                            (if (equal strategy "summary") ""
-                                              (format " [%s]" strategy))
-                                            before (length pai--context-messages) took))
-                  (message "pai: context compacted in %s (%d → %d messages)"
-                           took before (length pai--context-messages)))
+                (pai--compact-apply result state)
               (pai--render-note "Nothing to compact.")
-              (message "pai: nothing to compact"))))
-      (cancel-timer timer)
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (pai-activity-finish entry outcome)
-          (unless (equal outcome "completed")
-            (pai--render-note "Compaction aborted; the context is unchanged." 'pai-error-face))
-          (pai--set-status "idle"))))))
+              (message "pai: nothing to compact")
+              nil))
+        (pai--compact-end state outcome "idle")
+        (unless (equal outcome "completed")
+          (with-current-buffer (plist-get state :buffer)
+            (pai--render-note "Compaction aborted; the context is unchanged." 'pai-error-face))))))))
+
+(defun pai--compaction-cancel ()
+  "Cancel the asynchronous compaction in progress, if any."
+  (let ((state pai--compaction))
+    (when state
+      (funcall (plist-get state :cancel-all)))))
+
+(defun pai--compact-async (reason custom-instructions callback)
+  "Compact the live context for REASON without blocking Emacs.
+Extension `compact' handlers run first (asynchronously when they support
+it, see `pai-ext-run-compact-async'); otherwise the built-in summary is
+streamed.  CALLBACK is called in this buffer with t when the context was
+compacted, nil otherwise; not at all when cancelled (\\[pai-interrupt]).
+Return non-nil when a compaction started."
+  (require 'pai-compaction)
+  (let ((model (pai--compact-model)))
+    (when (and model (not pai--compaction))
+      (let* ((messages pai--context-messages)
+             (state (pai--compact-begin
+                     reason messages
+                     "Compacting context (%s): %s.  The run is paused until it finishes; C-c C-c interrupts."
+                     t))
+             (buffer (current-buffer))
+             (done nil)
+             (finish
+              (lambda (result)
+                (unless done
+                  (setq done t)
+                  (when (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (setq pai--compaction nil)
+                      (let ((ok nil))
+                        (cond
+                         ((plist-get state :cancelled)
+                          (pai--compact-end state "aborted")
+                          (pai--render-note "Compaction interrupted; the context is unchanged."
+                                            'pai-error-face))
+                         ((not (eq pai--context-messages messages))
+                          (pai--compact-end state "failed")
+                          (pai--render-note "Compaction discarded: the context changed meanwhile."
+                                            'pai-error-face))
+                         ((plist-get result :error)
+                          (setq pai--compact-failed-at (pai-estimate-context-tokens messages))
+                          (pai--compact-end state "failed")
+                          (pai--render-note (format "Compaction failed: %s; the context is unchanged."
+                                                    (plist-get result :error))
+                                            'pai-error-face))
+                         ((null result)
+                          (setq pai--compact-failed-at (pai-estimate-context-tokens messages))
+                          (pai--compact-end state "completed")
+                          (pai--render-note "Nothing to compact."))
+                         (t
+                          (setq ok (pai--compact-apply result state))
+                          (pai--compact-end state "completed")))
+                        (unless (plist-get state :cancelled)
+                          (funcall callback ok))))))))
+             (builtin
+              (lambda ()
+                (plist-put state :builtin t)
+                (plist-put state :cancel
+                           (pai-compact-async messages model custom-instructions finish
+                                              (pai--compact-progress state))))))
+        (plist-put state :cancel-all
+                   (lambda ()
+                     (plist-put state :cancelled t)
+                     (let ((cancel (plist-get state :cancel)))
+                       (when (functionp cancel) (ignore-errors (funcall cancel))))
+                     (funcall finish nil)))
+        (setq pai--compaction state)
+        (let ((cancel-ext
+               (pai-ext-run-compact-async
+                messages (pai--ext-context)
+                (lambda (ext)
+                  (unless (or done (plist-get state :cancelled))
+                    (cond
+                     ((null ext) (funcall builtin))
+                     ((pai--compaction-shape messages (plist-get ext :messages))
+                      (funcall finish ext))
+                     (t (message "pai: ignoring malformed compaction from extension (%s)"
+                                 (or (plist-get ext :strategy) "unnamed"))
+                        (funcall builtin)))))
+                :reason reason :model model :custom-instructions custom-instructions)))
+          (unless (or done (plist-get state :builtin))
+            (plist-put state :cancel cancel-ext)))
+        t))))
+
+(defun pai--auto-compact-due-p ()
+  "Return non-nil when the live context crossed the compaction threshold.
+Not again after a compaction found nothing or failed, until the context
+grew by the keep-recent budget (see `pai--compact-failed-at')."
+  (require 'pai-compaction)
+  (let ((cw (and pai--model (plist-get pai--model :context-window))))
+    (and cw (> cw 0)
+         (pai-should-compact-p pai--context-messages cw)
+         (or (null pai--compact-failed-at)
+             (>= (pai-estimate-context-tokens pai--context-messages)
+                 (+ pai--compact-failed-at (pai-compaction-keep-recent-tokens)))))))
+
+(defun pai--before-turn (resume)
+  "Between two turns of a run: compact when due, then RESUME the run.
+Port of pi's compaction before the next assistant response: a `/compact'
+typed during the run, or a context over the threshold, pauses the run while
+the context is compacted without blocking Emacs; the run then continues
+with the compacted context.  Return non-nil when the run was paused."
+  (let ((request pai--compact-request))
+    (when (or request (pai--auto-compact-due-p))
+      (setq pai--compact-request nil)
+      (pai--compact-async
+       (if request 'manual 'auto) (plist-get request :instructions)
+       (lambda (ok)
+         (pai--set-status "working…")
+         (funcall resume (and ok (list :messages pai--context-messages))))))))
+
+(defun pai--recover-error (message resume)
+  "Recover from the failed assistant MESSAGE of a run, then RESUME it.
+Port of pi's overflow recovery: when the provider rejected the prompt as too
+long, drop the failed message from the live context (the session keeps it),
+compact, and retry the turn -- once, until a turn succeeds again.  Return
+non-nil when recovery started."
+  (require 'pai-compaction)
+  (let ((cw (and pai--model (plist-get pai--model :context-window))))
+    (when (and (not pai--overflow-retried)
+               (pai-compaction-enabled-p)
+               pai--model
+               (equal (plist-get message :model) (plist-get pai--model :id))
+               (pai-context-overflow-p message cw))
+      (setq pai--overflow-retried t)
+      (let ((without (remq message pai--context-messages)))
+        (setq pai--context-messages without)
+        (pai--render-note "Context overflow: compacting, then retrying the turn once.")
+        (or (pai--compact-async
+             'overflow nil
+             (lambda (ok)
+               (pai--set-status "working…")
+               (if ok
+                   (funcall resume (list :messages pai--context-messages))
+                 ;; the run ends with the error, which stays in the context
+                 (setq pai--context-messages (append pai--context-messages (list message)))
+                 (funcall resume))))
+            ;; could not start: give the failed message back and fail as before
+            (progn (setq pai--context-messages (append without (list message)))
+                   nil))))))
 
 (defun pai-compact-command (args ctx)
   "Handler for `/compact': summarize and shrink the live context."
@@ -1559,9 +1777,12 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
     (setq pai--model (pai-model (or (pai-settings-get :model) pai-default-model))))
   (unless pai--model
     (user-error "No model selected; use M-x pai-add-provider, then /model"))
+  (when pai--compaction
+    (user-error "Compaction in progress; send again when it finishes (C-c C-c stops it)"))
   (pai-ext-emit 'before-agent-start (pai--ext-context) :prompt text)
   (pai--maybe-compact)
-  (setq pai--active t)
+  (setq pai--active t
+        pai--overflow-retried nil)
   (setq pai--run
         (pai-agent-run (list (pai-user-message (pai--expand-mentions text)))
                        (pai-context pai--context-messages (pai-tools-all))
@@ -1609,6 +1830,8 @@ Programmatic submissions (subagents, extensions) are not recorded."
   (let ((text (pai--input-text)))
     (cond
      ((or (null text) (string-empty-p text)) (message "Empty input"))
+     ((and pai--compaction (not pai--active) (not (pai-command-input-p text)))
+      (message "Compacting the context; send again when it finishes (C-c C-c stops it)"))
      (t
       (setq pai--history-index nil pai--history-draft nil)
       (when record
@@ -1675,16 +1898,21 @@ Moving past the newest entry restores the input you were typing."
     (pai-history-previous (- (or n 1)))))
 
 (defun pai-interrupt ()
-  "Abort the active run, if any."
+  "Abort the active run and any compaction in progress."
   (interactive)
-  (if pai--active
+  (if (or pai--active pai--compaction)
       (let ((run pai--run))
+        ;; a run paused for compaction: stop the summary first
+        (pai--compaction-cancel)
+        (setq pai--compact-request nil)
         ;; Aborting emits `agent-end' (:aborted t), which resets the UI.
         (when run (pai-agent-abort run))
-        (when pai--active               ; no run, or its buffer sink is gone
-          (setq pai--active nil pai--run nil)
-          (pai--set-status "idle")
-          (pai--render-note "— interrupted —" 'pai-error-face)))
+        (if pai--active               ; no run, or its buffer sink is gone
+            (progn
+              (setq pai--active nil pai--run nil)
+              (pai--set-status "idle")
+              (pai--render-note "— interrupted —" 'pai-error-face))
+          (pai--set-status "idle")))
     (message "No active run")))
 
 (defun pai-set-model (id)

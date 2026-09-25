@@ -409,6 +409,140 @@ first argument: accepting a value neither chains nor offers it again."
     (pai-compaction-summarize (list (pai-user-message "x")) (pai-model "faux"))
     (should (equal seen "abcdefgh"))))
 
+;;;; Compaction during a run
+
+(defun pai-ui-test--wait-idle (&optional seconds)
+  "Pump process output until the run in the current buffer ends."
+  (let ((deadline (+ (float-time) (or seconds 10))))
+    (while (and (or pai--active pai--compaction) (< (float-time) deadline))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest pai-ui-auto-compacts-between-turns-of-a-run ()
+  "Crossing the threshold mid-run pauses the run, compacts, and continues."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "elisp_eval"
+                                 :arguments (:form "(make-string 3000 ?x)")))
+                  :stop-reason tool-use)
+                 '(:text "TURN PREFIX SUMMARY" :stop-reason stop)
+                 '(:text "all done after compaction" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
+                                                  :compact-keep-recent-tokens 50)))
+        (pai-ui-test--type-and-send "go")
+        (pai-ui-test--wait-idle)
+        (let ((content (buffer-string)))
+          (should (string-match-p "Compacting context (auto)" content))
+          (should (string-match-p "The run is paused" content))
+          (should (string-match-p "Compacted context" content))
+          (should (string-match-p "all done after compaction" content))
+          ;; compaction came before the final answer
+          (should (< (string-match "Compacted context" content)
+                     (string-match "all done after compaction" content))))
+        (should-not pai--active)
+        (should-not pai--compaction)
+        (should (equal pai--status "idle"))
+        ;; the continued turn was sent the compacted context
+        (should (string-match-p "TURN PREFIX SUMMARY"
+                                (pai-json-encode (plist-get pai-faux-last-context :messages))))
+        (should (string-match-p "summarized" (pai-content-text
+                                             (pai-message-content (nth 1 pai--context-messages)))))
+        (should (seq-find (lambda (e) (equal (plist-get e :type) "compaction"))
+                          (pai-session-entries pai--session)))))))
+
+(ert-deftest pai-ui-compact-during-run-is-queued-for-turn-boundary ()
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "bash" :arguments (:command "sleep 0.3; echo hi")))
+                  :stop-reason tool-use)
+                 '(:text "QUEUED SUMMARY" :stop-reason stop)
+                 '(:text "continued" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 1)))
+        (pai-ui-test--type-and-send "go")
+        (should pai--active)
+        (should (eq (pai--compact-now nil) 'queued))
+        (should (string-match-p "Compaction queued" (buffer-string)))
+        (pai-ui-test--wait-idle)
+        (should (string-match-p "Compacting context (manual)" (buffer-string)))
+        (should (string-match-p "continued" (buffer-string)))
+        (should-not pai--compact-request)
+        (should (string-match-p "QUEUED SUMMARY"
+                                (pai-json-encode (plist-get pai-faux-last-context :messages))))))))
+
+(ert-deftest pai-ui-interrupt-during-run-compaction ()
+  "C-c C-c while the run is paused for compaction stops both at once."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "elisp_eval"
+                                 :arguments (:form "(make-string 3000 ?x)")))
+                  :stop-reason tool-use)
+                 '(:text "SHOULD NOT APPEAR" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
+                                                  :compact-keep-recent-tokens 50))
+            (cancelled nil) (before nil))
+        (cl-letf (((symbol-function 'pai-compact-async)
+                   (lambda (&rest _) (lambda () (setq cancelled t)))))
+          (pai-ui-test--type-and-send "go")
+          ;; paused, waiting for the summary
+          (should pai--active)
+          (should pai--compaction)
+          (should (equal pai--status "compacting…"))
+          (setq before pai--context-messages)
+          (pai-interrupt))
+        (should cancelled)
+        (should-not pai--compaction)
+        (should-not pai--active)
+        (should (equal pai--status "idle"))
+        (should (eq pai--context-messages before))
+        (should-not (pai-activity-running "compaction"))
+        (let ((content (buffer-string)))
+          (should (string-match-p "Compaction interrupted" content))
+          (should (string-match-p "— interrupted —" content))
+          (should-not (string-match-p "SHOULD NOT APPEAR" content)))))))
+
+(ert-deftest pai-ui-context-overflow-compacts-and-retries-once ()
+  (pai-faux-reset)
+  (pai-faux-push '(:error "prompt is too long: 200000 tokens > 128000 maximum")
+                 '(:text "OVERFLOW SUMMARY" :stop-reason stop)
+                 '(:text "recovered after overflow" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--persisted-turns 3)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 2)))
+        (pai-ui-test--type-and-send "hi there")
+        (pai-ui-test--wait-idle)
+        (let ((content (buffer-string)))
+          (should (string-match-p "Context overflow: compacting" content))
+          (should (string-match-p "Compacting context (overflow)" content))
+          (should (string-match-p "recovered after overflow" content)))
+        ;; the retry was sent the compacted context, without the failed reply
+        (let ((sent (plist-get pai-faux-last-context :messages)))
+          (should (string-match-p "OVERFLOW SUMMARY" (pai-json-encode sent)))
+          (should-not (seq-find (lambda (m) (eq (plist-get m :stop-reason) 'error)) sent)))
+        (should-not (seq-find (lambda (m) (eq (plist-get m :stop-reason) 'error))
+                              pai--context-messages))
+        (should-not pai--active)))))
+
+(ert-deftest pai-ui-context-overflow-retried-only-once ()
+  (pai-faux-reset)
+  (pai-faux-push '(:error "prompt is too long: 200000 tokens > 128000 maximum")
+                 '(:text "S1" :stop-reason stop)
+                 '(:error "prompt is too long: 190000 tokens > 128000 maximum")
+                 '(:text "NOT REACHED" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--persisted-turns 3)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 2)))
+        (pai-ui-test--type-and-send "hi there")
+        (pai-ui-test--wait-idle)
+        (let ((content (buffer-string)))
+          (should (= 1 (how-many "Context overflow: compacting" (point-min) (point-max))))
+          (should (string-match-p "error: prompt is too long: 190000" content))
+          (should-not (string-match-p "NOT REACHED" content)))
+        (should-not pai--active)))))
+
 (defun pai-ui-test--persisted-turns (n)
   "Append N user/assistant turns to both the live context and the session."
   (dotimes (_ n)

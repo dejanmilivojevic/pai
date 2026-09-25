@@ -196,6 +196,50 @@
       (should (eq (plist-get ret :reason) 'auto))
       (should (equal (reverse calls) '(declines takes))))))
 
+(ert-deftest pai-ext-run-compact-async-protocol ()
+  "Sync answers, declines and (:async CANCEL) handlers, in order."
+  (pai-ext-reset)
+  (let ((calls '()) (later nil) (got :none) (cancelled nil))
+    (pai-register-extension
+     (lambda (pi)
+       ;; declines synchronously (ignores :callback)
+       (pai-ext-on pi 'compact (lambda (_e _c) (push 'sync-decline calls) nil))
+       ;; declines asynchronously
+       (pai-ext-on pi 'compact (lambda (e _c) (push 'async-decline calls)
+                                 (setq later (plist-get e :callback))
+                                 (list :async (lambda () (setq cancelled t)))))
+       (pai-ext-on pi 'compact (lambda (e _c) (push 'takes calls)
+                                 (list :messages (plist-get e :messages) :strategy "t")))))
+    (pai-ext-run-compact-async (list (pai-user-message "x")) nil
+                               (lambda (r) (setq got r)) :reason 'auto)
+    (should (eq got :none))
+    (should (equal (reverse calls) '(sync-decline async-decline)))
+    (funcall later nil)                 ; the async handler declines later
+    (should (equal (plist-get got :strategy) "t"))
+    (should (equal (reverse calls) '(sync-decline async-decline takes)))
+    (should-not cancelled)))
+
+(ert-deftest pai-ext-run-compact-async-cancel ()
+  (pai-ext-reset)
+  (let ((later nil) (got :none) (cancelled nil))
+    (pai-register-extension
+     (lambda (pi)
+       (pai-ext-on pi 'compact (lambda (e _c)
+                                 (setq later (plist-get e :callback))
+                                 (list :async (lambda () (setq cancelled t)))))))
+    (let ((cancel (pai-ext-run-compact-async (list (pai-user-message "x")) nil
+                                             (lambda (r) (setq got r)))))
+      (funcall cancel)
+      (should cancelled)
+      (funcall later (list :messages nil :strategy "late"))
+      (should (eq got :none)))))
+
+(ert-deftest pai-ext-run-compact-async-none ()
+  (pai-ext-reset)
+  (let ((got :none))
+    (pai-ext-run-compact-async (list (pai-user-message "x")) nil (lambda (r) (setq got r)))
+    (should (null got))))
+
 (ert-deftest pai-ext-run-compact-none ()
   (pai-ext-reset)
   (should-not (pai-ext-run-compact (list (pai-user-message "x")) nil)))

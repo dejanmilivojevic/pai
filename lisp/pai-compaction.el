@@ -263,20 +263,49 @@ trigger honors both `:compact-threshold' and the proportional reserve."
 
 ;;;; Cut point
 
+(defun pai-compaction--cut-point-p (message)
+  "Return non-nil when the kept context may start at MESSAGE.
+Never at a tool result: it would be cut off from its tool call."
+  (not (eq (pai-message-role message) 'tool-result)))
+
+(defun pai-compaction--turn-start-p (message)
+  "Return non-nil when MESSAGE starts a turn (a user-role message)."
+  (eq (pai-message-role message) 'user))
+
 (defun pai-compaction--find-cut-index (messages keep-recent)
-  "Return the index in MESSAGES of the first message to KEEP.
-Accumulate tokens from the end until KEEP-RECENT is reached, then snap the cut
-to the nearest preceding user message so whole turns are kept together."
-  (let ((n (length messages)) (acc 0) (cut nil))
-    (cl-loop for i from (1- n) downto 0 do
-             (cl-incf acc (pai-estimate-tokens (nth i messages)))
-             (when (and (null cut) (>= acc keep-recent))
-               (setq cut i)))
-    (setq cut (or cut 0))
-    (cl-loop for i from cut downto 0
-             when (eq (pai-message-role (nth i messages)) 'user)
-             return (setq cut i))
-    cut))
+  "Return the index in MESSAGES of the first message to keep (0: nothing to cut).
+Port of pi's findCutPoint: walk back from the newest message accumulating
+estimated tokens; once KEEP-RECENT is reached, cut at the closest valid cut
+point at or after that message -- a user or assistant message, never a tool
+result.  The cut may fall inside a turn (a long agent run after a single
+prompt); see `pai-compaction--split-turn'.
+
+Unlike pi, when no cut point follows (the newest messages are tool results
+larger than KEEP-RECENT, as is typical between turns of a run), fall back to
+the closest cut point before, keeping somewhat more than KEEP-RECENT rather
+than everything."
+  (let* ((vec (vconcat messages))
+         (n (length vec))
+         (acc 0))
+    (or (cl-loop for i from (1- n) downto 0
+                 do (cl-incf acc (pai-estimate-tokens (aref vec i)))
+                 when (>= acc keep-recent)
+                 return (or (cl-loop for c from i below n
+                                     when (pai-compaction--cut-point-p (aref vec c))
+                                     return c)
+                            (cl-loop for c from (1- i) downto 0
+                                     when (pai-compaction--cut-point-p (aref vec c))
+                                     return c)))
+        0)))
+
+(defun pai-compaction--split-turn (messages cut)
+  "Return the index of the turn start when keeping MESSAGES from CUT splits a turn.
+That is the user message opening the turn the cut falls into, when the
+message at CUT does not start a turn itself; nil otherwise."
+  (let ((vec (vconcat messages)))
+    (unless (or (>= cut (length vec)) (pai-compaction--turn-start-p (aref vec cut)))
+      (cl-loop for i from (1- cut) downto 0
+               when (pai-compaction--turn-start-p (aref vec i)) return i))))
 
 ;;;; Summarization
 
@@ -348,31 +377,164 @@ Do NOT continue the conversation. Do NOT respond to any questions in the convers
 (defconst pai-compaction-summary-max-tokens 3072
   "Output token limit of a compaction summary.")
 
+(defconst pai-compaction-turn-prefix-instructions
+  "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix."
+  "Instructions for summarizing the prefix of a split turn (pi's prompt).")
+
 (defvar pai-compaction-progress-function nil
   "When non-nil, called with each chunk of summary text as it streams in.
 Bound by the UI around a compaction to show progress; the summary itself
 is unaffected.")
 
+(defun pai-compaction--request (messages custom-instructions &optional kind)
+  "Return the summarization context for MESSAGES with CUSTOM-INSTRUCTIONS.
+KIND `turn-prefix' asks for pi's split-turn prefix summary instead of the
+full structured summary."
+  (let ((convo (pai-compaction--serialize messages)))
+    (pai-context
+     (list (pai-system-message pai-compaction-system-prompt)
+           (pai-user-message
+            (concat (if (eq kind 'turn-prefix)
+                        pai-compaction-turn-prefix-instructions
+                      pai-compaction-format-instructions)
+                    (when (and custom-instructions (not (eq kind 'turn-prefix))
+                               (not (string-empty-p custom-instructions)))
+                      (concat "\n\nAdditional instructions: " custom-instructions))
+                    "\n\n<conversation>\n" convo "\n</conversation>")))
+     nil)))
+
+(defun pai-compaction--progress-handler (progress)
+  "Return a stream-event handler feeding text deltas to PROGRESS, or nil."
+  (and progress
+       (lambda (ev)
+         (when (eq (plist-get ev :type) 'text-delta)
+           (funcall progress (or (plist-get ev :delta) ""))))))
+
+(defun pai-compaction--final-result (final kind)
+  "Return the summary result plist for the FINAL assistant message of KIND.
+Like pi, an errored or length-capped response is a failure: a truncated
+summary must not become the context."
+  (let ((label (if (eq kind 'turn-prefix) "Turn prefix summarization" "Summarization")))
+    (cond
+     ((null final) (list :error (concat label " timed out")))
+     ((memq (plist-get final :stop-reason) '(error aborted))
+      (list :error (format "%s failed: %s" label
+                           (or (plist-get final :error-message)
+                               (symbol-name (plist-get final :stop-reason))))))
+     ((eq (plist-get final :stop-reason) 'length)
+      (list :error (concat label " failed: generation hit the token cap and the summary is incomplete")))
+     (t (list :text (pai-content-text (pai-message-content final))
+              :usage (plist-get final :usage))))))
+
+(defun pai-compaction--max-tokens (kind)
+  "Return the output token limit for a summary of KIND (the prefix gets half)."
+  (if (eq kind 'turn-prefix)
+      (/ pai-compaction-summary-max-tokens 2)
+    pai-compaction-summary-max-tokens))
+
+(defun pai-compaction--summarize-step (messages model instructions kind sync progress callback)
+  "Summarize MESSAGES of KIND with MODEL, then call CALLBACK with the result.
+SYNC blocks until done; otherwise return the stream handle."
+  (let ((ctx (pai-compaction--request messages instructions kind))
+        (opts (list :max-tokens (pai-compaction--max-tokens kind)))
+        (on-delta (pai-compaction--progress-handler progress)))
+    (if sync
+        (progn (funcall callback
+                        (pai-compaction--final-result
+                         (pai-provider-stream-sync model ctx opts nil on-delta) kind))
+               nil)
+      (let ((done nil))
+        (pai-provider-stream
+         model ctx opts
+         (lambda (ev)
+           (when on-delta (ignore-errors (funcall on-delta ev)))
+           (when (and (not done) (memq (plist-get ev :type) '(done error)))
+             (setq done t)
+             (funcall callback (pai-compaction--final-result (plist-get ev :message) kind)))))))))
+
 (defun pai-compaction-summarize (messages model &optional custom-instructions)
-  "Summarize MESSAGES with MODEL synchronously.  Return (:text S :usage U)."
-  (let* ((convo (pai-compaction--serialize messages))
-         (sys (pai-system-message pai-compaction-system-prompt))
-         (user (pai-user-message
-                (concat pai-compaction-format-instructions
-                        (when (and custom-instructions (not (string-empty-p custom-instructions)))
-                          (concat "\n\nAdditional instructions: " custom-instructions))
-                        "\n\n<conversation>\n" convo "\n</conversation>")))
-         (progress pai-compaction-progress-function)
-         (final (pai-provider-stream-sync
-                 model (pai-context (list sys user) nil)
-                 (list :max-tokens pai-compaction-summary-max-tokens)
-                 nil
-                 (and progress
-                      (lambda (ev)
-                        (when (eq (plist-get ev :type) 'text-delta)
-                          (funcall progress (or (plist-get ev :delta) ""))))))))
-    (list :text (if final (pai-content-text (pai-message-content final)) "")
-          :usage (and final (plist-get final :usage)))))
+  "Summarize MESSAGES with MODEL synchronously.
+Return (:text S :usage U); on failure :text is empty and :error explains."
+  (let (out)
+    (pai-compaction--summarize-step messages model custom-instructions 'history t
+                                    pai-compaction-progress-function
+                                    (lambda (r) (setq out r)))
+    (if (plist-get out :error) (append (list :text "") out) out)))
+
+;;;; Summarizing what a cut drops
+
+(defun pai-compaction--merge-usage (a b)
+  "Return usage A plus usage B, either possibly nil."
+  (cond ((and a b) (pai-usage-add a b)) (t (or a b))))
+
+(defun pai-compaction-summarize-dropped (dropped kept model custom-instructions
+                                                 callback &optional sync progress)
+  "Summarize the DROPPED messages of a cut that keeps KEPT, then call CALLBACK.
+Follows pi: when the cut splits a turn -- KEPT opens mid-turn and DROPPED
+holds that turn's user message -- the history before the turn and the turn's
+prefix are summarized separately (the prefix with pi's turn-prefix prompt,
+so the original request survives) and merged.  CALLBACK receives
+\(:text S :usage U) or (:error MESSAGE).  SYNC blocks; otherwise the work is
+asynchronous and the return value is a function that cancels it (then
+CALLBACK receives (:error \"cancelled\")).  PROGRESS receives text chunks."
+  (let* ((all (append dropped kept))
+         (ts (and kept (pai-compaction--split-turn all (length dropped))))
+         (history (if ts (seq-take dropped ts) dropped))
+         (prefix (and ts (nthcdr ts dropped)))
+         (state (list :handle nil :cancelled nil :done nil))
+         (finish (lambda (result)
+                   (unless (plist-get state :done)
+                     (plist-put state :done t)
+                     (funcall callback (if (plist-get state :cancelled)
+                                           (list :error "cancelled")
+                                         result)))))
+         (step (lambda (msgs kind k)
+                 (if (plist-get state :cancelled)
+                     (funcall finish nil)
+                   (plist-put state :handle
+                              (pai-compaction--summarize-step
+                               msgs model custom-instructions kind sync progress
+                               (lambda (r)
+                                 (if (or (plist-get r :error) (plist-get state :cancelled))
+                                     (funcall finish r)
+                                   (funcall k r)))))))))
+    (cond
+     ((null prefix)
+      (funcall step history 'history finish))
+     (t
+      (let ((do-prefix
+             (lambda (hist)
+               (funcall step prefix 'turn-prefix
+                        (lambda (pre)
+                          (funcall finish
+                                   (list :text (concat (or (plist-get hist :text) "No prior history.")
+                                                       "\n\n---\n\n**Turn Context (split turn):**\n\n"
+                                                       (plist-get pre :text))
+                                         :usage (pai-compaction--merge-usage
+                                                 (plist-get hist :usage)
+                                                 (plist-get pre :usage)))))))))
+        (if history
+            (funcall step history 'history do-prefix)
+          (funcall do-prefix nil)))))
+    (unless sync
+      (lambda ()
+        (unless (plist-get state :done)
+          (plist-put state :cancelled t)
+          (ignore-errors (pai-provider-abort (plist-get state :handle)))
+          (funcall finish nil))))))
 
 ;;;; Compaction
 
@@ -388,34 +550,110 @@ message is tagged `:deferred-schemas', so compaction never unloads a tool."
                           :deferred-schemas (plist-get carried :names))
       (pai-user-message text))))
 
+(defun pai-compaction--plan (messages)
+  "Return the compaction plan for MESSAGES, or nil when nothing can be cut.
+The plan is (:system S :dropped D :kept K :cut-index N :tokens-before T)."
+  (let* ((system (seq-take-while #'pai-system-message-p messages))
+         (rest (seq-drop-while #'pai-system-message-p messages))
+         (cut (pai-compaction--find-cut-index rest (pai-compaction-keep-recent-tokens))))
+    (when (> cut 0)
+      (list :system system
+            :dropped (seq-take rest cut)
+            :kept (nthcdr cut rest)
+            :cut-index cut
+            :tokens-before (pai-estimate-context-tokens messages)))))
+
+(defun pai-compaction--result (plan summary usage)
+  "Return the compaction result of PLAN with SUMMARY and USAGE, or nil."
+  (when (and summary (not (string-empty-p (string-trim summary))))
+    (let ((kept (plist-get plan :kept)))
+      (list :messages (append (plist-get plan :system)
+                              (list (pai-compaction-summary-message
+                                     summary
+                                     (pai-tool-carried-schemas
+                                      (plist-get plan :dropped) kept)))
+                              ;; Everything the kept messages' usage counts
+                              ;; described has just been replaced by the
+                              ;; summary, so those anchors no longer
+                              ;; describe this context.
+                              (pai-invalidate-usage-anchors kept))
+            :summary summary
+            :cut-index (plist-get plan :cut-index)
+            :tokens-before (plist-get plan :tokens-before)
+            :usage usage))))
+
 (defun pai-compact (messages model &optional custom-instructions)
   "Compact MESSAGES using MODEL.  Return a plist or nil when nothing to compact.
 The plist is (:messages NEW-LIST :summary S :cut-index N :tokens-before T
 :usage U), where NEW-LIST is leading system messages, the summary message, and
 the kept recent messages."
-  (let* ((system (seq-take-while #'pai-system-message-p messages))
-         (rest (seq-drop-while #'pai-system-message-p messages))
-         (keep (pai-compaction-keep-recent-tokens))
-         (cut (pai-compaction--find-cut-index rest keep))
-         (tokens-before (pai-estimate-context-tokens messages)))
-    (when (> cut 0)
-      (let* ((to-summarize (seq-take rest cut))
-             (kept (nthcdr cut rest))
-             (result (pai-compaction-summarize to-summarize model custom-instructions))
-             (summary (plist-get result :text))
-             (carried (pai-tool-carried-schemas to-summarize kept)))
-        (when (and summary (not (string-empty-p (string-trim summary))))
-          (list :messages (append system
-                                  (list (pai-compaction-summary-message summary carried))
-                                  ;; Everything the kept messages' usage counts
-                                  ;; described has just been replaced by the
-                                  ;; summary, so those anchors no longer
-                                  ;; describe this context.
-                                  (pai-invalidate-usage-anchors kept))
-                :summary summary
-                :cut-index cut
-                :tokens-before tokens-before
-                :usage (plist-get result :usage)))))))
+  (let ((plan (pai-compaction--plan messages)) (out nil))
+    (when plan
+      (pai-compaction-summarize-dropped
+       (plist-get plan :dropped) (plist-get plan :kept) model custom-instructions
+       (lambda (r) (setq out r)) t pai-compaction-progress-function)
+      (unless (plist-get out :error)
+        (pai-compaction--result plan (plist-get out :text) (plist-get out :usage))))))
+
+(defun pai-compact-async (messages model custom-instructions callback &optional progress)
+  "Compact MESSAGES using MODEL without blocking; return a cancel function or nil.
+CALLBACK is called once with the `pai-compact' result, with nil when there
+is nothing to compact (then before this returns), or with (:error MESSAGE)
+when summarizing failed or was cancelled.  PROGRESS receives summary text
+chunks as they stream in."
+  (let ((plan (pai-compaction--plan messages)))
+    (if (null plan)
+        (progn (funcall callback nil) nil)
+      (pai-compaction-summarize-dropped
+       (plist-get plan :dropped) (plist-get plan :kept) model custom-instructions
+       (lambda (r)
+         (funcall callback
+                  (if (plist-get r :error)
+                      r
+                    (or (pai-compaction--result plan (plist-get r :text) (plist-get r :usage))
+                        (list :error "the summary came back empty")))))
+       nil progress))))
+
+;;;; Context overflow (port of pi's isContextOverflow)
+
+(defconst pai-compaction-overflow-patterns
+  '("prompt is too long" "request_too_large" "input is too long for requested model"
+    "exceeds the context window"
+    "exceeds \\(?:the \\)?\\(?:model'?s \\)?maximum context length"
+    "input token count.*exceeds the maximum" "maximum prompt length is [0-9]+"
+    "reduce the length of the messages" "maximum context length is [0-9]+ tokens"
+    "exceeds \\(?:the \\)?maximum allowed input length of [0-9,]+ tokens?"
+    "input ([0-9]+ tokens) is longer than the model'?s context length"
+    "exceeds the limit of [0-9]+" "exceeds the available context size"
+    "greater than the context length" "context window exceeds limit"
+    "exceeded model token limit" "too large for model with [0-9]+ maximum context length"
+    "prompt has [0-9,]+ tokens?, but the configured context size is"
+    "model_context_window_exceeded" "prompt too long; exceeded \\(?:max \\)?context length"
+    "range of input length should be" "context[_ ]length[_ ]exceeded"
+    "too many tokens" "token limit exceeded" "\\`4\\(?:00\\|13\\) *\\(?:status code\\)? *(no body)")
+  "Provider error messages that mean the prompt overflowed the context window.")
+
+(defconst pai-compaction-non-overflow-patterns
+  '("\\`\\(?:Throttling error\\|Service unavailable\\):" "rate limit" "too many requests")
+  "Error messages that match an overflow pattern but are not overflows.")
+
+(defun pai-context-overflow-p (message &optional context-window)
+  "Return non-nil when assistant MESSAGE failed because the context overflowed.
+Either the provider rejected the prompt as too long, or (with CONTEXT-WINDOW)
+it truncated the input so that no output fit, a length stop with no output."
+  (let ((err (plist-get message :error-message))
+        (usage (plist-get message :usage))
+        (case-fold-search t))
+    (or (and (eq (plist-get message :stop-reason) 'error) (stringp err)
+             (not (seq-some (lambda (p) (string-match-p p err))
+                            pai-compaction-non-overflow-patterns))
+             (seq-some (lambda (p) (string-match-p p err)) pai-compaction-overflow-patterns)
+             t)
+        (and context-window (> context-window 0)
+             (eq (plist-get message :stop-reason) 'length)
+             (eql (or (plist-get usage :output) 0) 0)
+             (>= (+ (or (plist-get usage :input) 0) (or (plist-get usage :cache-read) 0))
+                 (* context-window 0.99))))))
 
 (provide 'pai-compaction)
 ;;; pai-compaction.el ends here

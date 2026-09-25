@@ -37,7 +37,11 @@
   ;; partial assistant message of the stream in flight, or nil
   partial
   ;; processes / functions to kill / call when the run is aborted
-  (abort-handlers '()))
+  (abort-handlers '())
+  ;; non-nil while paused between turns by the :before-turn hook
+  (paused nil)
+  ;; non-nil once the :before-turn hook ran for the upcoming turn
+  (resumed nil))
 
 ;;;; Hook dispatch
 
@@ -181,13 +185,62 @@ owns the completion."
                                 (if (eq lvl 'off) nil lvl)))))
     (setf (pai-run-config run) config)))
 
+(defun pai-agent-paused-p (run)
+  "Return non-nil while RUN is paused between turns (see `:before-turn')."
+  (pai-run-paused run))
+
+(defun pai-agent--pause (run key args on-resume)
+  "Offer RUN's hook KEY a pause; return non-nil when the run is now paused.
+The hook is called with ARGS followed by a RESUME function, and returns
+non-nil when it takes the pause: nothing more happens until it calls
+RESUME, optionally with an update plist whose `:messages' replace the
+context messages (e.g. a compacted transcript).  ON-RESUME is then called
+with the update.  RESUME runs at most once and is dropped once the run is
+aborted."
+  (let* ((called nil)
+         (resume (pai-agent--deferred
+                  run (lambda (update)
+                        (unless called
+                          (setq called t)
+                          (setf (pai-run-paused run) nil)
+                          (when (plist-member update :messages)
+                            (setf (pai-run-context run)
+                                  (plist-put (copy-sequence (pai-run-context run))
+                                             :messages (plist-get update :messages))))
+                          (funcall on-resume update)))))
+         (resume-fn (lambda (&optional update) (funcall resume update))))
+    (setf (pai-run-paused run) t)
+    (let ((taken (condition-case err
+                     (apply #'pai-agent--call run key (append args (list resume-fn)))
+                   (error (message "pai: %s hook failed: %s" key
+                                   (error-message-string err))
+                          nil))))
+      (cond
+       (called t)                        ; resumed synchronously: already went on
+       (taken t)
+       (t (setf (pai-run-paused run) nil) nil)))))
+
+(defun pai-agent--pause-before-turn (run)
+  "Offer RUN's `:before-turn' hook a pause before the next turn.
+The hook gets the run context and RESUME, see `pai-agent--pause'."
+  (pai-agent--pause run :before-turn (list (pai-run-context run))
+                    (lambda (_update)
+                      (setf (pai-run-resumed run) t)
+                      (pai-agent--inner-iterate run))))
+
 (defun pai-agent--inner-iterate (run)
   "Run one inner-loop iteration of RUN, or advance to the follow-up check."
   (cond
    ((pai-run-finished run) nil)
    ((not (or (pai-run-has-more run) (pai-run-pending run)))
     (pai-agent--after-inner run))
+   ((and (pai-run-lastturn run)
+         (not (pai-run-resumed run))
+         (pai-agent--hook run :before-turn)
+         (pai-agent--pause-before-turn run))
+    nil)
    (t
+    (setf (pai-run-resumed run) nil)
     (when (pai-run-lastturn run)
       (let ((upd (pai-agent--call run :prepare-next-turn (pai-run-lastturn run))))
         (when upd (pai-agent--apply-turn-update run upd)))
@@ -266,21 +319,49 @@ Deferred tools are declared as stable stubs (see `pai-tool-declaration')."
                           (pai-agent--emit run (list :type 'message-end :message final))
                           (pai-agent--on-assistant-done run final))))))))))
 
+(defun pai-agent--end-failed-turn (run message)
+  "End RUN after its turn failed with MESSAGE (stop-reason error or aborted)."
+  (pai-agent--push-context run message)
+  (pai-agent--emit run (list :type 'turn-end :message message :tool-results nil))
+  (pai-agent--finish run))
+
+(defun pai-agent--recover-error (run message)
+  "Offer RUN's `:recover-error' hook to retry the turn that failed with MESSAGE.
+The hook is called with MESSAGE, the run context (without MESSAGE) and a
+RESUME function (see `pai-agent--pause').  Resuming with `:messages' --
+e.g. a compacted context after a context overflow -- streams the turn
+again; resuming without ends the run with the error.  Return non-nil when
+the hook took over."
+  (and (pai-agent--hook run :recover-error)
+       (pai-agent--pause run :recover-error (list message (pai-run-context run))
+                         (lambda (update)
+                           (if (plist-member update :messages)
+                               (pai-agent--stream-assistant run)
+                             (pai-agent--end-failed-turn run message))))))
+
 (defun pai-agent--on-assistant-done (run message)
   "Continue RUN after the assistant MESSAGE for this turn is complete."
   (setf (pai-run-new-messages run) (append (pai-run-new-messages run) (list message)))
-  (pai-agent--push-context run message)
   (let ((stop (plist-get message :stop-reason)))
-    (if (memq stop '(error aborted))
-        (progn
-          (pai-agent--emit run (list :type 'turn-end :message message :tool-results nil))
-          (pai-agent--finish run))
+    (cond
+     ;; A retried turn keeps the failed message out of the context.  A
+     ;; length stop without any output is offered too: some providers
+     ;; truncate an oversized prompt instead of rejecting it.
+     ((and (or (eq stop 'error)
+               (and (eq stop 'length)
+                    (eql (or (plist-get (plist-get message :usage) :output) 0) 0)))
+           (pai-agent--recover-error run message))
+      nil)
+     ((memq stop '(error aborted))
+      (pai-agent--end-failed-turn run message))
+     (t
+      (pai-agent--push-context run message)
       (let ((tool-calls (pai-message-tool-calls message)))
         (if (null tool-calls)
             (pai-agent--turn-complete run message nil nil)
           (if (eq stop 'length)
               (pai-agent--fail-truncated-tools run message tool-calls)
-            (pai-agent--execute-tools run message tool-calls)))))))
+            (pai-agent--execute-tools run message tool-calls))))))))
 
 ;;;; Tool execution (sequential)
 

@@ -104,7 +104,8 @@ reports errors while preserving cached/explicit models.
 Mirrors pi agent-loop.ts. `pai-agent-run(prompts context config emit)`:
 - Emit agent-start, turn-start, message events for injected prompts.
 - Outer loop (follow-up queue) wraps inner loop (tool calls + steering).
-- Per iteration: prepare-next-turn -> inject steering/prepared messages ->
+- Per iteration: before-turn (may pause the run, e.g. to compact, and resume
+  it with replaced context messages) -> prepare-next-turn -> inject steering/prepared messages ->
   stream assistant response (via provider) -> if stop-reason error/aborted, end ->
   collect tool calls -> if stop-reason length, fail all tool calls ->
   else execute tools (sequential/parallel) -> append results -> turn-end ->
@@ -115,7 +116,20 @@ Mirrors pi agent-loop.ts. `pai-agent-run(prompts context config emit)`:
 ### Config (plist) hooks
 `:model :convert-to-llm :transform-context :get-api-key :should-stop-after-turn
 :prepare-next-turn :get-steering-messages :get-follow-up-messages :tool-execution
-:before-tool-call :after-tool-call :reasoning :max-tokens :temperature :tools`
+:before-tool-call :after-tool-call :reasoning :max-tokens :temperature :tools
+:before-turn`
+
+`:before-turn (context resume)` runs between turns of a run (not before the
+first).  Returning non-nil pauses the run until `(funcall resume)` or
+`(funcall resume (list :messages NEW))`; `pai-agent-abort` drops a pending
+resume.  Tools and hooks can register cleanup with `pai-agent-on-abort`.
+
+`:recover-error (message context resume)` is offered a turn that failed
+(stop-reason error, or length with no output).  Returning non-nil pauses the
+run; `(funcall resume (list :messages NEW))` streams the turn again with NEW
+(the failed message stays out of the context), `(funcall resume)` ends the
+run with the error.  The UI uses it for pi's compact-and-retry on context
+overflow.
 
 ## 5. Tool contract (pai-tools.el)
 
