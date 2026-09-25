@@ -354,22 +354,35 @@ Edits target the pai session buffer this command was invoked from (or any live
     (pai-settings-get :thinking-level "off")))
 
 (defun pai-settings-ui--scoped-model-items ()
-  "Return one settings row per scoped-model role (built-in and extension).
-Each row picks a model or `inherit'; its note says what the role is for and
-which model it resolves to right now."
+  "Return two settings rows per scoped-model role (built-in and extension).
+The first picks a model or `inherit', the second a thinking level or
+`inherit'; their notes say what the role is for and what it resolves to
+right now."
   (let ((session-model (and (boundp 'pai--model) pai--model (pai-model-key pai--model)))
-        (choices (cons pai-scoped-model-inherit (pai-model-keys))))
-    (mapcar
+        (choices (cons pai-scoped-model-inherit (pai-model-keys)))
+        (levels (cons pai-scoped-model-inherit pai-thinking-levels)))
+    (mapcan
      (lambda (role)
-       (list :key (intern (concat ":scoped-" (pai-model-role-name role)))
-             :type 'choice
-             :label (pai-model-role-name role)
-             :doc (concat (or (alist-get role pai-model-role-descriptions) "")
-                          (unless (pai-scoped-model-explicit role)
-                            (concat " · " (pai-scoped-model-describe role session-model))))
-             :choices choices
-             :get (lambda () (or (pai-scoped-model-explicit role) pai-scoped-model-inherit))
-             :set (lambda (v) (pai-scoped-model-set role v))))
+       (let ((name (pai-model-role-name role)))
+         (list
+          (list :key (intern (concat ":scoped-" name))
+                :type 'choice
+                :label name
+                :doc (concat (or (alist-get role pai-model-role-descriptions) "")
+                             (unless (pai-scoped-model-explicit role)
+                               (concat " · " (pai-scoped-model-describe role session-model))))
+                :choices choices
+                :get (lambda () (or (pai-scoped-model-explicit role) pai-scoped-model-inherit))
+                :set (lambda (v) (pai-scoped-model-set role v)))
+          (list :key (intern (concat ":scoped-thinking-" name))
+                :type 'choice
+                :label (concat name " thinking")
+                :doc (concat "Thinking level of " name " runs"
+                             (unless (pai-scoped-thinking-explicit role)
+                               (concat " · " (pai-scoped-thinking-describe role))))
+                :choices levels
+                :get (lambda () (or (pai-scoped-thinking-explicit role) pai-scoped-model-inherit))
+                :set (lambda (v) (pai-scoped-thinking-set role v))))))
      pai-model-roles)))
 
 (defun pai-settings-ui--register-builtins ()

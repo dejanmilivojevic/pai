@@ -145,7 +145,8 @@
   (should-not (pai-settings-ui-test--section 'dyn)))
 
 (ert-deftest pai-settings-ui-scoped-models-rows ()
-  ;; One row per role, extension roles included; the row edits the role.
+  ;; A model row and a thinking row per role, extension roles included;
+  ;; the rows edit the role.
   (let ((pai-model-roles (copy-sequence pai-model-roles))
         (pai-model-role-fallbacks (copy-alist pai-model-role-fallbacks))
         (pai-model-role-descriptions (copy-alist pai-model-role-descriptions)))
@@ -155,7 +156,9 @@
              (demo (seq-find (lambda (r) (equal (plist-get r :label) "x-demo")) rows))
              (model (pai-model-key (car (pai-models)))))
         (should (equal (mapcar (lambda (r) (plist-get r :label)) rows)
-                       (mapcar #'pai-model-role-name pai-model-roles)))
+                       (mapcan (lambda (r) (let ((n (pai-model-role-name r)))
+                                             (list n (concat n " thinking"))))
+                               pai-model-roles)))
         (should (string-match-p "Demo role for tests" (plist-get demo :doc)))
         (should (string-match-p "inherit" (plist-get demo :doc)))
         (should (equal (funcall (plist-get demo :get)) "inherit"))
@@ -163,7 +166,18 @@
         (funcall (plist-get demo :set) model)
         (should (equal (pai-scoped-model-explicit :x-demo) model))
         (funcall (plist-get demo :set) "inherit")
-        (should-not (pai-scoped-model-explicit :x-demo)))
+        (should-not (pai-scoped-model-explicit :x-demo))
+        ;; the thinking row
+        (let ((think (seq-find (lambda (r) (equal (plist-get r :label) "x-demo thinking")) rows)))
+          (should (equal (funcall (plist-get think :get)) "inherit"))
+          (should (member "high" (plist-get think :choices)))
+          (should (member "inherit" (plist-get think :choices)))
+          (should (string-match-p "inherits → off" (plist-get think :doc)))
+          (funcall (plist-get think :set) "high")
+          (should (equal (pai-scoped-thinking-explicit :x-demo) "high"))
+          (should (eq (pai-scoped-thinking :x-demo) 'high))
+          (funcall (plist-get think :set) "inherit")
+          (should-not (pai-scoped-thinking-explicit :x-demo))))
       (let ((text (pai-settings-ui-test--render)))
         (should (string-match-p "Scoped models (per role)" text))
         (should (string-match-p "x-demo" text))

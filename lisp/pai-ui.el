@@ -903,6 +903,7 @@ tail no longer than the rest of MESSAGES; anything else is rejected."
 An invalid result is reported and ignored, so the built-in compaction runs."
   (let ((result (pai-ext-run-compact pai--context-messages (pai--ext-context)
                                      :reason reason :model model
+                                     :reasoning (pai--compact-reasoning)
                                      :custom-instructions custom-instructions)))
     (cond ((null result) nil)
           ((pai--compaction-shape pai--context-messages (plist-get result :messages))
@@ -1034,6 +1035,11 @@ block Emacs."
   "Return the model compaction summaries use."
   (or (ignore-errors (pai-scoped-model :compact pai--model)) pai--model))
 
+(defun pai--compact-reasoning ()
+  "Return the thinking level compaction summaries use (the `:compact' role's).
+A symbol, or nil when the role (and those it inherits from) leaves it off."
+  (ignore-errors (pai-scoped-thinking :compact)))
+
 (defun pai--compact-now (custom-instructions &optional reason)
   "Compact the live context now with optional CUSTOM-INSTRUCTIONS.  Return non-nil on success.
 REASON is `manual' (default) or `auto'.  An extension `compact' handler may
@@ -1065,7 +1071,8 @@ written.  C-g aborts it safely, leaving the context unchanged."
       (unwind-protect
           (let* ((pai-compaction-progress-function (pai--compact-progress state))
                  (result (or (pai--compact-by-extension custom-instructions reason model)
-                             (pai-compact messages model custom-instructions))))
+                             (pai-compact messages model custom-instructions
+                                          (pai--compact-reasoning)))))
             (setq outcome "completed")
             (if result
                 (pai--compact-apply result state)
@@ -1137,7 +1144,8 @@ Return non-nil when a compaction started."
                 (plist-put state :builtin t)
                 (plist-put state :cancel
                            (pai-compact-async messages model custom-instructions finish
-                                              (pai--compact-progress state))))))
+                                              (pai--compact-progress state)
+                                              (pai--compact-reasoning))))))
         (plist-put state :cancel-all
                    (lambda ()
                      (plist-put state :cancelled t)
@@ -1157,7 +1165,8 @@ Return non-nil when a compaction started."
                      (t (message "pai: ignoring malformed compaction from extension (%s)"
                                  (or (plist-get ext :strategy) "unnamed"))
                         (funcall builtin)))))
-                :reason reason :model model :custom-instructions custom-instructions)))
+                :reason reason :model model :reasoning (pai--compact-reasoning)
+                :custom-instructions custom-instructions)))
           (unless (or done (plist-get state :builtin))
             (plist-put state :cancel cancel-ext)))
         t))))

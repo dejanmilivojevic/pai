@@ -80,12 +80,89 @@
       (pai-settings-load nil)
       (pai-register-model-role :x-worker :task)
       (let ((msg (lambda (args) (plist-get (pai-scoped-models-command args nil) :message))))
-        (should (string-match-p "Scoped model x-worker = local/main" (funcall msg "x-worker local/main")))
+        (should (string-match-p "Scoped model x-worker: local/main · thinking inherits → off"
+                                (funcall msg "x-worker local/main")))
         (should (string-match-p "x-worker +local/main" (funcall msg "")))
         (should (string-match-p "inherits" (funcall msg "x-worker inherit")))
         (should-not (pai-scoped-model-explicit :x-worker))
         (should (string-match-p "Unknown model: nope" (funcall msg "task nope")))
         (should (string-match-p "Usage" (funcall msg "bogus-role local/main")))))))
+
+(ert-deftest pai-mr-scoped-thinking-follows-the-fallback-chain ()
+  "A role's thinking level is its own, else inherited like its model."
+  (let ((pai-model-roles (copy-sequence pai-model-roles))
+        (pai-model-role-fallbacks (copy-alist pai-model-role-fallbacks)))
+    (pai-mr-test--sandbox dir
+      (pai-settings-load nil)
+      (pai-register-model-role :x-worker :task)
+      ;; nothing set: off, which is what runs used before
+      (should (equal (pai-scoped-thinking-resolution :x-worker) '("off")))
+      (should-not (pai-scoped-thinking :x-worker))
+      (should (equal (pai-scoped-thinking-describe :x-worker) "inherits → off"))
+      ;; from :main, then from the nearer :task
+      (should (equal (pai-scoped-thinking-set :main "low") "low"))
+      (should (equal (pai-scoped-thinking-resolution :x-worker) '("low" . :main)))
+      (pai-scoped-thinking-set :task "high")
+      (should (eq (pai-scoped-thinking :x-worker) 'high))
+      (should (equal (pai-scoped-thinking-describe :x-worker) "inherits → high (from task)"))
+      ;; an explicit "off" stops the inheritance
+      (pai-scoped-thinking-set :x-worker "off")
+      (should (equal (pai-scoped-thinking-resolution :x-worker) '("off" . :x-worker)))
+      (should-not (pai-scoped-thinking :x-worker))
+      (should (equal (pai-scoped-thinking-describe :x-worker) "off"))
+      ;; cleared again: inherits
+      (should-not (pai-scoped-thinking-set :x-worker pai-scoped-model-inherit))
+      (should (eq (pai-scoped-thinking :x-worker) 'high))
+      ;; stored in the project scope, independent of the model setting
+      (should (plist-member (pai-settings-scope-value :scoped-thinking 'project) :task))
+      (should-not (pai-settings-get :scoped-models))
+      (should-error (pai-scoped-thinking-set :task "ludicrous")))))
+
+(ert-deftest pai-mr-scoped-models-command-thinking ()
+  (let ((pai-model-roles (copy-sequence pai-model-roles))
+        (pai-model-role-fallbacks (copy-alist pai-model-role-fallbacks)))
+    (pai-mr-test--sandbox dir
+      (pai-mr-test--model "local" "main")
+      (pai-settings-load nil)
+      (pai-register-model-role :x-worker :task)
+      (let ((msg (lambda (args) (plist-get (pai-scoped-models-command args nil) :message))))
+        ;; model and thinking at once
+        (should (string-match-p "x-worker: local/main · thinking medium"
+                                (funcall msg "x-worker local/main medium")))
+        (should (equal (pai-scoped-model-explicit :x-worker) "local/main"))
+        (should (equal (pai-scoped-thinking-explicit :x-worker) "medium"))
+        ;; only the thinking level
+        (should (string-match-p "thinking high" (funcall msg "x-worker thinking high")))
+        (should (equal (pai-scoped-model-explicit :x-worker) "local/main"))
+        (should (equal (pai-scoped-thinking-explicit :x-worker) "high"))
+        ;; the listing shows it
+        (should (string-match-p "x-worker +local/main · thinking high" (funcall msg "")))
+        ;; inherit clears it
+        (should (string-match-p "thinking inherits → off" (funcall msg "x-worker thinking inherit")))
+        (should-not (pai-scoped-thinking-explicit :x-worker))
+        ;; a model change without a level leaves the level alone
+        (pai-scoped-thinking-set :x-worker "low")
+        (funcall msg "x-worker inherit")
+        (should-not (pai-scoped-model-explicit :x-worker))
+        (should (equal (pai-scoped-thinking-explicit :x-worker) "low"))
+        ;; bad input changes nothing
+        (should (string-match-p "Unknown thinking level: loud" (funcall msg "x-worker local/main loud")))
+        (should-not (pai-scoped-model-explicit :x-worker))
+        (should (string-match-p "Usage" (funcall msg "x-worker thinking")))))))
+
+(ert-deftest pai-mr-scoped-models-completion-offers-thinking ()
+  (with-temp-buffer
+    (insert "> ")
+    (setq-local pai--input-marker (copy-marker (point)))
+    (let ((complete (plist-get (pai-command-get "scoped-models") :arg-completions)))
+      (insert "/scoped-models task ")
+      (should (member "thinking" (funcall complete "")))
+      (insert "thinking ")
+      (should (equal (pai-command-arg-words) '("task" "thinking")))
+      (let ((levels (funcall complete "")))
+        (should (member "high" levels))
+        (should (member "off" levels))
+        (should (member pai-scoped-model-inherit levels))))))
 
 (ert-deftest pai-mr-scoped-models-completion-by-position ()
   (with-temp-buffer

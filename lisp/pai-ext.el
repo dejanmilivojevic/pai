@@ -337,8 +337,9 @@ The first handler that returns (:block t ...) wins."
 
 (defun pai-ext-run-compact (messages ctx &rest props)
   "Run `compact' handlers over MESSAGES; the first non-nil result wins.
-PROPS are passed on in the event: :reason (`manual', `auto'), :model and
-:custom-instructions.  A handler that takes over compaction returns a plist
+PROPS are passed on in the event: :reason (`manual', `auto', `overflow'),
+:model and :reasoning (the `:compact' role's model and thinking level, a
+symbol or nil for off; use both for any summary) and :custom-instructions.  A handler that takes over compaction returns a plist
 shaped like `pai-compact''s result:
 
   (:messages NEW :summary S :strategy STRATEGY

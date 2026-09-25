@@ -496,6 +496,58 @@ first argument: accepting a value neither chains nor offers it again."
         (should (seq-find (lambda (e) (equal (plist-get e :type) "compaction"))
                           (pai-session-entries pai--session)))))))
 
+(ert-deftest pai-ui-compaction-uses-the-compact-role-thinking ()
+  "Summaries are requested at the :compact role's thinking level (off if unset)."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      ;; unset: no reasoning, as before
+      (pai-faux-reset)
+      (pai-faux-push '(:text "## Goal\nS1" :stop-reason stop))
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50)))
+        (should (pai--compact-now nil))
+        (should-not (plist-get pai-faux-last-options :reasoning)))
+      ;; set on :compact (the blocking /compact path)
+      (pai-faux-push '(:text "## Goal\nS2" :stop-reason stop))
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50
+                                    :scoped-thinking (:compact "low"))))
+        (should (pai--compact-now nil))
+        (should (eq (plist-get pai-faux-last-options :reasoning) 'low)))
+      ;; inherited from :main
+      (pai-faux-push '(:text "## Goal\nS3" :stop-reason stop))
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50
+                                    :scoped-thinking (:main "high"))))
+        (should (pai--compact-now nil))
+        (should (eq (plist-get pai-faux-last-options :reasoning) 'high))))))
+
+(ert-deftest pai-ui-mid-run-compaction-uses-the-compact-role-thinking ()
+  "The asynchronous compaction between turns passes the level too."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "elisp_eval"
+                                 :arguments (:form "(make-string 3000 ?x)")))
+                  :stop-reason tool-use)
+                 '(:text "PREFIX SUMMARY" :stop-reason stop)
+                 '(:text "done" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
+                                                  :compact-keep-recent-tokens 50
+                                                  :scoped-thinking (:compact "minimal")))
+            (seen nil))
+        (cl-letf* ((orig (symbol-function 'pai-faux-stream))
+                   ((symbol-function 'pai-faux-stream)
+                    (lambda (model ctx options emit)
+                      (push (plist-get options :reasoning) seen)
+                      (funcall orig model ctx options emit))))
+          (pai-ui-test--type-and-send "go")
+          (pai-ui-test--wait-idle))
+        (should (string-match-p "Compacted context" (buffer-string)))
+        ;; request order: turn 1, the summary, turn 2 -- only the summary
+        ;; thinks at the :compact level; the conversation keeps its own (off)
+        (should (equal (reverse seen) '(nil minimal nil)))))))
+
 (ert-deftest pai-ui-compact-during-run-is-queued-for-turn-boundary ()
   (pai-faux-reset)
   (pai-faux-push '(:tool-calls ((:id "c1" :name "bash" :arguments (:command "sleep 0.3; echo hi")))

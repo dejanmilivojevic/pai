@@ -216,7 +216,7 @@ Built-in commands (extensions, skills, and prompt templates add more):
 | `/help` `/tools` `/skills` | List commands, tools, discovered skills |
 | `/model [id]` | List or switch the model |
 | `/thinking [level]` | Show/set reasoning level (off…max) |
-| `/scoped-models [role id\|inherit]` | Per-role models (main/task/compact, plus extension roles); also in `/menu` → Model & Reasoning → Scoped models |
+| `/scoped-models [role id\|inherit [level]]`, `/scoped-models role thinking level\|inherit` | Per-role models and thinking levels (main/task/compact, plus extension roles such as the memory workers). An unset role inherits both along its fallback chain (e.g. memory roles → task → main); with no level set anywhere a role runs without thinking. Also in `/menu` → Model & Reasoning → Scoped models |
 | `/settings [menu/set/get/edit …]` | View or change settings (`menu` opens the Transient UI) |
 | `/compact` | Summarize + shrink the context |
 | `/new` `/resume` `/session` `/name` | Session lifecycle & info |

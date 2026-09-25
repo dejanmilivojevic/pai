@@ -473,11 +473,14 @@ summary must not become the context."
       (/ pai-compaction-summary-max-tokens 2)
     pai-compaction-summary-max-tokens))
 
-(defun pai-compaction--summarize-step (messages model instructions kind sync progress callback)
+(defun pai-compaction--summarize-step (messages model instructions kind sync progress callback
+                                                 &optional reasoning)
   "Summarize MESSAGES of KIND with MODEL, then call CALLBACK with the result.
-SYNC blocks until done; otherwise return the stream handle."
+SYNC blocks until done; otherwise return the stream handle.  REASONING is
+the thinking level (a symbol, nil for off) of the `:compact' role."
   (let ((ctx (pai-compaction--request messages instructions kind))
-        (opts (list :max-tokens (pai-compaction--max-tokens kind)))
+        (opts (append (list :max-tokens (pai-compaction--max-tokens kind))
+                      (when reasoning (list :reasoning reasoning))))
         (on-delta (pai-compaction--progress-handler progress)))
     (if sync
         (progn (funcall callback
@@ -493,13 +496,13 @@ SYNC blocks until done; otherwise return the stream handle."
              (setq done t)
              (funcall callback (pai-compaction--final-result (plist-get ev :message) kind)))))))))
 
-(defun pai-compaction-summarize (messages model &optional custom-instructions)
-  "Summarize MESSAGES with MODEL synchronously.
+(defun pai-compaction-summarize (messages model &optional custom-instructions reasoning)
+  "Summarize MESSAGES with MODEL synchronously, thinking at REASONING.
 Return (:text S :usage U); on failure :text is empty and :error explains."
   (let (out)
     (pai-compaction--summarize-step messages model custom-instructions 'history t
                                     pai-compaction-progress-function
-                                    (lambda (r) (setq out r)))
+                                    (lambda (r) (setq out r)) reasoning)
     (if (plist-get out :error) (append (list :text "") out) out)))
 
 ;;;; Summarizing what a cut drops
@@ -509,7 +512,7 @@ Return (:text S :usage U); on failure :text is empty and :error explains."
   (cond ((and a b) (pai-usage-add a b)) (t (or a b))))
 
 (defun pai-compaction-summarize-dropped (dropped kept model custom-instructions
-                                                 callback &optional sync progress)
+                                                 callback &optional sync progress reasoning)
   "Summarize the DROPPED messages of a cut that keeps KEPT, then call CALLBACK.
 Follows pi: when the cut splits a turn -- KEPT opens mid-turn and DROPPED
 holds that turn's user message -- the history before the turn and the turn's
@@ -517,7 +520,8 @@ prefix are summarized separately (the prefix with pi's turn-prefix prompt,
 so the original request survives) and merged.  CALLBACK receives
 \(:text S :usage U) or (:error MESSAGE).  SYNC blocks; otherwise the work is
 asynchronous and the return value is a function that cancels it (then
-CALLBACK receives (:error \"cancelled\")).  PROGRESS receives text chunks."
+CALLBACK receives (:error \"cancelled\")).  PROGRESS receives text chunks.
+REASONING is the thinking level (a symbol, nil for off) of every call."
   (let* ((all (append dropped kept))
          (ts (and kept (pai-compaction--split-turn all (length dropped))))
          (history (if ts (seq-take dropped ts) dropped))
@@ -538,7 +542,8 @@ CALLBACK receives (:error \"cancelled\")).  PROGRESS receives text chunks."
                                (lambda (r)
                                  (if (or (plist-get r :error) (plist-get state :cancelled))
                                      (funcall finish r)
-                                   (funcall k r)))))))))
+                                   (funcall k r)))
+                               reasoning))))))
     (cond
      ((null prefix)
       (funcall step history 'history finish))
@@ -610,8 +615,9 @@ The plan is (:system S :dropped D :kept K :cut-index N :tokens-before T)."
             :tokens-before (plist-get plan :tokens-before)
             :usage usage))))
 
-(defun pai-compact (messages model &optional custom-instructions)
+(defun pai-compact (messages model &optional custom-instructions reasoning)
   "Compact MESSAGES using MODEL.  Return a plist or nil when nothing to compact.
+REASONING is the summaries' thinking level (a symbol, nil for off).
 The plist is (:messages NEW-LIST :summary S :cut-index N :tokens-before T
 :usage U), where NEW-LIST is leading system messages, the summary message, and
 the kept recent messages."
@@ -619,12 +625,13 @@ the kept recent messages."
     (when plan
       (pai-compaction-summarize-dropped
        (plist-get plan :dropped) (plist-get plan :kept) model custom-instructions
-       (lambda (r) (setq out r)) t pai-compaction-progress-function)
+       (lambda (r) (setq out r)) t pai-compaction-progress-function reasoning)
       (unless (plist-get out :error)
         (pai-compaction--result plan (plist-get out :text) (plist-get out :usage))))))
 
-(defun pai-compact-async (messages model custom-instructions callback &optional progress)
+(defun pai-compact-async (messages model custom-instructions callback &optional progress reasoning)
   "Compact MESSAGES using MODEL without blocking; return a cancel function or nil.
+REASONING is the summaries' thinking level (a symbol, nil for off).
 CALLBACK is called once with the `pai-compact' result, with nil when there
 is nothing to compact (then before this returns), or with (:error MESSAGE)
 when summarizing failed or was cancelled.  PROGRESS receives summary text
@@ -640,7 +647,7 @@ chunks as they stream in."
                       r
                     (or (pai-compaction--result plan (plist-get r :text) (plist-get r :usage))
                         (list :error "the summary came back empty")))))
-       nil progress))))
+       nil progress reasoning))))
 
 ;;;; Context overflow (port of pi's isContextOverflow)
 
