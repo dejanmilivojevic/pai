@@ -743,6 +743,57 @@ itself a mode-line construct, where `%' starts a directive: an unescaped
   "Return the header line text, escaped for `header-line-format'."
   (pai--mode-line-escape (pai--header-line)))
 
+;;;; The host mode line, cached
+;;
+;; Emacs re-evaluates a window's mode line whenever it redraws the window --
+;; the header line's spinner, every chunk of streamed text, any overlay.  A
+;; rich global mode line (Spacemacs' spaceline) builds ~180 KB of strings per
+;; evaluation in Lisp, so a working pai window produced megabytes of garbage
+;; per second and a GC pause every few seconds.  In pai buffers the global
+;; mode line is therefore evaluated at most once per
+;; `pai-mode-line-cache-interval' per window, and again right after a
+;; command, a change of the selected window or a resize; other redraws reuse
+;; the string.
+
+(defcustom pai-mode-line-cache t
+  "Non-nil to cache the global mode line in pai buffers (see above).
+Nil evaluates it on every redraw, as other buffers do."
+  :type 'boolean :group 'pai)
+
+(defcustom pai-mode-line-cache-interval 1.0
+  "Seconds a cached mode line of a pai window is reused.
+Time-based segments (a clock) in pai windows lag by up to this much."
+  :type 'number :group 'pai)
+
+(defvar-local pai--mode-line-cache nil
+  "Cached global mode lines: alist WINDOW -> (TIME . STRING).")
+
+(defun pai--mode-line-invalidate (&rest _)
+  "Forget the cached mode lines of this buffer's windows."
+  (setq pai--mode-line-cache nil))
+
+(defun pai--mode-line-host ()
+  "Return the global mode line for the window being drawn, cached.
+During mode-line evaluation the window being drawn is the selected one."
+  (let* ((win (selected-window))
+         (hit (assq win pai--mode-line-cache))
+         (now (float-time)))
+    (if (and hit (< (- now (cadr hit)) pai-mode-line-cache-interval))
+        (cddr hit)
+      (let ((text (pai--mode-line-escape
+                   (format-mode-line (default-value 'mode-line-format) nil win))))
+        (setq pai--mode-line-cache
+              (cons (cons win (cons now text))
+                    (seq-filter (lambda (c) (and (not (eq (car c) win)) (window-live-p (car c))))
+                                pai--mode-line-cache)))
+        text))))
+
+(defun pai--mode-line-format ()
+  "Return the `mode-line-format' of a pai buffer."
+  (if pai-mode-line-cache
+      '((:eval (pai--mode-line-host)) (:eval (pai--mode-line-segment)))
+    (append (default-value 'mode-line-format) '((:eval (pai--mode-line-segment))))))
+
 (defun pai--mode-line-segment ()
   "Return the footer for the mode line, or \"\" when it shows above the prompt."
   (if (eq (pai-footer-position) 'mode-line)
@@ -2578,8 +2629,12 @@ a copy of the map, so the copies are updated too."
         (delete-overlay ov))))
   (use-local-map (copy-keymap pai-mode-map))
   (setq-local header-line-format '(:eval (pai--header-line-segment)))
-  (setq-local mode-line-format
-              (append (default-value 'mode-line-format) '((:eval (pai--mode-line-segment)))))
+  (setq-local mode-line-format (pai--mode-line-format))
+  ;; keep the cached mode line (see `pai--mode-line-host') current where it
+  ;; matters: after commands, when windows are selected or resized
+  (add-hook 'post-command-hook #'pai--mode-line-invalidate nil t)
+  (add-hook 'window-selection-change-functions #'pai--mode-line-invalidate nil t)
+  (add-hook 'window-size-change-functions #'pai--mode-line-invalidate nil t)
   (setq-local truncate-lines nil)
   ;; Terminal-style behaviour: the input line lives at the buffer's end and is
   ;; kept pinned to the bottom of the window.  A high `scroll-conservatively'

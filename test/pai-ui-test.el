@@ -409,6 +409,52 @@ first argument: accepting a value neither chains nor offers it again."
     (pai-compaction-summarize (list (pai-user-message "x")) (pai-model "faux"))
     (should (equal seen "abcdefgh"))))
 
+;;;; The cached host mode line
+
+(ert-deftest pai-ui-mode-line-is-cached-per-window ()
+  "The global mode line is evaluated at most once per interval per window."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (should (equal mode-line-format
+                     '((:eval (pai--mode-line-host)) (:eval (pai--mode-line-segment)))))
+      (let ((calls 0)
+            (pai-mode-line-cache-interval 60))
+        ;; batch Emacs has no mode line to format: stand in for spaceline
+        (cl-letf (((symbol-function 'format-mode-line)
+                   (lambda (&rest _) (cl-incf calls) (format "mode line #%d" calls))))
+          (setq pai--mode-line-cache nil)
+          (let ((a (pai--mode-line-host))
+                (b (pai--mode-line-host)))
+            (should (eq a b))            ; the second redraw reused it
+            (should (= calls 1))
+            ;; a command in the buffer (like a selection change or a resize)
+            ;; refreshes it
+            (run-hooks 'post-command-hook)
+            (should (equal (pai--mode-line-host) "mode line #2"))
+            ;; and so does age
+            (let ((pai-mode-line-cache-interval 0))
+              (should (equal (pai--mode-line-host) "mode line #3")))
+            ;; other windows get their own entry
+            (let ((other (split-window)))
+              (unwind-protect
+                  (with-selected-window other
+                    (should (equal (pai--mode-line-host) "mode line #4")))
+                (delete-window other)))))))))
+
+(ert-deftest pai-ui-mode-line-cache-escapes-percent ()
+  "A literal % in the global mode line is shown, not read as a directive."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (cl-letf (((symbol-function 'format-mode-line) (lambda (&rest _) (copy-sequence "load 42% done"))))
+        (setq pai--mode-line-cache nil)
+        (should (equal (pai--mode-line-host) "load 42%% done"))))))
+
+(ert-deftest pai-ui-mode-line-cache-can-be-turned-off ()
+  (let ((pai-mode-line-cache nil))
+    (should (equal (pai--mode-line-format)
+                   (append (default-value 'mode-line-format)
+                           '((:eval (pai--mode-line-segment))))))))
+
 ;;;; Compaction during a run
 
 (defun pai-ui-test--wait-idle (&optional seconds)
