@@ -37,6 +37,20 @@
 
 (cl-defstruct (pai-ext-api (:constructor pai-ext-api-create)) id)
 
+(defvar-local pai-subagent-session nil
+  "The parent chat buffer when this buffer is a subagent's session, else nil.
+Set before `pai--setup' by extensions that open subagent sessions; it
+survives the major mode.  Extensions that learn from the user's own
+sessions (pai-memory) leave such buffers alone.")
+(put 'pai-subagent-session 'permanent-local t)
+
+(defun pai-subagent-session-p (&optional buffer)
+  "Return non-nil when BUFFER (default current) is a subagent's session."
+  (let ((buffer (or buffer (current-buffer))))
+    (and (buffer-live-p buffer)
+         (buffer-local-value 'pai-subagent-session buffer)
+         t)))
+
 (defvar pai--extensions '()
   "Alist of (ID . FACTORY) for registered extensions, in registration order.")
 

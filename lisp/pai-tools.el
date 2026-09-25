@@ -42,6 +42,12 @@
   "Return a list of all registered tool plists."
   (hash-table-values pai--tools))
 
+(defun pai-tool-subagent-allowed-p (tool)
+  "Return non-nil unless TOOL is kept from subagents.
+A tool with `:subagent-exclude' non-nil (e.g. pai-memory's, which write to
+or search the user's own memory) is not given to subagent runs."
+  (not (plist-get tool :subagent-exclude)))
+
 (defun pai-tools-select (names)
   "Return the registered tool plists whose names are in NAMES (a list of strings)."
   (delq nil (mapcar #'pai-tool-get names)))

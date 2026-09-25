@@ -240,6 +240,21 @@
     (pai-ext-run-compact-async (list (pai-user-message "x")) nil (lambda (r) (setq got r)))
     (should (null got))))
 
+(ert-deftest pai-ext-subagent-session-marker-survives-the-mode ()
+  "Set before `pai--setup', the marker must survive `pai-mode'."
+  (let ((parent (current-buffer)))
+    (with-temp-buffer
+      (should-not (pai-subagent-session-p))
+      (setq pai-subagent-session parent)
+      (pai-mode)
+      (should (eq pai-subagent-session parent))
+      (should (pai-subagent-session-p)))
+    (should-not (pai-subagent-session-p parent))))
+
+(ert-deftest pai-tool-subagent-allowed-p-honours-the-flag ()
+  (should (pai-tool-subagent-allowed-p '(:name "read")))
+  (should-not (pai-tool-subagent-allowed-p '(:name "memory" :subagent-exclude t))))
+
 (ert-deftest pai-ext-run-compact-none ()
   (pai-ext-reset)
   (should-not (pai-ext-run-compact (list (pai-user-message "x")) nil)))
