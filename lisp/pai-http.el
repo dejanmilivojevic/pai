@@ -134,7 +134,10 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
                                 on-frame on-error on-close (timeout pai-request-timeout))
   "Start a streaming HTTP request to URL.
 METHOD defaults to POST.  HEADERS is an alist of (NAME . VALUE) strings.
-BODY, when non-nil, is sent as the raw request body via stdin.
+BODY, when non-nil, is sent as the raw request body via stdin: a string, or
+a list of strings sent one after the other (unibyte strings are sent as is,
+without the UTF-8 copy a multibyte string needs; see
+`pai-provider-encode-body').
 
 ON-FRAME is called with each SSE frame plist on a 2xx response.  ON-ERROR
 is called once with a descriptive string on any HTTP error (>=400) or
@@ -162,7 +165,8 @@ Return the process; kill it to abort the request."
                 :sentinel (lambda (p event)
                             (pai-http--sentinel st p event (process-exit-status p))))))
     (when body
-      (process-send-string proc body)
+      (dolist (piece (if (listp body) body (list body)))
+        (process-send-string proc piece))
       (process-send-eof proc))
     proc))
 

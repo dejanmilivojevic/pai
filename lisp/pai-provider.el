@@ -81,6 +81,82 @@ EMIT is called with each unified `AssistantMessageEvent'.  Return a handle
               (funcall stream-fn model context options emit)
             (pai-provider--http-stream provider model context options emit)))))))
 
+;;;; Request bodies
+;;
+;; A long session sends the whole transcript on every turn.  Encoding it anew
+;; each time -- `json-serialize' plus the UTF-8 copy `process-send-string'
+;; makes of a multibyte string -- produced several megabytes of garbage per
+;; turn, and with it a GC pause every few turns.  The conversation array is
+;; therefore encoded element by element: every element's JSON is kept as a
+;; unibyte UTF-8 fragment, and the body is sent to curl as a list of pieces.
+;; Unchanged messages then cost nothing: no serializing, no concatenation, no
+;; encoding (a unibyte string is sent as is).
+
+(defconst pai-provider--conversation-keys '(:messages :contents :input)
+  "Body keys that may hold the conversation array, in order of preference.")
+
+(defconst pai-provider--marker "pai-conversation-placeholder-7f3e2c9a4b51d086"
+  "Placeholder encoded in place of the conversation array.")
+
+(defconst pai-provider--comma (encode-coding-string "," 'utf-8))
+(defconst pai-provider--open (encode-coding-string "[" 'utf-8))
+(defconst pai-provider--close (encode-coding-string "]" 'utf-8))
+
+(defvar-local pai-provider--fragments nil
+  "Encoded conversation elements: ELEMENT (compared with `equal') -> (JSON . GEN).
+JSON is the element's unibyte UTF-8 encoding; GEN the last request using it.")
+
+(defvar-local pai-provider--generation 0
+  "Number of request bodies encoded in this buffer.")
+
+(defconst pai-provider-fragment-generations 4
+  "Encoded elements unused for this many requests are dropped.
+More than one, so runs sharing a buffer (a subagent next to the main
+run) keep each other's entries.")
+
+(defun pai-provider--utf8 (string)
+  "Return STRING as a unibyte UTF-8 string (a new string)."
+  (encode-coding-string string 'utf-8))
+
+(defun pai-provider-encode-body (body)
+  "Encode request BODY as JSON; return a list of unibyte strings to send in order.
+Their concatenation is exactly the UTF-8 encoding of `pai-json-encode' of
+BODY.  The conversation array (see `pai-provider--conversation-keys') is
+encoded element by element with each element's JSON cached in this buffer,
+so a turn only encodes what changed."
+  (let ((key (and (consp body) (keywordp (car body))
+                  (seq-find (lambda (k) (let ((v (plist-get body k))) (and (consp v) (cdr v))))
+                            pai-provider--conversation-keys))))
+    (if (not key)
+        (list (pai-provider--utf8 (pai-json-encode body)))
+      (let* ((cache (or pai-provider--fragments
+                        (setq pai-provider--fragments (make-hash-table :test 'equal))))
+             (gen (setq pai-provider--generation (1+ pai-provider--generation)))
+             (envelope (pai-provider--utf8
+                        (pai-json-encode (plist-put (copy-sequence body) key pai-provider--marker))))
+             (quoted (concat "\"" pai-provider--marker "\""))
+             (at (string-search quoted envelope))
+             ;; built in reverse, see the `nreverse' below
+             (pieces (list pai-provider--open (substring envelope 0 at))))
+        (let ((first t))
+          (dolist (element (plist-get body key))
+            (let ((hit (gethash element cache)))
+              (if hit
+                  (setcdr hit gen)
+                (setq hit (cons (pai-provider--utf8 (pai-json-encode element)) gen))
+                (puthash element hit cache))
+              (unless first (push pai-provider--comma pieces))
+              (setq first nil)
+              (push (car hit) pieces))))
+        (push pai-provider--close pieces)
+        (push (substring envelope (+ at (length quoted))) pieces)
+        ;; forget elements no recent request used
+        (maphash (lambda (k v)
+                   (when (< (cdr v) (- gen pai-provider-fragment-generations))
+                     (remhash k cache)))
+                 cache)
+        (nreverse pieces)))))
+
 (defun pai-provider--http-stream (provider model context options emit)
   "Run the HTTP streaming path for PROVIDER in the originating buffer.
 Discard deferred parser callbacks if that buffer has been killed."
@@ -93,7 +169,7 @@ Discard deferred parser callbacks if that buffer has been killed."
          (body (plist-get req :body))
          (body-str (cond ((null body) nil)
                          ((stringp body) body)
-                         (t (pai-json-encode body))))
+                         (t (pai-provider-encode-body body))))
          (errored nil))
     (pai-http-stream
      :url (plist-get req :url)

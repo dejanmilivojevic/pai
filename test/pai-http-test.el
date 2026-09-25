@@ -86,6 +86,43 @@ The plist has :frames (list), :error (string or nil), :closed (bool)."
     (should (plist-get result :closed))
     (should (equal (plist-get (car (plist-get result :frames)) :data) "ok"))))
 
+(ert-deftest pai-http-sends-a-body-given-as-pieces ()
+  "A list body is sent piece by piece; the server receives the exact bytes."
+  (let* ((received nil)
+         (proc (make-network-process
+                :name "pai-http-test-body" :server t :host 'local :service t
+                :family 'ipv4 :coding 'binary :noquery t
+                :filter
+                (lambda (conn chunk)
+                  (let* ((acc (concat (or (process-get conn 'acc) "") chunk))
+                         (head-end (string-search "\r\n\r\n" acc))
+                         (len (and head-end
+                                   (string-match "[Cc]ontent-[Ll]ength: *\\([0-9]+\\)" acc)
+                                   (string-to-number (match-string 1 acc)))))
+                    (process-put conn 'acc acc)
+                    (when (and len (>= (- (length acc) head-end 4) len)
+                               (not (process-get conn 'replied)))
+                      (process-put conn 'replied t)
+                      (setq received (substring acc (+ head-end 4)))
+                      (process-send-string conn "HTTP/1.1 200 OK\r\n\r\ndata: ok\n\n")
+                      (process-send-eof conn))))))
+         (port (cadr (process-contact proc)))
+         (pieces (list (encode-coding-string "{\"a\":[" 'utf-8)
+                       (encode-coding-string "\"café ☕\"" 'utf-8)
+                       (encode-coding-string ",1]}" 'utf-8)))
+         (closed nil))
+    (unwind-protect
+        (progn
+          (pai-http-stream :url (format "http://127.0.0.1:%d/" port) :body pieces
+                           :on-close (lambda (_) (setq closed t)))
+          (let ((deadline (+ (float-time) 10)))
+            (while (and (not closed) (< (float-time) deadline))
+              (accept-process-output nil 0.05)))
+          (should closed)
+          (should (equal received (apply #'concat pieces)))
+          (should (equal (decode-coding-string received 'utf-8) "{\"a\":[\"café ☕\",1]}")))
+      (delete-process proc))))
+
 ;;;; Full stack: real curl -> Anthropic parser -> agent loop
 
 (require 'pai-core)
