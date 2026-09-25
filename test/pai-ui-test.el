@@ -449,6 +449,28 @@ first argument: accepting a value neither chains nor offers it again."
       (switch-to-buffer (get-buffer-create "*scratch*"))
       (should (eq (pai dir) b)))))
 
+(ert-deftest pai-ui-m-x-pai-from-a-chat-opens-another ()
+  "Interactively, `pai' in a chat opens a new instance; elsewhere it goes back."
+  (pai-ui-test--with-project dir
+    (let ((a (pai dir)) b)
+      ;; from inside the chat: another instance
+      (with-current-buffer a
+        (setq b (call-interactively #'pai)))
+      (should (buffer-live-p b))
+      (should-not (eq a b))
+      (should (eq (buffer-local-value 'major-mode b) 'pai-mode))
+      ;; from another buffer: back to the most recent chat
+      (with-temp-buffer
+        (setq default-directory dir)
+        (should (eq (call-interactively #'pai) b)))
+      ;; from a subagent's chat: no new instance, back to the user's own
+      (let ((child (generate-new-buffer "*pai: child*")))
+        (with-current-buffer child
+          (setq pai-subagent-session a)
+          (pai--setup dir)
+          (should-not (pai--in-own-chat-p))
+          (should (memq (call-interactively #'pai) (list a b))))))))
+
 (ert-deftest pai-ui-pai-never-picks-a-subagent-session ()
   (pai-ui-test--with-project dir
     (let* ((mine (pai dir))

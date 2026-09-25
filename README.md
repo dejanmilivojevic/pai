@@ -181,8 +181,8 @@ lists, tables and code blocks survive, and only long prose lines are wrapped.
 
 ## Usage
 
-- `M-x pai` — open (or go back to) the chat for the current project; `C-u M-x pai`
-  opens another instance.
+- `M-x pai` — open (or go back to) the chat for the current project. Run from a pai
+  chat (or with `C-u`) it opens another instance instead.
 - `M-x pai-new-session` — open another instance (a fresh session buffer) in a window
   of its own. Run as many instances as you like, for one project or several; each
   has its own session, settings and extension state.

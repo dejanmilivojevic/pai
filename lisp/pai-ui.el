@@ -2827,13 +2827,18 @@ The current chat stays visible next to it."
                            display-buffer-use-some-window)
                           (inhibit-same-window . t))))
 
+(defun pai--in-own-chat-p ()
+  "Return non-nil when the current buffer is one of the user's pai chats."
+  (and (eq major-mode 'pai-mode) (not (pai-subagent-session-p))))
+
 ;;;###autoload
 (defun pai (&optional cwd new)
   "Open the pai agent chat for CWD (default `default-directory').
-Go back to the project's most recently used instance, or start one.  With
-a prefix argument (NEW) always open another instance, see
-`pai-new-session'; `pai-switch' picks among open ones."
-  (interactive (list nil current-prefix-arg))
+Go back to the project's most recently used instance, or start one.
+Interactively, run from a pai chat or with a prefix argument, open
+another instance instead (NEW), in a window of its own -- so running
+`pai' again gives you another chat.  `pai-switch' picks among open ones."
+  (interactive (list nil (or current-prefix-arg (pai--in-own-chat-p))))
   (let* ((dir (pai--dir (or cwd default-directory)))
          (existing (and (not new) (car (pai-instances dir)))))
     (if (not existing)
