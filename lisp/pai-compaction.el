@@ -143,14 +143,27 @@ a touch early."
       n))
    (t 0)))
 
+(defvar pai-compaction--token-cache (make-hash-table :test 'eq :weakness 'key)
+  "Token estimates of messages: MESSAGE -> (CONTENT CHARS-PER-TOKEN . TOKENS).
+The header, compaction and memory re-estimate the whole transcript several
+times per turn; completed messages never change, so their estimate is kept
+(weakly, so dropped messages are collected).  An entry only counts while the
+message still holds the same `:content' list and the chars-per-token ratio
+is unchanged.")
+
 (defun pai-estimate-tokens (message)
   "Estimate the token count of MESSAGE.
 Counts every block the provider serializers actually send, at
-`pai-estimate-chars-per-token' characters per token."
-  (pai-estimate-tokens-from-chars
-   (pcase (pai-message-role message)
-     ('tool-result (pai-compaction--content-chars (plist-get message :content)))
-     (_ (pai-compaction--content-chars (pai-message-content message))))))
+`pai-estimate-chars-per-token' characters per token.  Memoized per message
+object (see `pai-compaction--token-cache')."
+  (let* ((content (plist-get message :content))
+         (hit (gethash message pai-compaction--token-cache)))
+    (if (and hit (eq (car hit) content) (eql (cadr hit) pai-estimate-chars-per-token))
+        (cddr hit)
+      (let ((tokens (pai-estimate-tokens-from-chars (pai-compaction--content-chars content))))
+        (puthash message (cons content (cons pai-estimate-chars-per-token tokens))
+                 pai-compaction--token-cache)
+        tokens))))
 
 (defun pai-compaction--usage-report-p (message)
   "Return non-nil when MESSAGE carries a usable provider usage report."
@@ -234,14 +247,29 @@ the messages, so they count toward the real context size.  TOOLS is a list of
 tool plists as returned by `pai-tools-all'."
   (let ((chars 0))
     (dolist (tool tools)
-      (let ((decl (pai-tool-declaration tool)))
-        (cl-incf chars (length (or (plist-get decl :name) "")))
-        (cl-incf chars (length (or (plist-get decl :description) "")))
-        (cl-incf chars (length (condition-case nil
-                                   (pai-json-encode (or (plist-get decl :parameters)
-                                                        (pai-json-empty-object)))
-                                 (error ""))))))
+      (cl-incf chars (pai-compaction--tool-chars tool)))
     (pai-estimate-tokens-from-chars chars)))
+
+(defvar pai-compaction--tool-chars-cache (make-hash-table :test 'eq :weakness 'key)
+  "Declaration size of tools: TOOL -> (DECLARATION . CHARS).
+The header re-estimates the tools after every message; their JSON schemas
+only change when a tool is re-registered (a new plist) or revealed (a new
+declaration).")
+
+(defun pai-compaction--tool-chars (tool)
+  "Return the characters TOOL's provider declaration contributes (memoized)."
+  (let* ((decl (pai-tool-declaration tool))
+         (hit (gethash tool pai-compaction--tool-chars-cache)))
+    (if (and hit (equal (car hit) decl))
+        (cdr hit)
+      (let ((chars (+ (length (or (plist-get decl :name) ""))
+                      (length (or (plist-get decl :description) ""))
+                      (length (condition-case nil
+                                  (pai-json-encode (or (plist-get decl :parameters)
+                                                       (pai-json-empty-object)))
+                                (error ""))))))
+        (puthash tool (cons decl chars) pai-compaction--tool-chars-cache)
+        chars))))
 
 (defun pai-estimate-total-context-tokens (messages &optional tools)
   "Estimate total context tokens for MESSAGES including TOOLS declarations.

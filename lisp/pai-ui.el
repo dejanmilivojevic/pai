@@ -545,14 +545,19 @@ plus the tool declarations sent on every request."
   pai--context-tokens)
 
 (defun pai--update-usage (messages)
-  "Accumulate usage from MESSAGES, update the session cost, re-estimate context."
+  "Accumulate usage from MESSAGES, update the session cost, re-estimate context.
+MESSAGES were just committed (and appended to the session), so their cost is
+added to the running total; without MESSAGES the total is recomputed from
+the whole session file (after a load, import or branch switch).  Re-pricing
+every message after each commit was a steady source of garbage in long
+sessions."
   (require 'pai-compaction)
   (dolist (m messages)
     (when (pai-assistant-message-p m)
       (setq pai--usage-total (pai-usage-add (or pai--usage-total (pai-usage))
                                             (or (plist-get m :usage) (pai-usage))))
-      (unless pai--session (pai--add-message-cost m))))
-  (when pai--session (pai--recompute-cost))
+      (pai--add-message-cost m)))
+  (when (and pai--session (null messages)) (pai--recompute-cost))
   (pai--refresh-context-tokens))
 
 ;;;; Session cost

@@ -305,6 +305,46 @@ the meter collapse."
     (should-not (seq-find #'pai-tool-result-message-p new))
     (should-not (plist-get (car new) :deferred-schemas))))
 
+;;;; Memoized estimates (long sessions re-estimate the transcript every turn)
+
+(ert-deftest pai-compaction-token-estimate-is-memoized-and-invalidated ()
+  (let* ((pai-estimate-chars-per-token 3)
+         (m (pai-assistant-message :content (list (pai-text (make-string 300 ?a)))))
+         (calls 0))
+    (cl-letf* ((orig (symbol-function 'pai-compaction--content-chars))
+               ((symbol-function 'pai-compaction--content-chars)
+                (lambda (c) (cl-incf calls) (funcall orig c))))
+      (should (= (pai-estimate-tokens m) 100))
+      (should (= (pai-estimate-tokens m) 100))
+      (should (= calls 1))                ; the second one was a hit
+      ;; new content (a new list) is re-estimated
+      (plist-put m :content (list (pai-text (make-string 600 ?b))))
+      (should (= (pai-estimate-tokens m) 200))
+      (should (= calls 2))
+      ;; so is a changed chars-per-token ratio
+      (let ((pai-estimate-chars-per-token 4))
+        (should (= (pai-estimate-tokens m) 150)))
+      (should (= calls 3))
+      ;; equal but distinct messages are separate entries
+      (should (= (pai-estimate-tokens (copy-sequence m)) 200))
+      (should (= calls 4)))))
+
+(ert-deftest pai-compaction-tool-token-estimate-is-memoized ()
+  (let* ((tool (list :name "t1" :description "does things" :deferred nil
+                     :parameters (pai-object-schema (list :x (pai-string-schema "X.")))))
+         (encodes 0))
+    (cl-letf* ((orig (symbol-function 'pai-json-encode))
+               ((symbol-function 'pai-json-encode)
+                (lambda (v) (cl-incf encodes) (funcall orig v))))
+      (let ((a (pai-estimate-tool-tokens (list tool)))
+            (b (pai-estimate-tool-tokens (list tool))))
+        (should (= a b))
+        (should (= encodes 1))
+        ;; a changed declaration is measured again
+        (plist-put tool :description (make-string 300 ?d))
+        (should (> (pai-estimate-tool-tokens (list tool)) a))
+        (should (= encodes 2))))))
+
 ;;;; Mid-run compaction (pi's split turn)
 
 (defun pai-compaction-test--long-run (n)
