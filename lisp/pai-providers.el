@@ -190,27 +190,74 @@ This does not discover models; call `pai-models-refresh' separately."
                              (error-message-string err)) errors))))
     (nreverse errors)))
 
+(defun pai-providers--curl-args (url header-file)
+  "Return curl arguments for a bounded discovery GET of URL.
+Headers are read from HEADER-FILE (see `pai-http-header-file'), so API keys
+stay out of the command line."
+  (append '("--silent" "--show-error" "--fail"
+            "--connect-timeout" "5" "--max-time" "15"
+            "--max-filesize" "8388608")
+          (when header-file (list "--header" (concat "@" header-file)))
+          (list "--url" url)))
+
 (defun pai-providers--get-json (url headers)
-  "GET URL with HEADERS using bounded curl; decode JSON or signal an error."
-  (let ((stderr (make-temp-file "pai-model-discovery-")))
+  "GET URL with HEADERS using bounded curl; decode JSON or signal an error.
+This blocks; `pai-providers--get-json-async' does not."
+  (let ((stderr (make-temp-file "pai-model-discovery-"))
+        (header-file (pai-http-header-file headers)))
     (unwind-protect
         (with-temp-buffer
-          (let* ((args (append '("--silent" "--show-error" "--fail"
-                                 "--connect-timeout" "5" "--max-time" "15"
-                                 "--max-filesize" "8388608")
-                               (cl-mapcan (lambda (header)
-                                            (list "--header" (concat (car header) ": " (cdr header))))
-                                          headers)
-                               (list "--url" url)))
-                 (status (apply #'call-process pai-curl-program nil
-                                (list (current-buffer) stderr) nil args)))
+          (let ((status (apply #'call-process pai-curl-program nil
+                               (list (current-buffer) stderr) nil
+                               (pai-providers--curl-args url header-file))))
             (unless (and (integerp status) (zerop status))
               (error "Model discovery HTTP request failed (%s): %s" status
                      (with-temp-buffer
                        (insert-file-contents stderr)
                        (string-trim (buffer-string)))))
             (pai-json-decode (buffer-string))))
-      (delete-file stderr))))
+      (delete-file stderr)
+      (when header-file (ignore-errors (delete-file header-file))))))
+
+(defun pai-providers--get-json-async (url headers k)
+  "GET URL with HEADERS without blocking; call K with the outcome.
+The outcome is (ok . JSON) or (error . ERROR), ERROR a condition as
+`condition-case' binds it."
+  (let* ((header-file (pai-http-header-file headers))
+         (out (generate-new-buffer " *pai-discovery*"))
+         (err (generate-new-buffer " *pai-discovery-err*"))
+         ;; an explicit, quiet stderr pipe: the default one writes its own
+         ;; status lines into ERR and would ask before its buffer is killed
+         (err-pipe (make-pipe-process :name "pai-discovery-err" :buffer err
+                                      :noquery t :sentinel #'ignore))
+         (finish
+          (lambda (outcome)
+            (when header-file (ignore-errors (delete-file header-file)))
+            (delete-process err-pipe)
+            (kill-buffer out)
+            (kill-buffer err)
+            (funcall k outcome))))
+    (condition-case e
+        (make-process
+         :name "pai-discovery"
+         :command (cons pai-curl-program (pai-providers--curl-args url header-file))
+         :buffer out :stderr err-pipe :noquery t :connection-type 'pipe
+         :coding 'utf-8
+         :sentinel
+         (lambda (p _event)
+           (when (memq (process-status p) '(exit signal))
+             (let ((status (process-exit-status p)))
+               ;; collect what is left of stderr
+               (while (accept-process-output err-pipe 0.05))
+               (funcall
+                finish
+                (condition-case e
+                    (if (zerop status)
+                        (cons 'ok (with-current-buffer out (pai-json-decode (buffer-string))))
+                      (error "Model discovery HTTP request failed (%s): %s" status
+                             (with-current-buffer err (string-trim (buffer-string)))))
+                  (error (cons 'error e))))))))
+      (error (funcall finish (cons 'error e))))))
 
 (defun pai-providers--token-limit (item keys)
   "Return the first positive integer token limit among KEYS in ITEM, or nil.
@@ -310,11 +357,9 @@ prompt, completion, input_cache_read, input_cache_write."
                           :cache-write (funcall rate :input_cache_write))))
         (and (pai-model-rates-nonzero-p rates) rates)))))
 
-(defun pai-providers--list-models (provider)
-  "Discover PROVIDER's models via its supported HTTP API.
-Pagination is bounded to 100 pages and repeated cursors are rejected."
+(defun pai-providers--discovery-headers (provider)
+  "Return the discovery request headers for PROVIDER."
   (let* ((api (pai--api-symbol (plist-get provider :api)))
-         (base (pai-providers--url (plist-get provider :base-url)))
          (key (pai-api-key (plist-get provider :id)))
          (anthropic-oauth (and (eq api 'anthropic-messages)
                                (stringp key) (string-search "sk-ant-oat" key)))
@@ -328,70 +373,130 @@ Pagination is bounded to 100 pages and repeated cursors are rejected."
                    (when (eq api 'anthropic-messages)
                      (list (cons "anthropic-version" pai-anthropic-version)))
                    (when anthropic-oauth
-                     (list (cons "anthropic-beta" pai-anthropic-oauth-beta)))))
-         (page 0) cursor seen models done)
-    (while (not done)
-      (when (>= page 100) (error "Model discovery exceeded 100 pages"))
-      (cl-incf page)
-      (let* ((url (concat base "/models"
-                          (pcase api
-                            ('anthropic-messages
-                             (concat "?limit=1000" (when cursor (concat "&after_id=" (url-hexify-string cursor)))))
-                            ('google-generative-ai
-                             (concat "?pageSize=1000" (when cursor (concat "&pageToken=" (url-hexify-string cursor)))))
-                            (_ ""))))
-             (response (pai-providers--get-json url headers))
-             (field (if (eq api 'google-generative-ai) :models :data))
-             (items (plist-get response field)))
-        (unless (and (plist-member response field) (listp items))
-          (error "Malformed model discovery response: missing model array"))
-        (dolist (item items)
-          (when (or (not (eq api 'google-generative-ai))
-                    (member "generateContent" (plist-get item :supportedGenerationMethods)))
-            (let ((id (if (eq api 'google-generative-ai)
-                          (string-remove-prefix "models/" (or (plist-get item :name) ""))
-                        (plist-get item :id))))
-              (unless (and (stringp id) (not (string-empty-p id)))
-                (error "Malformed discovered model ID"))
-              (push (append (list :id id)
-                            (when-let* ((name (or (plist-get item :displayName)
-                                                (plist-get item :display_name))))
-                              (list :name name))
-                            ;; Context window, in each API's own spelling:
-                            ;; Anthropic `max_input_tokens', Gemini
-                            ;; `inputTokenLimit', OpenAI-compatible
-                            ;; `context_length', vLLM `max_model_len'.
-                            ;; Left absent when undeclared so
-                            ;; `pai-providers--apply-context-window-floor' can
-                            ;; fill it from the provider's own smallest window.
-                            (when-let* ((limit (pai-providers--token-limit
-                                                item '(:max_input_tokens :inputTokenLimit
-                                                       :context_length :max_model_len))))
-                              (list :context-window limit))
-                            (when-let* ((limit (pai-providers--token-limit
-                                                item '(:max_output_tokens :outputTokenLimit
-                                                       :max_tokens))))
-                              (list :max-tokens limit))
-                            ;; OpenRouter-style per-token prices; a listed
-                            ;; price of zero is a known free model
-                            (let ((cost (pai-providers--pricing item)))
-                              (cond (cost (list :cost cost))
-                                    ((plist-get item :pricing) (list :free t)))))
-                    models))))
-        (setq cursor
-              (pcase api
-                ('anthropic-messages
-                 (when (eq (plist-get response :has_more) t)
-                   (or (plist-get response :last_id)
-                       (error "Missing Anthropic pagination cursor"))))
-                ('google-generative-ai (plist-get response :nextPageToken))))
-        (when (or (eq cursor :null) (equal cursor "")) (setq cursor nil))
-        (when cursor
-          (unless (stringp cursor) (error "Invalid model pagination cursor"))
-          (when (member cursor seen) (error "Repeated model pagination cursor"))
-          (push cursor seen))
-        (setq done (null cursor))))
-    (pai-providers--apply-context-window-floor (nreverse models))))
+                     (list (cons "anthropic-beta" pai-anthropic-oauth-beta))))))
+    headers))
+
+(defun pai-providers--list-models-k (provider fetch k)
+  "Discover PROVIDER's models via its HTTP API; call K with the outcome.
+FETCH is called as (FETCH URL HEADERS K2) and calls K2 with (ok . JSON)
+or (error . ERROR), now or later.  K receives (ok . MODEL-SPECS) or
+\(error . ERROR).  Pagination is bounded to 100 pages and repeated cursors
+are rejected."
+  (let* ((api (pai--api-symbol (plist-get provider :api)))
+         (base (pai-providers--url (plist-get provider :base-url)))
+         (headers (pai-providers--discovery-headers provider))
+         (page 0) cursor seen models)
+    (cl-labels
+        ((url-for ()
+           (concat base "/models"
+                   (pcase api
+                     ('anthropic-messages
+                      (concat "?limit=1000" (when cursor (concat "&after_id=" (url-hexify-string cursor)))))
+                     ('google-generative-ai
+                      (concat "?pageSize=1000" (when cursor (concat "&pageToken=" (url-hexify-string cursor)))))
+                     (_ ""))))
+         (next ()
+           (if (>= page 100)
+               (funcall k (list 'error 'error "Model discovery exceeded 100 pages"))
+             (cl-incf page)
+             (funcall fetch (url-for) headers #'got)))
+         (got (outcome)
+           ;; parse outside of K, so an error in K is not taken for ours
+           (let ((result
+                  (if (eq (car outcome) 'error)
+                      outcome
+                    (condition-case e
+                        (let* ((response (cdr outcome))
+                               (field (if (eq api 'google-generative-ai) :models :data))
+                               (items (plist-get response field)))
+                          (unless (and (plist-member response field) (listp items))
+                            (error "Malformed model discovery response: missing model array"))
+                          (dolist (item items)
+                            (when (or (not (eq api 'google-generative-ai))
+                                      (member "generateContent" (plist-get item :supportedGenerationMethods)))
+                              (let ((id (if (eq api 'google-generative-ai)
+                                            (string-remove-prefix "models/" (or (plist-get item :name) ""))
+                                          (plist-get item :id))))
+                                (unless (and (stringp id) (not (string-empty-p id)))
+                                  (error "Malformed discovered model ID"))
+                                (push (append (list :id id)
+                                              (when-let* ((name (or (plist-get item :displayName)
+                                                                  (plist-get item :display_name))))
+                                                (list :name name))
+                                              ;; Context window, in each API's own spelling:
+                                              ;; Anthropic `max_input_tokens', Gemini
+                                              ;; `inputTokenLimit', OpenAI-compatible
+                                              ;; `context_length', vLLM `max_model_len'.
+                                              ;; Left absent when undeclared so
+                                              ;; `pai-providers--apply-context-window-floor' can
+                                              ;; fill it from the provider's own smallest window.
+                                              (when-let* ((limit (pai-providers--token-limit
+                                                                  item '(:max_input_tokens :inputTokenLimit
+                                                                         :context_length :max_model_len))))
+                                                (list :context-window limit))
+                                              (when-let* ((limit (pai-providers--token-limit
+                                                                  item '(:max_output_tokens :outputTokenLimit
+                                                                         :max_tokens))))
+                                                (list :max-tokens limit))
+                                              ;; OpenRouter-style per-token prices; a listed
+                                              ;; price of zero is a known free model
+                                              (let ((cost (pai-providers--pricing item)))
+                                                (cond (cost (list :cost cost))
+                                                      ((plist-get item :pricing) (list :free t)))))
+                                      models))))
+                          (setq cursor
+                                (pcase api
+                                  ('anthropic-messages
+                                   (when (eq (plist-get response :has_more) t)
+                                     (or (plist-get response :last_id)
+                                         (error "Missing Anthropic pagination cursor"))))
+                                  ('google-generative-ai (plist-get response :nextPageToken))))
+                          (when (or (eq cursor :null) (equal cursor "")) (setq cursor nil))
+                          (when cursor
+                            (unless (stringp cursor) (error "Invalid model pagination cursor"))
+                            (when (member cursor seen) (error "Repeated model pagination cursor"))
+                            (push cursor seen))
+                          (if cursor 'more
+                            (cons 'ok (pai-providers--apply-context-window-floor
+                                       (reverse models)))))
+                      (error (cons 'error e))))))
+             (if (eq result 'more) (next) (funcall k result)))))
+      (next))))
+
+(defun pai-providers--list-models (provider)
+  "Discover PROVIDER's models via its HTTP API, blocking; signal on failure."
+  (let (result)
+    (pai-providers--list-models-k
+     provider
+     (lambda (url headers k)
+       (funcall k (condition-case e (cons 'ok (pai-providers--get-json url headers))
+                    (error (cons 'error e)))))
+     (lambda (outcome) (setq result outcome)))
+    (if (eq (car result) 'ok)
+        (cdr result)
+      (signal (car (cdr result)) (cdr (cdr result))))))
+
+(defun pai-providers--install (id provider callback specs)
+  "Replace provider ID's discovered models with SPECS.
+PROVIDER is its plist; CALLBACK its :list-models function, if any."
+  (let ((built (mapcar (lambda (spec)
+                         (cons (pai-providers--model spec provider callback) spec))
+                       specs)))
+    (pai-providers--restore pai-providers--discovered pai--models id)
+    (pcase-dolist (`(,model . ,spec) built)
+      (let* ((key (pai-model-key model))
+             (owned (gethash key pai-providers--discovered))
+             (previous (if owned (cdr owned) (gethash key pai--models)))
+             (merged (if previous
+                         (pai-providers--merge-previous model spec previous)
+                       model)))
+        (pai-register-model merged)
+        (puthash key (cons merged previous) pai-providers--discovered)))))
+
+(defun pai-providers--discoverable-p (provider)
+  "Return non-nil when PROVIDER supports model discovery."
+  (or (plist-get provider :list-models)
+      (and (plist-get provider :api) (plist-get provider :base-url))))
 
 (defun pai-providers-discover (id provider)
   "Discover models for PROVIDER (registered as ID); signal an error on failure.
@@ -399,31 +504,42 @@ Use its :list-models callback, otherwise its :api/:base-url metadata.  All
 network calls and validation finish before the cached set is replaced; the
 provider's explicit models and fallback metadata are retained.  Return non-nil
 when the provider supports discovery."
-  (let ((callback (plist-get provider :list-models)))
-    (when (or callback (and (plist-get provider :api) (plist-get provider :base-url)))
-      (let* ((specs (if callback (funcall callback provider)
-                      (pai-providers--list-models provider)))
-             (built (mapcar (lambda (spec)
-                              (cons (pai-providers--model spec provider callback) spec))
-                            specs)))
-        (pai-providers--restore pai-providers--discovered pai--models id)
-        (pcase-dolist (`(,model . ,spec) built)
-          (let* ((key (pai-model-key model))
-                 (owned (gethash key pai-providers--discovered))
-                 (previous (if owned (cdr owned) (gethash key pai--models)))
-                 (merged (if previous
-                             (pai-providers--merge-previous model spec previous)
-                           model)))
-            (pai-register-model merged)
-            (puthash key (cons merged previous) pai-providers--discovered))))
-      t)))
+  (when (pai-providers--discoverable-p provider)
+    (let* ((callback (plist-get provider :list-models))
+           (specs (if callback (funcall callback provider)
+                    (pai-providers--list-models provider))))
+      (pai-providers--install id provider callback specs))
+    t))
+
+(defun pai-providers-discover-async (id provider k)
+  "Like `pai-providers-discover' for PROVIDER (ID), without blocking.
+Call K with nil on success or an error string, in the buffer current now
+\(registries are per instance).  A :list-models callback is still called
+synchronously; HTTP discovery runs in the background."
+  (let ((buffer (current-buffer))
+        (callback (plist-get provider :list-models)))
+    (cl-flet ((finish (outcome)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (funcall k (if (eq (car outcome) 'ok)
+                                   (condition-case e
+                                       (progn (pai-providers--install id provider callback (cdr outcome))
+                                              nil)
+                                     (error (format "%s: %s" id (error-message-string e))))
+                                 (format "%s: %s" id (error-message-string (cdr outcome)))))))))
+      (condition-case e
+          (if callback
+              (finish (cons 'ok (funcall callback provider)))
+            (pai-providers--list-models-k provider #'pai-providers--get-json-async #'finish))
+        (error (finish (cons 'error e)))))))
 
 (defun pai-models-refresh ()
   "Discover models for registered providers; return a list of error strings.
 Use :list-models callbacks first, otherwise supported :api/:base-url metadata.
 Failures preserve cached and explicit models.  Successful discovery replaces
 that provider's discovered set, retaining explicitly registered metadata and
-fallback models.  Providers without discovery support are left unchanged."
+fallback models.  Providers without discovery support are left unchanged.
+This blocks until every provider answered; see `pai-models-refresh-async'."
   (let (errors)
     (maphash
      (lambda (id provider)
@@ -432,6 +548,35 @@ fallback models.  Providers without discovery support are left unchanged."
          (error (push (format "%s: %s" id (error-message-string err)) errors))))
      pai--providers)
     (nreverse errors)))
+
+(defun pai-models-refresh-async (&optional callback)
+  "Discover models for every registered provider in the background.
+Providers are queried concurrently; CALLBACK, when non-nil, is called in
+this buffer with the list of error strings once all of them answered."
+  (let ((pending 0) (errors '()) (buffer (current-buffer)) (started nil))
+    (cl-flet ((one-done (err)
+                (when err (push err errors))
+                (setq pending (1- pending))
+                (when (and started (= pending 0) callback (buffer-live-p buffer))
+                  (with-current-buffer buffer (funcall callback (nreverse errors))))))
+      (maphash (lambda (id provider)
+                 (when (pai-providers--discoverable-p provider)
+                   (setq pending (1+ pending))
+                   (pai-providers-discover-async id provider #'one-done)))
+               pai--providers)
+      (setq started t)
+      ;; everything answered synchronously (or nothing to ask)
+      (when (and (= pending 0) callback)
+        (funcall callback (nreverse errors))))))
+
+(defun pai-models-refresh-for-choice ()
+  "Refresh models for a model picker without making it wait.
+With models already known the picker offers them right away while
+discovery runs in the background; with none known it has to wait."
+  (if (pai-model-keys)
+      (pai-models-refresh-async
+       (lambda (errors) (dolist (err errors) (message "%s" err))))
+    (dolist (err (pai-models-refresh)) (message "%s" err))))
 
 (defvar-local pai-model-ensure--tried nil
   "Alist of (PROVIDER-ID . TIME) of on-demand discoveries in this session.

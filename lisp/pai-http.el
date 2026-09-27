@@ -123,12 +123,31 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
      ((and (numberp exit-code) (/= exit-code 0) (null status))
       (pai-http--emit-error
        st (format "curl failed (exit %s): %s" exit-code (string-trim event))))
+     ;; The response started but did not finish (--max-time, a reset
+     ;; connection): the body is incomplete, not a successful answer.
+     ((and (numberp exit-code) (/= exit-code 0))
+      (pai-http--emit-error
+       st (format "connection ended before the response was complete (curl exit %s): %s"
+                  exit-code (string-trim (concat (pai-http--state-buffer st) " " event)))))
      ((null status)
       (pai-http--emit-error st (format "no HTTP response: %s" (string-trim event)))))
     (unless (pai-http--state-done st)
       (setf (pai-http--state-done st) t))
     (when (pai-http--state-on-close st)
       (funcall (pai-http--state-on-close st) exit-code))))
+
+(defun pai-http-header-file (headers)
+  "Write HEADERS, an alist of (NAME . VALUE), to a new private file; return it.
+Return nil when HEADERS is empty.  curl reads the file with `-H @FILE', so
+header values -- API keys -- never appear in its command line, which any
+local user can read (ps, /proc/PID/cmdline).  The caller deletes the file."
+  (when headers
+    (let ((file (with-file-modes #o600 (make-temp-file "pai-headers-"))))
+      (let ((coding-system-for-write 'utf-8-unix))
+        (with-temp-file file
+          (dolist (h headers)
+            (insert (format "%s: %s\n" (car h) (cdr h))))))
+      file)))
 
 (cl-defun pai-http-stream (&key url (method "POST") headers body
                                 on-frame on-error on-close (timeout pai-request-timeout))
@@ -147,23 +166,28 @@ Return the process; kill it to abort the request."
   (let* ((st (pai-http--state-create
               :phase 'headers :on-frame on-frame
               :on-error on-error :on-close on-close))
+         (header-file (pai-http-header-file headers))
          (args (append
                 (list "-sS" "-N" "--no-buffer" "-i"
                       "-X" method
                       "--max-time" (number-to-string timeout))
-                (mapcan (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h))))
-                        headers)
+                (when header-file (list "-H" (concat "@" header-file)))
                 (when body (list "--data-binary" "@-"))
                 (list url)))
-         (proc (make-process
-                :name "pai-http"
-                :command (cons pai-curl-program args)
-                :connection-type 'pipe
-                :coding 'utf-8
-                :noquery t
-                :filter (lambda (_p chunk) (pai-http--filter st chunk))
-                :sentinel (lambda (p event)
-                            (pai-http--sentinel st p event (process-exit-status p))))))
+         (proc (condition-case err
+                   (make-process
+                    :name "pai-http"
+                    :command (cons pai-curl-program args)
+                    :connection-type 'pipe
+                    :coding 'utf-8
+                    :noquery t
+                    :filter (lambda (_p chunk) (pai-http--filter st chunk))
+                    :sentinel (lambda (p event)
+                                (when (memq (process-status p) '(exit signal))
+                                  (when header-file (ignore-errors (delete-file header-file))))
+                                (pai-http--sentinel st p event (process-exit-status p))))
+                 (error (when header-file (ignore-errors (delete-file header-file)))
+                        (signal (car err) (cdr err))))))
     (when body
       (dolist (piece (if (listp body) body (list body)))
         (process-send-string proc piece))

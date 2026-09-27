@@ -28,6 +28,12 @@
        (when (buffer-live-p ,buf) (kill-buffer ,buf))
        (ignore-errors (delete-directory ,dir t)))))
 
+(defun pai-ui-test--wait-for (pred &optional seconds)
+  "Pump process output until PRED is non-nil or SECONDS (default 5) pass."
+  (let ((deadline (+ (float-time) (or seconds 5))))
+    (while (and (not (funcall pred)) (< (float-time) deadline))
+      (accept-process-output nil 0.02))))
+
 (defun pai-ui-test--type-and-send (text)
   "Type TEXT into the input area and submit."
   (goto-char (point-max))
@@ -697,6 +703,8 @@ first argument: accepting a value neither chains nor offers it again."
       (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
                                                   :compact-keep-recent-tokens 50))
             (cancelled nil) (before nil))
+        ;; not yet due when the run starts; the tool result makes it due
+        (setq pai--compact-failed-at (pai-estimate-context-tokens pai--context-messages))
         (cl-letf (((symbol-function 'pai-compact-async)
                    (lambda (&rest _) (lambda () (setq cancelled t)))))
           (pai-ui-test--type-and-send "go")
@@ -1288,6 +1296,8 @@ Regression: \"ctx 325k/1.0M (33%)\" rendered as \"(33\"."
     (with-current-buffer buf
       (let ((before (length pai--context-messages)))
         (pai-ui-test--type-and-send "!echo bang-out")
+        ;; runs asynchronously
+        (pai-ui-test--wait-for (lambda () (string-match-p "bang-out" (buffer-string))))
         (should (string-match-p "bang-out" (buffer-string)))
         (should (> (length pai--context-messages) before))))))
 
@@ -1296,6 +1306,7 @@ Regression: \"ctx 325k/1.0M (33%)\" rendered as \"(33\"."
     (with-current-buffer buf
       (let ((before (length pai--context-messages)))
         (pai-ui-test--type-and-send "!!echo hidden-out")
+        (pai-ui-test--wait-for (lambda () (string-match-p "hidden-out" (buffer-string))))
         (should (string-match-p "hidden-out" (buffer-string)))
         (should (= (length pai--context-messages) before))))))
 

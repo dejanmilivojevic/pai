@@ -363,21 +363,31 @@ plist \(:text STRING :truncated BOOL :total-lines N)."
 
 (defun pai-tools--cap-details (details max-bytes)
   "Return DETAILS with every string longer than MAX-BYTES truncated.
-DETAILS is returned unchanged (`eq') when nothing is oversized."
-  (cl-labels ((big-p (x)
-                (cond ((stringp x) (> (string-bytes x) max-bytes))
-                      ((consp x) (or (big-p (car x)) (big-p (cdr x))))
-                      ((vectorp x) (cl-some #'big-p x))))
-              (cap (x)
-                (cond ((not (big-p x)) x)
-                      ((stringp x)
-                       (concat (plist-get (pai-tools-truncate
-                                           x most-positive-fixnum max-bytes 'head)
-                                          :text)
-                               "\n[truncated]"))
-                      ((consp x) (cons (cap (car x)) (cap (cdr x))))
-                      ((vectorp x) (vconcat (mapcar #'cap x))))))
-    (cap details)))
+DETAILS is returned unchanged (`eq') when nothing is oversized.  One linear
+pass; list spines are walked in a loop, so a long list (thousands of items)
+cannot exceed `max-lisp-eval-depth'."
+  (let ((changed nil))
+    (cl-labels ((cap (x)
+                  (cond ((stringp x)
+                         (if (<= (string-bytes x) max-bytes)
+                             x
+                           (setq changed t)
+                           (concat (plist-get (pai-tools-truncate
+                                               x most-positive-fixnum max-bytes 'head)
+                                              :text)
+                                   "\n[truncated]")))
+                        ((consp x)
+                         (let ((out '()) (rest x))
+                           (while (consp rest)
+                             (push (cap (car rest)) out)
+                             (setq rest (cdr rest)))
+                           (setq out (nreverse out))
+                           (when rest (setcdr (last out) (cap rest)))   ; dotted tail
+                           out))
+                        ((vectorp x) (vconcat (mapcar #'cap x)))
+                        (t x))))
+      (let ((new (cap details)))
+        (if changed new details)))))
 
 (defun pai-tools-cap-result (result &optional max-bytes)
   "Cap the text blocks and detail strings of tool RESULT at MAX-BYTES.
