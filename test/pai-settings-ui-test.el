@@ -28,9 +28,12 @@
     (seq-find (lambda (i) (equal (pai-settings-ui-item-key i) key))
               (pai-settings-ui-subsection-items sub))))
 
-(defun pai-settings-ui-test--render ()
-  "Mount the screen fresh and return its buffer text."
-  (let* ((inst (vui-mount (vui-component 'pai-settings-screen) "*pai settings test*"))
+(defun pai-settings-ui-test--render (&optional collapsed)
+  "Mount the screen fresh and return its buffer text.
+Every section is expanded unless COLLAPSED (the default of the real screen)."
+  (when (get-buffer "*pai settings test*") (kill-buffer "*pai settings test*"))
+  (let* ((pai-settings-ui-start-expanded (not collapsed))
+         (inst (vui-mount (vui-component 'pai-settings-screen) "*pai settings test*"))
          (buf (vui-instance-buffer inst)))
     (with-current-buffer buf (buffer-string))))
 
@@ -208,7 +211,9 @@
               (pai-mode)
               (pai-ext-initialize-instance)
               (pai-settings-set :auto-compact t 'global))
-            (with-current-buffer sb (pai-settings-ui-open))
+            (let ((pai-settings-ui-start-expanded t))
+              (when (get-buffer "*pai settings*") (kill-buffer "*pai settings*"))
+              (with-current-buffer sb (pai-settings-ui-open)))
             (with-current-buffer (get-buffer "*pai settings*")
               (should (eq pai-settings-ui--target-buffer sb))
               (goto-char (point-min))
@@ -222,6 +227,64 @@
             (should (null (default-value 'pai-settings--global))))
         (when (get-buffer "*pai settings*") (kill-buffer "*pai settings*"))
         (kill-buffer sb)))))
+
+(ert-deftest pai-settings-ui-starts-collapsed-with-counts ()
+  "Sections start collapsed, each title saying how many settings it holds."
+  (let ((text (pai-settings-ui-test--render t)))
+    (should (string-match-p "^▶ Session  ([0-9]+)$" text))
+    (should (string-match-p "^▶ Model & Reasoning  ([0-9]+)$" text))
+    (should (string-match-p "^Search" text))
+    (should-not (string-match-p "Auto-compact" text))))
+
+(ert-deftest pai-settings-ui-search-matches-words-anywhere ()
+  "Every word must occur in the label, description, section, subsection or key."
+  (let* ((sec (pai-settings-ui-test--section 'session))
+         (sub (seq-find (lambda (s) (eq (pai-settings-ui-subsection-id s) 'context))
+                        (pai-settings-ui-section-subsections sec)))
+         (item (pai-settings-ui-test--item 'session 'context :auto-compact)))
+    (should (pai-settings-ui-matches-p "auto" sec sub item))
+    (should (pai-settings-ui-matches-p "COMPACT session" sec sub item)) ; case, section
+    (should (pai-settings-ui-matches-p "grows large" sec sub item))    ; description
+    (should (pai-settings-ui-matches-p "context" sec sub item))        ; subsection
+    (should-not (pai-settings-ui-matches-p "compact memory" sec sub item))))
+
+(ert-deftest pai-settings-ui-search-shows-only-matches ()
+  (when (get-buffer "*pai settings test*") (kill-buffer "*pai settings test*"))
+  (let ((inst (vui-mount (vui-component 'pai-settings-screen) "*pai settings test*")))
+    (with-current-buffer (vui-instance-buffer inst)
+      (setq pai-settings-ui--query "threshold")
+      (vui-rerender inst)
+      (let ((text (buffer-string)))
+        (should (string-match-p "Session › Context" text))
+        (should (string-match-p "Compact threshold" text))
+        (should-not (string-match-p "Auto-compact" text))
+        (should-not (string-match-p "▶ Project" text)))
+      (setq pai-settings-ui--query "no such setting anywhere")
+      (vui-rerender inst)
+      (should (string-match-p "No setting matches" (buffer-string))))))
+
+(ert-deftest pai-settings-ui-open-sections-are-remembered ()
+  (when (get-buffer "*pai settings test*") (kill-buffer "*pai settings test*"))
+  (let ((inst (vui-mount (vui-component 'pai-settings-screen) "*pai settings test*")))
+    (with-current-buffer (vui-instance-buffer inst)
+      (setq pai-settings-ui--instance inst)
+      (pai-settings-ui--set-open 'session t)
+      (vui-rerender inst)
+      (should (string-match-p "▼ Session" (buffer-string)))
+      (should (string-match-p "Auto-compact" (buffer-string)))
+      (should (string-match-p "▶ Project" (buffer-string)))
+      ;; E: all closed, then all open
+      (pai-settings-ui-toggle-all)
+      (should-not (string-match-p "Auto-compact" (buffer-string)))
+      (pai-settings-ui-toggle-all)
+      (should (string-match-p "▼ Project" (buffer-string))))))
+
+(ert-deftest pai-settings-ui-marks-values-saved-in-a-file ()
+  (pai-settings-ui-test--sandbox dir
+    (let ((item (pai-settings-ui-test--item 'session 'context :auto-compact)))
+      (should-not (pai-settings-ui--saved-in item))
+      (pai-settings-set :auto-compact :false 'project)
+      (should (eq (pai-settings-ui--saved-in item) 'project)))))
 
 (provide 'pai-settings-ui-test)
 ;;; pai-settings-ui-test.el ends here

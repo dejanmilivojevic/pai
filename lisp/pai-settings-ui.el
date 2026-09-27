@@ -208,13 +208,64 @@ section and subsection are created on demand."
                    (truncate (string-to-number s)))))
       (_ (if (string-empty-p s) nil s)))))
 
-(defun pai-settings-ui--labeled (label control doc)
-  "Lay out a fixed-width LABEL, its CONTROL, and optional DOC on one row."
-  (apply #'vui-hstack
-         (delq nil
-               (list (vui-box (vui-text label) :width 22 :align :left)
-                     control
-                     (and doc (vui-muted (concat "  " doc)))))))
+;;;; Rows
+;;
+;; One row per setting: a marker (• = saved in a settings file), the label
+;; in a column sized to the labels on screen, the control, and the
+;; description cut to one line (the full text is the tooltip).
+
+(defcustom pai-settings-ui-start-expanded nil
+  "Non-nil to open the settings screen with every section expanded.
+By default sections start collapsed, showing how many settings they hold,
+and the screen remembers which ones you opened.  A search shows every match."
+  :type 'boolean :group 'pai)
+
+(defface pai-settings-ui-section-face '((t :inherit (bold font-lock-function-name-face)))
+  "Face of section titles on the settings screen.")
+
+(defface pai-settings-ui-saved-face '((t :inherit warning))
+  "Face of the marker of a setting saved in a settings file.")
+
+(defvar pai-settings-ui--label-width 26
+  "Width of the label column; set on every render from the labels.")
+
+(defvar pai-settings-ui--doc-width 60
+  "Width descriptions are cut to; set on every render from the window.")
+
+(defun pai-settings-ui--one-line (text width)
+  "Return TEXT on one line, cut to WIDTH columns with an ellipsis."
+  (truncate-string-to-width
+   (string-trim (replace-regexp-in-string "[ \t\n]+" " " (or text "")))
+   (max 10 width) nil nil "…"))
+
+(defun pai-settings-ui--saved-in (item)
+  "Return the settings file ITEM's value is saved in (`project', `global'), or nil.
+Only items whose key is itself a settings key can tell."
+  (let ((key (pai-settings-ui-item-key item)))
+    (and (keywordp key)
+         (pai-settings-ui--call
+          (lambda ()
+            (cond ((plist-member pai-settings--project key) 'project)
+                  ((plist-member pai-settings--global key) 'global)))))))
+
+(defun pai-settings-ui--labeled (label control doc &optional item)
+  "Lay out LABEL, its CONTROL and DOC (cut to one line) on one row.
+ITEM, when given, is marked when its value is saved in a settings file."
+  (let* ((saved (and item (pai-settings-ui--saved-in item)))
+         (width pai-settings-ui--label-width)
+         (shown (truncate-string-to-width (or label "") (- width 2) nil nil "…")))
+    (apply #'vui-hstack
+           (delq nil
+                 (list (vui-text (if saved "•" " ")
+                         :face 'pai-settings-ui-saved-face
+                         :help-echo (and saved (format "Saved in the %s settings file" saved)))
+                       (vui-box (vui-text shown :help-echo (unless (equal shown label) label))
+                                :width (1- width) :align :left)
+                       control
+                       (and doc (not (string-empty-p doc))
+                            (vui-text (concat " " (pai-settings-ui--one-line
+                                                   doc pai-settings-ui--doc-width))
+                              :face 'shadow :help-echo doc)))))))
 
 (defun pai-settings-ui--render-item (item refresh)
   "Render setting ITEM to a vnode.  REFRESH re-renders the screen after edits.
@@ -233,18 +284,21 @@ All value reads and writes run in the target session buffer."
       ('action
        (apply #'vui-hstack
               (delq nil
-                    (list (vui-button label
+                    (list (vui-text " ")
+                          (vui-button label
                                       :on-click (lambda ()
                                                   (pai-settings-ui--call
                                                    (pai-settings-ui-item-action item))
                                                   (funcall refresh)))
-                          (and doc (vui-muted (concat "  " doc)))))))
+                          (and doc (vui-text (concat " " (pai-settings-ui--one-line
+                                                          doc pai-settings-ui--doc-width))
+                                     :face 'shadow :help-echo doc))))))
       ('boolean
        (pai-settings-ui--labeled
         label
         (vui-checkbox :checked (pai-truthy (pai-settings-ui--call get))
                       :on-change setter)
-        doc))
+        doc item))
       ('choice
        (pai-settings-ui--labeled
         label
@@ -252,7 +306,7 @@ All value reads and writes run in the target session buffer."
                     :options (pai-settings-ui--resolve
                               (pai-settings-ui-item-choices item))
                     :on-change setter)
-        doc))
+        doc item))
       ((or 'string 'number)
        (let ((fkey (format "pai-set-%s" (pai-settings-ui-item-key item))))
          (pai-settings-ui--labeled
@@ -265,7 +319,7 @@ All value reads and writes run in the target session buffer."
                                    set (pai-settings-ui--parse
                                         item (or value (vui-field-value fkey))))
                                   (funcall refresh)))
-          (concat (or doc "") (and doc "  ") "(RET applies)"))))
+          doc item)))
       (_ (vui-text (format "%s: unsupported type %s" label type))))))
 
 (defun pai-settings-ui--subsection-all-items (sub)
@@ -278,25 +332,158 @@ The dynamic generator runs in the target session buffer."
                     (pai-settings-ui--call
                      (pai-settings-ui-subsection-items-fn sub))))))
 
-(defun pai-settings-ui--render-subsection (sub refresh)
-  "Render subsection SUB (heading plus its items).  REFRESH re-renders."
-  (vui-vstack
-   (vui-heading-2 (pai-settings-ui--resolve
-                   (pai-settings-ui-subsection-label sub)))
-   (apply #'vui-vstack :indent 2
-          (mapcar (lambda (i) (pai-settings-ui--render-item i refresh))
-                  (pai-settings-ui--subsection-all-items sub)))))
+;;;; The tree, searched
 
-(defun pai-settings-ui--render-section (sec refresh)
-  "Render section SEC as a collapsible containing its subsections."
-  (apply #'vui-collapsible
-         :title (pai-settings-ui--resolve (pai-settings-ui-section-label sec))
-         :key (pai-settings-ui-section-id sec)
-         :initially-expanded t
-         (mapcar (lambda (s) (pai-settings-ui--render-subsection s refresh))
-                 (pai-settings-ui--sorted
-                  (pai-settings-ui-section-subsections sec)
-                  #'pai-settings-ui-subsection-order))))
+(defun pai-settings-ui--tree ()
+  "Return the visible settings as ((SECTION (SUB . ITEMS) ...) ...), in order."
+  (mapcar (lambda (sec)
+            (cons sec
+                  (mapcar (lambda (sub) (cons sub (pai-settings-ui--subsection-all-items sub)))
+                          (pai-settings-ui--sorted (pai-settings-ui-section-subsections sec)
+                                                   #'pai-settings-ui-subsection-order))))
+          (pai-settings-ui-visible-sections)))
+
+(defun pai-settings-ui--haystack (sec sub item)
+  "Return the lower-case text a search matches ITEM of SEC/SUB against."
+  (downcase
+   (mapconcat (lambda (x) (format "%s" (or x "")))
+              (list (pai-settings-ui--resolve (pai-settings-ui-section-label sec))
+                    (pai-settings-ui--resolve (pai-settings-ui-subsection-label sub))
+                    (pai-settings-ui--resolve (pai-settings-ui-item-label item))
+                    (pai-settings-ui-item-doc item)
+                    (pai-settings-ui-item-key item))
+              " ")))
+
+(defun pai-settings-ui-matches-p (query sec sub item)
+  "Return non-nil when every word of QUERY occurs in ITEM of SEC/SUB.
+Label, description, section, subsection and key are searched, ignoring case."
+  (let ((hay (pai-settings-ui--haystack sec sub item)))
+    (seq-every-p (lambda (w) (string-search w hay))
+                 (split-string (downcase query) nil t))))
+
+(defun pai-settings-ui--filter (tree query)
+  "Return TREE with only the items matching QUERY; empty groups dropped."
+  (delq nil
+        (mapcar (lambda (s)
+                  (let ((subs (delq nil
+                                    (mapcar (lambda (g)
+                                              (let ((items (seq-filter
+                                                            (lambda (i) (pai-settings-ui-matches-p
+                                                                         query (car s) (car g) i))
+                                                            (cdr g))))
+                                                (and items (cons (car g) items))))
+                                            (cdr s)))))
+                    (and subs (cons (car s) subs))))
+                tree)))
+
+(defun pai-settings-ui--count (entry)
+  "Return how many settings tree ENTRY (SECTION (SUB . ITEMS) ...) holds."
+  (apply #'+ (mapcar (lambda (g) (length (cdr g))) (cdr entry))))
+
+(defun pai-settings-ui--set-widths (tree)
+  "Size the label and description columns for TREE and the window."
+  (let ((longest (apply #'max 12
+                        (mapcar (lambda (i) (string-width
+                                             (format "%s" (or (pai-settings-ui--resolve
+                                                               (pai-settings-ui-item-label i))
+                                                              ""))))
+                                (mapcan (lambda (s) (mapcan (lambda (g) (copy-sequence (cdr g)))
+                                                            (cdr s)))
+                                        tree))))
+        (win (get-buffer-window (current-buffer) t)))
+    (setq pai-settings-ui--label-width (min 32 (+ 3 longest))
+          pai-settings-ui--doc-width (max 40 (- (if win (window-body-width win) 120)
+                                                pai-settings-ui--label-width 24)))))
+
+;;;; Open sections
+
+(defvar-local pai-settings-ui--open :unset
+  "Open sections (ids) and advanced subsections ((SECTION . SUB) ids), or t for all.")
+(put 'pai-settings-ui--open 'permanent-local t)
+
+(defvar-local pai-settings-ui--query ""
+  "The search text of this settings screen.")
+(put 'pai-settings-ui--query 'permanent-local t)
+
+(defvar-local pai-settings-ui--instance nil
+  "The mounted settings screen of this buffer.")
+(put 'pai-settings-ui--instance 'permanent-local t)
+
+(defun pai-settings-ui--open-p (id)
+  "Return non-nil when section or subsection ID is expanded."
+  (when (eq pai-settings-ui--open :unset)
+    (setq pai-settings-ui--open (and pai-settings-ui-start-expanded t)))
+  (or (eq pai-settings-ui--open t) (member id pai-settings-ui--open)))
+
+(defun pai-settings-ui--set-open (id open)
+  "Expand section or subsection ID when OPEN, else collapse it."
+  (let ((cur (if (eq pai-settings-ui--open t)
+                 (mapcar #'pai-settings-ui-section-id (pai-settings-ui-visible-sections))
+               (and (listp pai-settings-ui--open) pai-settings-ui--open))))
+    (setq pai-settings-ui--open (if open (cons id (remove id cur)) (remove id cur)))))
+
+(defun pai-settings-ui--advanced-p (sub)
+  "Return non-nil when subsection SUB holds advanced settings (shown collapsed)."
+  (string-prefix-p "Advanced" (format "%s" (pai-settings-ui--resolve
+                                            (pai-settings-ui-subsection-label sub)))))
+
+;;;; Rendering
+
+(defun pai-settings-ui--render-items (items refresh)
+  "Return ITEMS rendered, stacked."
+  (apply #'vui-vstack (mapcar (lambda (i) (pai-settings-ui--render-item i refresh)) items)))
+
+(defun pai-settings-ui--render-subsection (sec sub items refresh)
+  "Render subsection SUB of SEC with ITEMS; advanced ones collapse."
+  (let ((label (pai-settings-ui--resolve (pai-settings-ui-subsection-label sub)))
+        (id (cons (pai-settings-ui-section-id sec) (pai-settings-ui-subsection-id sub))))
+    (if (pai-settings-ui--advanced-p sub)
+        (vui-collapsible
+         :title (format "%s  (%d)" label (length items)) :key id :indent 1
+         :title-face 'bold
+         :expanded (and (pai-settings-ui--open-p id) t)
+         :on-toggle (lambda (on) (pai-settings-ui--set-open id on) (funcall refresh))
+         ;; rows are only built when shown: some probe the system
+         (when (pai-settings-ui--open-p id) (pai-settings-ui--render-items items refresh)))
+      (vui-vstack
+       (vui-text label :face 'bold)
+       (pai-settings-ui--render-items items refresh)))))
+
+(defun pai-settings-ui--render-section (entry refresh)
+  "Render tree ENTRY (SECTION (SUB . ITEMS) ...) as a collapsible section."
+  (let* ((sec (car entry))
+         (id (pai-settings-ui-section-id sec)))
+    (apply #'vui-collapsible
+           :title (format "%s  (%d)" (pai-settings-ui--resolve (pai-settings-ui-section-label sec))
+                          (pai-settings-ui--count entry))
+           :key id
+           :title-face 'pai-settings-ui-section-face
+           :expanded (and (pai-settings-ui--open-p id) t)
+           :on-toggle (lambda (on) (pai-settings-ui--set-open id on) (funcall refresh))
+           ;; rows are only built when shown: some probe the system
+           ;; (executables, libraries) and a collapsed section would pay anyway
+           (and (pai-settings-ui--open-p id)
+                (mapcar (lambda (g) (pai-settings-ui--render-subsection sec (car g) (cdr g) refresh))
+                        (cdr entry))))))
+
+(defun pai-settings-ui--render-matches (entry refresh)
+  "Render the search matches of tree ENTRY, grouped as Section › Subsection."
+  (let ((sec (car entry)))
+    (apply #'vui-vstack
+           (mapcan (lambda (g)
+                     (list (vui-text (format "%s › %s"
+                                             (pai-settings-ui--resolve (pai-settings-ui-section-label sec))
+                                             (pai-settings-ui--resolve (pai-settings-ui-subsection-label (car g))))
+                             :face 'pai-settings-ui-section-face)
+                           (pai-settings-ui--render-items (cdr g) refresh)))
+                   (cdr entry)))))
+
+(defconst pai-settings-ui--search-key "pai-settings-search"
+  "The `:key' of the search field.")
+
+(defconst pai-settings-ui--help
+  "/ search · RET open, toggle, apply · TAB next · E expand/collapse all · g refresh · q quit    • saved in a settings file"
+  "The key hints under the search field.")
 
 ;;;; Screen component and entry point
 
@@ -304,15 +491,56 @@ The dynamic generator runs in the target session buffer."
   "The pai settings screen.  Its `rev' state forces a re-render after edits."
   :state ((rev 0))
   :render
-  (let ((refresh (lambda () (vui-set-state :rev (1+ rev)))))
+  (let* ((refresh (lambda () (vui-set-state :rev (1+ rev))))
+         (raw (or pai-settings-ui--query ""))
+         (query (string-trim raw))
+         (tree (pai-settings-ui--tree))
+         (searching (not (string-empty-p query)))
+         (matches (and searching (pai-settings-ui--filter tree query))))
+    (pai-settings-ui--set-widths tree)
     (apply #'vui-vstack :spacing 1
            (append
             (list (vui-heading-1
-                   (format "pai settings — %s"
-                           (abbreviate-file-name default-directory)))
-                  (vui-muted "TAB/S-TAB move · RET toggle/apply · g refresh · q quit"))
-            (mapcar (lambda (sec) (pai-settings-ui--render-section sec refresh))
-                    (pai-settings-ui-visible-sections))))))
+                   (format "pai settings — %s" (abbreviate-file-name default-directory)))
+                  (apply #'vui-hstack
+                         (delq nil
+                               (list (vui-text "Search" :face 'bold)
+                                     (vui-field :key pai-settings-ui--search-key
+                                                :value raw :size 36
+                                                :placeholder "e.g. compact, model, memory budget"
+                                                :on-change (lambda (v)
+                                                             (setq pai-settings-ui--query (or v ""))
+                                                             (funcall refresh)))
+                                     (and searching
+                                          (vui-muted (format "%d match%s" (apply #'+ (mapcar #'pai-settings-ui--count matches))
+                                                             (if (= 1 (apply #'+ (mapcar #'pai-settings-ui--count matches))) "" "es")))))))
+                  (vui-muted pai-settings-ui--help))
+            (cond
+             ((and searching (null matches))
+              (list (vui-muted (format "No setting matches \"%s\"." query))))
+             (searching
+              (mapcar (lambda (e) (pai-settings-ui--render-matches e refresh)) matches))
+             (t (mapcar (lambda (e) (pai-settings-ui--render-section e refresh)) tree)))))))
+
+(defun pai-settings-ui-search ()
+  "Move to the search field of the settings screen."
+  (interactive)
+  (when (vui-goto-key pai-settings-ui--search-key)
+    (forward-char (length pai-settings-ui--query))))
+
+(defun pai-settings-ui-toggle-all ()
+  "Expand every section, or collapse them all when any is open."
+  (interactive)
+  (setq pai-settings-ui--open
+        (if (and (not (eq pai-settings-ui--open :unset)) pai-settings-ui--open) nil t))
+  (when pai-settings-ui--instance (vui-rerender pai-settings-ui--instance)))
+
+(defvar pai-settings-ui-keys
+  (let ((m (make-sparse-keymap)))
+    (define-key m "/" #'pai-settings-ui-search)
+    (define-key m "E" #'pai-settings-ui-toggle-all)
+    m)
+  "Keys of the settings screen, on top of vui's.")
 
 ;;;###autoload
 (defun pai-settings-ui-open ()
@@ -331,8 +559,12 @@ Edits target the pai session buffer this command was invoked from (or any live
                                 dir))
       ;; set the target BEFORE mounting so the first render already reads and
       ;; writes the session's buffer-local settings
-      (setq pai-settings-ui--target-buffer origin))
+      (setq pai-settings-ui--target-buffer origin
+            pai-settings-ui--query ""))
     (let ((inst (vui-mount (vui-component 'pai-settings-screen) "*pai settings*")))
+      (with-current-buffer (vui-instance-buffer inst)
+        (setq pai-settings-ui--instance inst)
+        (use-local-map (make-composed-keymap pai-settings-ui-keys (current-local-map))))
       (pop-to-buffer (vui-instance-buffer inst)))))
 
 ;;;; Built-in sections
