@@ -213,18 +213,26 @@ event, or TIMEOUT seconds (default 180) elapse.  Returns nil on timeout.
 ON-EVENT, when non-nil, is called with every stream event (e.g. to show
 progress; timers keep running while this blocks, but Emacs only redraws
 when asked to)."
-  (let ((final nil) (done nil))
-    (pai-provider-stream
-     model context options
-     (lambda (ev)
-       (when on-event
-         (condition-case err (funcall on-event ev)
-           (error (message "pai: stream progress handler: %s" (error-message-string err)))))
-       (when (memq (plist-get ev :type) '(done error))
-         (setq final (plist-get ev :message) done t))))
-    (let ((deadline (+ (float-time) (or timeout 180))))
-      (while (and (not done) (< (float-time) deadline))
-        (accept-process-output nil 0.05)))
+  (let ((final nil) (done nil) (handle nil))
+    (setq handle
+          (pai-provider-stream
+           model context options
+           (lambda (ev)
+             (unless done
+               (when on-event
+                 (condition-case err (funcall on-event ev)
+                   (error (message "pai: stream progress handler: %s" (error-message-string err)))))
+               (when (memq (plist-get ev :type) '(done error))
+                 (setq final (plist-get ev :message) done t))))))
+    ;; On timeout or C-g the request must not live on, streaming (and
+    ;; billing) into callbacks nobody waits for.
+    (unwind-protect
+        (let ((deadline (+ (float-time) (or timeout 180))))
+          (while (and (not done) (< (float-time) deadline))
+            (accept-process-output nil 0.05)))
+      (unless done
+        (setq done t)
+        (ignore-errors (pai-provider-abort handle))))
     final))
 
 
