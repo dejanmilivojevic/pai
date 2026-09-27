@@ -408,7 +408,10 @@ a synchronous ON-DONE) is not the tool's and is signalled again."
                            (error-message-string err)))))))))
 
 (defun pai-agent--make-tool-result-message (tool-call result)
-  "Build a tool-result message from TOOL-CALL and RESULT plist."
+  "Build a tool-result message from TOOL-CALL and RESULT plist.
+RESULT is capped by `pai-tools-cap-result' first, so no single tool can
+flood the context (and the session file) with an unbounded result."
+  (setq result (pai-tools-cap-result result))
   (pai-tool-result-message
    :tool-call-id (plist-get tool-call :id)
    :tool-name (plist-get tool-call :name)

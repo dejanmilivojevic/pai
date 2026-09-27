@@ -620,5 +620,15 @@ Each request's context messages are pushed onto the symbol CONTEXTS."
     (pai-agent-abort run)
     (should (= calls 1))))
 
+(ert-deftest pai-agent-tool-result-message-is-capped ()
+  "Every tool result is bounded before entering the conversation."
+  (let* ((pai-tool-result-max-bytes 1000)
+         (msg (pai-agent--make-tool-result-message
+               (list :id "c1" :name "x")
+               (pai-tool-ok-result (make-string 100000 ?z)
+                                   (list :value (make-string 100000 ?z))))))
+    (should (< (string-bytes (pai-content-text (plist-get msg :content))) 1200))
+    (should (< (length (plist-get (plist-get msg :details) :value)) 1100))))
+
 (provide 'pai-agent-test)
 ;;; pai-agent-test.el ends here

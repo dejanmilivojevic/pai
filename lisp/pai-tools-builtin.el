@@ -371,11 +371,24 @@
                     (setq value (eval (car res) t))
                     (setq pos (cdr res))))))
             (setq printed (buffer-string)))
-          (funcall on-done
-                   (pai-tool-ok-result
-                    (concat (unless (string-empty-p printed) (concat printed "\n"))
-                            (format "=> %S" value))
-                    (list :value (format "%S" value)))))
+          ;; Values and printed output can be arbitrarily large (e.g. a
+          ;; propertized `buffer-string' drags vui/button structures along),
+          ;; so bound them like every other tool's output.
+          (let* ((repr (format "%S" value))
+                 (text (concat (unless (string-empty-p printed) (concat printed "\n"))
+                               "=> " repr))
+                 (trunc (pai-tools-truncate text nil nil 'head))
+                 (note (when (plist-get trunc :truncated)
+                         (format "\n[output truncated: showing %d of %d bytes; \
+return less (e.g. buffer-substring-no-properties, a prefix or a count)]"
+                                 (string-bytes (plist-get trunc :text))
+                                 (string-bytes text)))))
+            (funcall on-done
+                     (pai-tool-ok-result
+                      (concat (plist-get trunc :text) note)
+                      (list :value (if (plist-get trunc :truncated)
+                                       (plist-get (pai-tools-truncate repr 50 4096 'head) :text)
+                                     repr))))))
       (error (funcall on-done (pai-tool-error-result
                                (format "Error: %s" (error-message-string err))))))))
 

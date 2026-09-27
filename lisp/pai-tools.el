@@ -273,31 +273,153 @@ See `pai-tool--coerce-value'.  ARGS itself is not modified."
   "Maximum number of bytes a tool includes before truncating."
   :type 'integer :group 'pai)
 
+(defcustom pai-tool-result-max-bytes (* 256 1024)
+  "Hard limit on the text of any single tool result, in bytes.
+A safety net applied to every tool result (builtin, extension and MCP)
+before it enters the conversation, so one runaway result (a huge
+`elisp_eval' value, a minified file, ...) cannot blow up the context and
+the session file.  Strings inside the result details are capped too."
+  :type 'integer :group 'pai)
+
+(defun pai-tools--head-bytes-end (text end max-bytes)
+  "Return the largest N <= END whose prefix of TEXT fits in MAX-BYTES."
+  (let ((lo 0) (hi (min end max-bytes)))   ; a char takes at least one byte
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi 1) 2)))
+        (if (<= (string-bytes (substring text 0 mid)) max-bytes)
+            (setq lo mid)
+          (setq hi (1- mid)))))
+    lo))
+
+(defun pai-tools--tail-bytes-start (text start max-bytes)
+  "Return the smallest N >= START whose suffix of TEXT fits in MAX-BYTES."
+  (let* ((len (length text))
+         (lo (max start (- len max-bytes))) (hi len))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (<= (string-bytes (substring text mid)) max-bytes)
+            (setq hi mid)
+          (setq lo (1+ mid)))))
+    lo))
+
 (defun pai-tools-truncate (text &optional max-lines max-bytes from)
   "Truncate TEXT to MAX-LINES and MAX-BYTES, keeping the FROM end.
-FROM is `head' (default) or `tail'.  Return a plist
-\(:text STRING :truncated BOOL :total-lines N)."
-  (let* ((max-lines (or max-lines pai-tool-max-lines))
-         (max-bytes (or max-bytes pai-tool-max-bytes))
-         (from (or from 'head))
-         (lines (split-string text "\n"))
-         (total (length lines))
-         (truncated nil)
-         (kept lines))
-    (when (> total max-lines)
-      (setq truncated t)
-      (setq kept (if (eq from 'tail)
-                     (nthcdr (- total max-lines) lines)
-                   (butlast lines (- total max-lines)))))
-    (let ((joined (string-join kept "\n")))
-      (when (> (string-bytes joined) max-bytes)
-        (setq truncated t)
-        (if (eq from 'tail)
-            (while (and (> (string-bytes joined) max-bytes) (cdr kept))
-              (setq kept (cdr kept) joined (string-join kept "\n")))
-          (while (and (> (string-bytes joined) max-bytes) (cdr kept))
-            (setq kept (butlast kept) joined (string-join kept "\n")))))
-      (list :text joined :truncated truncated :total-lines total))))
+FROM is `head' (default) or `tail'.  Cuts fall on line boundaries when
+possible; a single line longer than MAX-BYTES is cut mid-line.  Runs in
+time linear in the kept part, so it is safe on huge strings.  Return a
+plist \(:text STRING :truncated BOOL :total-lines N)."
+  (let* ((max-lines (max 1 (or max-lines pai-tool-max-lines)))
+         (max-bytes (max 0 (or max-bytes pai-tool-max-bytes)))
+         (full text)
+         (full-len (length text))
+         (total (pai-tools--count-lines text))
+         ;; Only a window of MAX-BYTES + 1 chars at the kept end can
+         ;; survive (a char takes at least one byte): work on that alone.
+         (offset (if (eq from 'tail) (max 0 (- full-len max-bytes 1)) 0))
+         (text (if (< (1+ max-bytes) full-len)
+                   (if (eq from 'tail) (substring text offset)
+                     (substring text 0 (1+ max-bytes)))
+                 text))
+         (len (length text))
+         (beg 0) (end len))
+    (if (eq from 'tail)
+        (let ((pos len) (n 0))
+          ;; Keep the last MAX-LINES lines.
+          (while (and (< n max-lines) pos)
+            (let ((nl (and (> pos 0)
+                           (cl-position ?\n text :end pos :from-end t))))
+              (setq beg (if nl (1+ nl) 0) pos nl n (1+ n))))
+          (when (> (string-bytes (substring text beg)) max-bytes)
+            (let* ((s (pai-tools--tail-bytes-start text beg max-bytes))
+                   (nl (string-search "\n" text s)))
+              (setq beg (if (and nl (< (1+ nl) len) (> s 0)
+                                 (not (eq (aref text (1- s)) ?\n)))
+                            (1+ nl)
+                          s)))))
+      (let ((pos 0) (n 0))
+        ;; Keep the first MAX-LINES lines.
+        (while (and (< n max-lines) pos)
+          (let ((nl (string-search "\n" text pos)))
+            (setq n (1+ n))
+            (if (and nl (< n max-lines))
+                (setq pos (1+ nl))
+              (setq end (or nl len) pos nil)))))
+      (when (> (string-bytes (substring text 0 end)) max-bytes)
+        (let* ((e (pai-tools--head-bytes-end text end max-bytes))
+               (nl (and (> e 0) (< e len) (not (eq (aref text e) ?\n))
+                        (cl-position ?\n text :end e :from-end t))))
+          (setq end (if (and nl (> nl 0)) nl e)))))
+    (setq beg (+ beg offset) end (+ end offset))
+    (list :text (if (and (= beg 0) (= end full-len)) full (substring full beg end))
+          :truncated (or (> beg 0) (< end full-len))
+          :total-lines total)))
+
+(defun pai-tools--count-lines (text)
+  "Return the number of newline-separated lines in TEXT."
+  (let ((n 1) (pos 0))
+    (while (setq pos (string-search "\n" text pos))
+      (setq n (1+ n) pos (1+ pos)))
+    n))
+
+(defun pai-tools--cap-details (details max-bytes)
+  "Return DETAILS with every string longer than MAX-BYTES truncated.
+DETAILS is returned unchanged (`eq') when nothing is oversized."
+  (cl-labels ((big-p (x)
+                (cond ((stringp x) (> (string-bytes x) max-bytes))
+                      ((consp x) (or (big-p (car x)) (big-p (cdr x))))
+                      ((vectorp x) (cl-some #'big-p x))))
+              (cap (x)
+                (cond ((not (big-p x)) x)
+                      ((stringp x)
+                       (concat (plist-get (pai-tools-truncate
+                                           x most-positive-fixnum max-bytes 'head)
+                                          :text)
+                               "\n[truncated]"))
+                      ((consp x) (cons (cap (car x)) (cap (cdr x))))
+                      ((vectorp x) (vconcat (mapcar #'cap x))))))
+    (cap details)))
+
+(defun pai-tools-cap-result (result &optional max-bytes)
+  "Cap the text blocks and detail strings of tool RESULT at MAX-BYTES.
+MAX-BYTES defaults to `pai-tool-result-max-bytes'.  Image blocks are
+left alone.  Return RESULT itself when nothing exceeds the limit."
+  (let* ((max-bytes (or max-bytes pai-tool-result-max-bytes))
+         (content (plist-get result :content))
+         (details (plist-get result :details))
+         (changed nil)
+         (new-content
+          (if (stringp content)
+              (if (<= (string-bytes content) max-bytes) content
+                (setq changed t)
+                (list (pai-text (pai-tools--cap-text content max-bytes))))
+            (mapcar (lambda (b)
+                      (let ((text (and (eq (plist-get b :type) 'text)
+                                       (plist-get b :text))))
+                        (if (and (stringp text) (> (string-bytes text) max-bytes))
+                            (progn (setq changed t)
+                                   (append (list :type 'text
+                                                 :text (pai-tools--cap-text text max-bytes))
+                                           (cl-loop for (k v) on b by #'cddr
+                                                    unless (memq k '(:type :text))
+                                                    append (list k v))))
+                          b)))
+                    content)))
+         (new-details (pai-tools--cap-details details max-bytes)))
+    (if (and (not changed) (eq new-details details))
+        result
+      (let ((r (copy-sequence result)))
+        (setq r (plist-put r :content new-content))
+        (when details (setq r (plist-put r :details new-details)))
+        r))))
+
+(defun pai-tools--cap-text (text max-bytes)
+  "Return TEXT cut to MAX-BYTES with a note saying how much was dropped."
+  (let* ((trunc (pai-tools-truncate text most-positive-fixnum max-bytes 'head))
+         (kept (plist-get trunc :text)))
+    (format "%s\n[tool output truncated: showing %d of %d bytes (%d lines); \
+narrow the request to see more]"
+            kept (string-bytes kept) (string-bytes text)
+            (plist-get trunc :total-lines))))
 
 (provide 'pai-tools)
 ;;; pai-tools.el ends here

@@ -147,6 +147,65 @@ Waits for asynchronous tools (bash) to finish."
   (let ((r (pai-tools-test--run "elisp_eval" '(:form "(setq pai-test-x 10) (* pai-test-x 2)"))))
     (should (string-match-p "=> 20" (pai-tools-test--text r)))))
 
+(ert-deftest pai-tools-elisp-eval-huge-value-is-truncated ()
+  "A huge value (the 27.9. session got a 221M-char result) is bounded."
+  (let* ((r (pai-tools-test--run
+             "elisp_eval" '(:form "(mapconcat #'number-to-string (number-sequence 1 200000) \"\\n\")")))
+         (text (pai-tools-test--text r)))
+    (should-not (pai-tools-test--error-p r))
+    (should (<= (string-bytes text) (+ pai-tool-max-bytes 200)))
+    (should (string-match-p "output truncated" text))
+    (should (<= (length (plist-get (plist-get r :details) :value)) 4096))))
+
+;;;; truncation helpers
+
+(ert-deftest pai-tools-truncate-lines-and-bytes ()
+  (let ((text "a\nb\nc\nd"))
+    (should (equal (plist-get (pai-tools-truncate text 2 100) :text) "a\nb"))
+    (should (equal (plist-get (pai-tools-truncate text 2 100 'tail) :text) "c\nd"))
+    (should (equal (plist-get (pai-tools-truncate text 10 100) :text) text))
+    (should-not (plist-get (pai-tools-truncate text 10 100) :truncated))
+    (should (= (plist-get (pai-tools-truncate text 10 100) :total-lines) 4))
+    ;; Byte limit cuts on line boundaries.
+    (should (equal (plist-get (pai-tools-truncate "aaa\nbbb\nccc" 10 8) :text) "aaa\nbbb"))
+    (should (equal (plist-get (pai-tools-truncate "aaa\nbbb\nccc" 10 8 'tail) :text) "bbb\nccc"))
+    ;; A single over-long line is cut mid-line instead of kept whole.
+    (let ((r (pai-tools-truncate (make-string 100000 ?x) 10 1000)))
+      (should (plist-get r :truncated))
+      (should (= (length (plist-get r :text)) 1000)))
+    (let ((r (pai-tools-truncate (make-string 100000 ?x) 10 1000 'tail)))
+      (should (= (length (plist-get r :text)) 1000)))
+    ;; Multibyte text respects the byte limit.
+    (let ((r (pai-tools-truncate (make-string 1000 ?é) 10 101)))
+      (should (<= (string-bytes (plist-get r :text)) 101)))))
+
+(ert-deftest pai-tools-truncate-huge-input-is-fast ()
+  (let* ((text (mapconcat #'identity (make-list 300000 "some line of output") "\n"))
+         (t0 (float-time))
+         (h (pai-tools-truncate text))
+         (tl (pai-tools-truncate text nil nil 'tail)))
+    (should (< (- (float-time) t0) 2))
+    (should (<= (string-bytes (plist-get h :text)) pai-tool-max-bytes))
+    (should (<= (string-bytes (plist-get tl :text)) pai-tool-max-bytes))
+    (should (= (plist-get h :total-lines) 300000))))
+
+(ert-deftest pai-tools-cap-result ()
+  (let* ((small (pai-tool-ok-result "ok" (list :exit-code 0))))
+    (should (eq (pai-tools-cap-result small 100) small)))
+  (let* ((big (make-string 5000 ?y))
+         (r (pai-tools-cap-result
+             (list :content (list (pai-text big) (list :type 'image :data big))
+                   :details (list :value big :n 1 :v (vector big)))
+             100))
+         (blocks (plist-get r :content)))
+    (should (< (string-bytes (plist-get (car blocks) :text)) 300))
+    (should (string-match-p "tool output truncated" (plist-get (car blocks) :text)))
+    ;; Images are untouched.
+    (should (= (length (plist-get (cadr blocks) :data)) 5000))
+    (should (< (length (plist-get (plist-get r :details) :value)) 200))
+    (should (< (length (aref (plist-get (plist-get r :details) :v) 0)) 200))
+    (should (= (plist-get (plist-get r :details) :n) 1))))
+
 (ert-deftest pai-tools-list-and-read-buffer ()
   (let ((buf (generate-new-buffer "pai-test-buffer")))
     (unwind-protect
