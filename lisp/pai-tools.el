@@ -265,11 +265,11 @@ See `pai-tool--coerce-value'.  ARGS itself is not modified."
 
 ;;;; Output truncation
 
-(defcustom pai-tool-max-lines 2000
+(defcustom pai-tool-max-lines 6000
   "Maximum number of lines a tool includes before truncating."
   :type 'integer :group 'pai)
 
-(defcustom pai-tool-max-bytes (* 50 1024)
+(defcustom pai-tool-max-bytes (* 150 1024)
   "Maximum number of bytes a tool includes before truncating."
   :type 'integer :group 'pai)
 
