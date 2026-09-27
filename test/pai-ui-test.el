@@ -665,6 +665,92 @@ first argument: accepting a value neither chains nor offers it again."
         ;; thinks at the :compact level; the conversation keeps its own (off)
         (should (equal (reverse seen) '(nil minimal nil)))))))
 
+(defun pai-ui-test--shrink-tool-results ()
+  "A stand-in `pre-compact' handler: blank every tool result; return t."
+  (setq pai--context-messages
+        (mapcar (lambda (m)
+                  (if (eq (pai-message-role m) 'tool-result)
+                      (plist-put (copy-sequence m) :content (list (pai-text "[shaken]")))
+                    m))
+                pai--context-messages))
+  t)
+
+(ert-deftest pai-ui-pre-compact-can-spare-the-compaction ()
+  "When a `pre-compact' handler brings the context under the threshold,
+the run continues with it and nothing is summarized."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "elisp_eval"
+                                 :arguments (:form "(make-string 60000 ?x)")))
+                  :stop-reason tool-use)
+                 '(:text "done without compacting" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.1
+                                                  :compact-keep-recent-tokens 50))
+            (reasons nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact)
+                   (lambda (_ctx &rest props)
+                     (push (plist-get props :reason) reasons)
+                     (pai-ui-test--shrink-tool-results))))
+          (pai-ui-test--type-and-send "go")
+          (pai-ui-test--wait-idle))
+        (should (equal reasons '(auto)))
+        (let ((content (buffer-string)))
+          (should-not (string-match-p "Compacting context" content))
+          (should (string-match-p "done without compacting" content)))
+        ;; the continued turn was sent the shrunk context
+        (let ((result (seq-find (lambda (m) (eq (pai-message-role m) 'tool-result))
+                                (plist-get pai-faux-last-context :messages))))
+          (should (equal (pai-content-text (plist-get result :content)) "[shaken]")))
+        (should-not (seq-find (lambda (e) (equal (plist-get e :type) "compaction"))
+                              (pai-session-entries pai--session)))))))
+
+(ert-deftest pai-ui-pre-compact-not-enough-still-compacts ()
+  "A `pre-compact' handler that leaves the context over the threshold
+does not prevent the compaction."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "## Goal\nS" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
+                                                  :compact-keep-recent-tokens 50))
+            (reasons nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact)
+                   (lambda (_ctx &rest props) (push (plist-get props :reason) reasons) t)))
+          (pai--maybe-compact))
+        (should (equal reasons '(auto)))
+        (should (string-match-p "Compacted context" (buffer-string)))))))
+
+(ert-deftest pai-ui-manual-compact-skips-pre-compact ()
+  (pai-faux-reset)
+  (pai-faux-push '(:text "## Goal\nS" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50))
+            (called nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact) (lambda (&rest _) (setq called t))))
+          (should (pai--compact-now nil)))
+        (should-not called)))))
+
+(ert-deftest pai-ui-compaction-names-its-model-and-shows-warnings ()
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50))
+            (detail nil))
+        (cl-letf (((symbol-function 'pai-ext-run-compact)
+                   (lambda (messages &rest _)
+                     (setq detail (plist-get (car (pai-activity-running "compaction")) :detail))
+                     (list :messages (append (list (car messages) (pai-user-message "S"))
+                                             (last messages 2))
+                           :summary "S" :strategy "test"
+                           :warning "PART OF IT COULD NOT BE SUMMARIZED"))))
+          (should (pai--compact-now nil)))
+        (should (string-match-p "waiting for faux/faux" detail))
+        (should (string-match-p "PART OF IT COULD NOT BE SUMMARIZED" (buffer-string)))))))
+
 (ert-deftest pai-ui-compact-during-run-is-queued-for-turn-boundary ()
   (pai-faux-reset)
   (pai-faux-push '(:tool-calls ((:id "c1" :name "bash" :arguments (:command "sleep 0.3; echo hi")))

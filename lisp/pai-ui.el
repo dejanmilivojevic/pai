@@ -950,7 +950,8 @@ when the kept tail maps back to session entries; see
   (let ((tokens (round (/ (plist-get state :chars) 4.0)))
         (limit pai-compaction-summary-max-tokens))
     (if (<= tokens 0)
-        (format "%s · waiting for the model" (plist-get state :what))
+        (format "%s · waiting for %s" (plist-get state :what)
+                (or (plist-get state :model-key) "the model"))
       (format "%s · %s %s/%s tokens"
               (plist-get state :what)
               (pai--compaction-bar (/ (float tokens) limit))
@@ -977,7 +978,9 @@ asynchronous one only updates its activity line."
 NOTE is rendered in the transcript.  ASYNC marks a compaction that does not
 block Emacs."
   (let* ((buffer (current-buffer))
+         (model (pai--compact-model))
          (state (list :chars 0 :async async :reason reason :buffer buffer
+                      :model-key (and model (pai-model-key model))
                       :messages messages :before (length messages)
                       :what (format "%d messages, ~%s tokens" (length messages)
                                     (pai-activity-fmt-count
@@ -1017,6 +1020,8 @@ block Emacs."
                               (if (equal strategy "summary") ""
                                 (format " [%s]" strategy))
                               (plist-get state :before) (length pai--context-messages) took))
+    (when-let ((warning (plist-get result :warning)))
+      (pai--render-note warning 'pai-error-face))
     (message "pai: context compacted in %s (%d → %d messages)"
              took (plist-get state :before) (length pai--context-messages))
     t))
@@ -1183,6 +1188,15 @@ grew by the keep-recent budget (see `pai--compact-failed-at')."
              (>= (pai-estimate-context-tokens pai--context-messages)
                  (+ pai--compact-failed-at (pai-compaction-keep-recent-tokens)))))))
 
+(defun pai--relieved-before-compact (reason)
+  "Give `pre-compact' handlers (e.g. `/shake') a go before a REASON compaction.
+Return non-nil when they shrank the context below the compaction threshold,
+so no compaction is needed."
+  (let ((cw (and pai--model (plist-get pai--model :context-window))))
+    (and (pai-ext-run-pre-compact (pai--ext-context) :reason reason)
+         cw (> cw 0)
+         (not (pai-should-compact-p pai--context-messages cw)))))
+
 (defun pai--before-turn (resume)
   "Between two turns of a run: compact when due, then RESUME the run.
 Port of pi's compaction before the next assistant response: a `/compact'
@@ -1192,11 +1206,14 @@ with the compacted context.  Return non-nil when the run was paused."
   (let ((request pai--compact-request))
     (when (or request (pai--auto-compact-due-p))
       (setq pai--compact-request nil)
+      (if (and (not request) (pai--relieved-before-compact 'auto))
+          ;; shaken below the threshold: continue with the smaller context
+          (progn (funcall resume (list :messages pai--context-messages)) t)
       (pai--compact-async
        (if request 'manual 'auto) (plist-get request :instructions)
        (lambda (ok)
          (pai--set-status "working…")
-         (funcall resume (and ok (list :messages pai--context-messages))))))))
+         (funcall resume (and ok (list :messages pai--context-messages)))))))))
 
 (defun pai--recover-error (message resume)
   "Recover from the failed assistant MESSAGE of a run, then RESUME it.
@@ -1215,7 +1232,9 @@ non-nil when recovery started."
       (let ((without (remq message pai--context-messages)))
         (setq pai--context-messages without)
         (pai--render-note "Context overflow: compacting, then retrying the turn once.")
-        (or (pai--compact-async
+        (or (and (pai--relieved-before-compact 'overflow)
+                 (progn (funcall resume (list :messages pai--context-messages)) t))
+            (pai--compact-async
              'overflow nil
              (lambda (ok)
                (pai--set-status "working…")
@@ -1844,7 +1863,8 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
   "Compact the live context between runs when it exceeds the model's window."
   (require 'pai-compaction)
   (when (and pai--model
-             (pai-should-compact-p pai--context-messages (plist-get pai--model :context-window)))
+             (pai-should-compact-p pai--context-messages (plist-get pai--model :context-window))
+             (not (pai--relieved-before-compact 'auto)))
     (pai--compact-now nil 'auto)))
 
 (defun pai--start-run (text)

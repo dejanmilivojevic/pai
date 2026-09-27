@@ -35,7 +35,9 @@ only runtime requirement beyond Emacs 29.1+ is `curl` (for streaming HTTP).
   extensions add hosted providers. **Scoped models** (main/task/compact) and
   thinking levels are switchable with `/model`, `/thinking`, `/scoped-models`.
 - **Context compaction**: token estimation, threshold trigger, LLM summary; auto
-  between runs and on-demand via `/compact`.
+  between runs and on-demand via `/compact`. A transcript larger than the
+  summarizing (`compact`) model's context window is summarized in parts, each
+  folded into the summary of the parts before it.
 - **Sessions as a tree**: append-only JSONL with entry ids/parentId; `/new`,
   `/resume`, `/fork`, `/clone`, `/tree`, `/name`, plus Markdown/HTML `/export`.
 - **Layered settings** (`~/.pai/settings.json` + project `.pai/settings.json`),
@@ -351,8 +353,9 @@ An extension registers via a factory that receives the API object:
 Events include `agent-start`, `turn-start`, `message-start`, `message-update`,
 `message-end`, `tool-execution-start/update/end`, `turn-end`, `agent-end`, plus
 reducing hooks `context`, `tool-call`, `tool-result`, `before-agent-start`,
-`input`, and `compact` (take over `/compact` and auto-compaction; see
-`pai-ext-run-compact`). Extensions can add scoped-model roles with
+`input`, `compact` (take over `/compact` and auto-compaction; see
+`pai-ext-run-compact`) and `pre-compact` (shrink the context before an automatic
+compaction, which then only runs if still needed; see `pai-ext-run-pre-compact`). Extensions can add scoped-model roles with
 `pai-register-model-role`. See `docs/ARCHITECTURE.md` for the full contract.
 
 ## Skills

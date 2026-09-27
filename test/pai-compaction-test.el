@@ -472,5 +472,111 @@ the meter collapse."
                                         :usage (pai-usage :input 1000 :output 0))
                  128000))))
 
+;;;; Transcripts larger than the summarizing model's window
+
+(defun pai-compaction-test--small-model (window)
+  "Return the faux model with a context WINDOW of WINDOW tokens."
+  (plist-put (copy-sequence (pai-model "faux")) :context-window window))
+
+(defmacro pai-compaction-test--capturing (requests &rest body)
+  "Run BODY collecting the user text of every faux summary request in REQUESTS."
+  (declare (indent 1))
+  `(cl-letf* ((orig (symbol-function 'pai-faux-stream))
+              ((symbol-function 'pai-faux-stream)
+               (lambda (model ctx opts emit)
+                 (push (pai-content-text (pai-message-content
+                                          (car (last (plist-get ctx :messages)))))
+                       ,requests)
+                 (funcall orig model ctx opts emit))))
+     ,@body))
+
+(ert-deftest pai-compaction-input-budget-follows-the-window ()
+  (let ((pai-estimate-chars-per-token 3) (pai-compaction-window-fraction 0.8))
+    (should-not (pai-compaction-input-budget (pai-compaction-test--small-model nil) 'history))
+    ;; 0.8 * 262144 - 3072 (answer) - 3072 (previous summary) - 2000, in chars
+    (should (= (pai-compaction-input-budget (pai-compaction-test--small-model 262144) 'history)
+               (* 3 (- (floor (* 0.8 262144)) 3072 3072 2000))))))
+
+(ert-deftest pai-compaction-chunk-texts-fit-the-budget ()
+  (let* ((model (pai-compaction-test--small-model 12000))
+         (budget (pai-compaction-input-budget model 'history))
+         (msgs (cl-loop for i from 0 below 30 append
+                        (list (pai-user-message (format "question %d %s" i (make-string 1500 ?q)))
+                              (pai-assistant-message
+                               :content (list (pai-text (format "answer %d %s" i (make-string 1500 ?a))))))))
+         (texts (pai-compaction-chunk-texts msgs model 'history)))
+    (should (> (length texts) 1))
+    (should (seq-every-p (lambda (x) (<= (length x) budget)) texts))
+    ;; nothing lost, in order
+    (should (string-match-p "question 0 " (car texts)))
+    (should (string-match-p "answer 29 " (car (last texts))))
+    ;; a window that fits everything: one text, as before
+    (should (= 1 (length (pai-compaction-chunk-texts msgs (pai-compaction-test--small-model 1000000)
+                                                     'history))))))
+
+(ert-deftest pai-compaction-chunk-texts-cut-one-huge-message ()
+  (let* ((model (pai-compaction-test--small-model 12000))
+         (budget (pai-compaction-input-budget model 'history))
+         (big (mapconcat (lambda (i) (format "line %d of a very large tool result" i))
+                         (number-sequence 1 5000) "\n"))
+         (texts (pai-compaction-chunk-texts (list (pai-user-message big)) model 'history)))
+    (should (> (length texts) 2))
+    (should (seq-every-p (lambda (x) (<= (length x) budget)) texts))
+    (should (equal (apply #'concat texts) (concat "USER: " big)))))
+
+(ert-deftest pai-compaction-summarizes-a-long-transcript-in-parts ()
+  "Each part is folded into the summary of the parts before it."
+  (pai-faux-reset)
+  (dotimes (i 50) (pai-faux-push (list :text (format "SUMMARY-%d" (1+ i)) :stop-reason 'stop)))
+  (let* ((model (pai-compaction-test--small-model 12000))
+         (msgs (cl-loop for i from 0 below 20 append
+                        (list (pai-user-message (format "question %d %s" i (make-string 1500 ?q)))
+                              (pai-assistant-message
+                               :content (list (pai-text (format "answer %d %s" i (make-string 1500 ?a))))))))
+         (n (length (pai-compaction-chunk-texts msgs model 'history)))
+         (requests nil) (out nil))
+    (should (> n 1))
+    (pai-compaction-test--capturing requests
+      (pai-compaction-summarize-dropped msgs nil model nil (lambda (r) (setq out r)) t))
+    (setq requests (nreverse requests))
+    (should (= (length requests) n))
+    (should-not (string-match-p "<previous-summary>" (car requests)))
+    (should (string-match-p "<previous-summary>\nSUMMARY-1\n</previous-summary>" (nth 1 requests)))
+    (should (equal (plist-get out :text) (format "SUMMARY-%d" n)))))
+
+(ert-deftest pai-compaction-failed-part-names-the-part ()
+  (pai-faux-reset)
+  (pai-faux-push '(:text "SUMMARY-1" :stop-reason stop)
+                 '(:error "server went away"))
+  (let* ((model (pai-compaction-test--small-model 12000))
+         (msgs (cl-loop for i from 0 below 20 append
+                        (list (pai-user-message (make-string 1500 ?q))
+                              (pai-assistant-message :content (list (pai-text (make-string 1500 ?a)))))))
+         (n (length (pai-compaction-chunk-texts msgs model 'history)))
+         (out nil))
+    (pai-compaction-summarize-dropped msgs nil model nil (lambda (r) (setq out r)) t)
+    (should (string-match-p (format "\\`part 2 of %d: " n) (plist-get out :error)))))
+
+(ert-deftest pai-compaction-async-parts-can-be-cancelled ()
+  (let* ((emits nil) (aborted nil)
+         (model (pai-compaction-test--small-model 12000))
+         (msgs (cl-loop for i from 0 below 20 append
+                        (list (pai-user-message (make-string 1500 ?q))
+                              (pai-assistant-message :content (list (pai-text (make-string 1500 ?a)))))))
+         (out :none))
+    (cl-letf (((symbol-function 'pai-provider-stream)
+               (lambda (_m _c _o emit) (push emit emits) (length emits)))
+              ((symbol-function 'pai-provider-abort) (lambda (h) (push h aborted))))
+      (let ((cancel (pai-compaction-summarize-dropped msgs nil model nil (lambda (r) (setq out r)))))
+        ;; the first part answers, the second request goes out
+        (funcall (car emits) (list :type 'done :message
+                                   (pai-assistant-message :content (list (pai-text "S1"))
+                                                          :stop-reason 'stop)))
+        (should (= (length emits) 2))
+        (funcall cancel)
+        ;; the request in flight (the second) is the one aborted
+        (should (equal aborted '(2)))
+        (should (equal out '(:error "cancelled")))))))
+
 (provide 'pai-compaction-test)
 ;;; pai-compaction-test.el ends here
