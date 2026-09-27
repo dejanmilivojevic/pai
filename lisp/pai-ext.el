@@ -612,30 +612,54 @@ first extension of a name wins."
                     out))))))
     (nreverse out)))
 
+(defun pai-ext--provider-map (entries)
+  "Return a table FEATURE -> name of the extension in ENTRIES providing it.
+An extension provides one feature per file, named after the file."
+  (let ((provider (make-hash-table :test 'eq)))
+    (dolist (e entries)
+      (dolist (f (cdr e)) (puthash (intern (file-name-base f)) (car e) provider)))
+    provider))
+
+(defun pai-ext--requires (entry)
+  "Return the features the files of extension ENTRY (NAME . FILES) `require'."
+  (mapcan (lambda (f) (copy-sequence (plist-get (pai-ext--scan-file f) :requires)))
+          (cdr entry)))
+
 (defun pai-ext-visible-names (&optional dirs)
   "Return the names of the extensions in DIRS that are enabled or needed.
 An extension is needed when a visible one `require's a feature it provides
 \(one of its file names); this is followed through, so what a needed
 extension requires is visible too."
   (let* ((entries (pai-ext-entries dirs))
-         (provider (make-hash-table :test 'eq))
+         (provider (pai-ext--provider-map entries))
          (visible (make-hash-table :test 'equal))
          (queue '()))
-    (dolist (e entries)
-      (dolist (f (cdr e)) (puthash (intern (file-name-base f)) (car e) provider)))
     (dolist (e entries)
       (when (pai-ext-enabled-p (car e))
         (puthash (car e) t visible)
         (push e queue)))
     (while queue
       (let ((e (pop queue)))
-        (dolist (f (cdr e))
-          (dolist (feature (plist-get (pai-ext--scan-file f) :requires))
-            (let ((name (gethash feature provider)))
-              (when (and name (not (gethash name visible)))
-                (puthash name t visible)
-                (push (assoc name entries) queue)))))))
+        (dolist (feature (pai-ext--requires e))
+          (let ((name (gethash feature provider)))
+            (when (and name (not (gethash name visible)))
+              (puthash name t visible)
+              (push (assoc name entries) queue))))))
     (seq-filter (lambda (n) (gethash n visible)) (mapcar #'car entries))))
+
+(defun pai-ext-required-by (name &optional dirs)
+  "Return the sorted names of the visible extensions in DIRS that need NAME.
+They `require' a feature NAME provides (one of its file names).  This is
+why a disabled extension can still be visible (`pai-ext-visible-names')."
+  (let* ((entries (pai-ext-entries dirs))
+         (provider (pai-ext--provider-map entries))
+         (out '()))
+    (dolist (other (pai-ext-visible-names dirs))
+      (unless (equal other name)
+        (when (seq-some (lambda (feature) (equal (gethash feature provider) name))
+                        (pai-ext--requires (assoc other entries)))
+          (push other out))))
+    (sort out #'string<)))
 
 (defun pai-ext-visible-p (name &optional dirs)
   "Return non-nil when extension NAME should be shown (see `pai-ext-visible-names')."

@@ -52,6 +52,41 @@ Each NAME becomes DIR/NAME/NAME.el holding SOURCE."
       (pai-ext-visible-test--disable "ext-a" "ext-b" "ext-c" "ext-d")
       (should-not (pai-ext-visible-names dirs)))))
 
+(ert-deftest pai-ext-required-by-one-visible-extension ()
+  "A disabled extension that one visible extension requires names it."
+  (pai-ext-visible-test--with-exts dir pai-ext-visible-test--specs
+    (let ((dirs (list dir)))
+      (pai-ext-visible-test--disable "ext-b")
+      (should (equal (pai-ext-required-by "ext-b" dirs) '("ext-a"))))))
+
+(ert-deftest pai-ext-required-by-two-sorted ()
+  "Several requirers are all listed, sorted."
+  (pai-ext-visible-test--with-exts dir
+      (append pai-ext-visible-test--specs '(("ext-e" . "(require 'ext-c)\n")))
+    (let ((dirs (list dir)))
+      (pai-ext-visible-test--disable "ext-c")
+      (should (equal (pai-ext-required-by "ext-c" dirs) '("ext-b" "ext-e"))))))
+
+(ert-deftest pai-ext-required-by-nobody ()
+  "An extension nothing requires has no requirers."
+  (pai-ext-visible-test--with-exts dir pai-ext-visible-test--specs
+    (let ((dirs (list dir)))
+      (should-not (pai-ext-required-by "ext-d" dirs))
+      (should-not (pai-ext-required-by "ext-a" dirs))
+      ;; a requirer that is hidden itself does not count
+      (pai-ext-visible-test--disable "ext-a" "ext-b" "ext-c")
+      (should-not (pai-ext-required-by "ext-c" dirs)))))
+
+(ert-deftest pai-ext-required-by-through-a-chain ()
+  "In a -> b -> c with b and c disabled, c is required by b and b by a."
+  (pai-ext-visible-test--with-exts dir pai-ext-visible-test--specs
+    (let ((dirs (list dir)))
+      (pai-ext-visible-test--disable "ext-b" "ext-c")
+      (should (equal (pai-ext-required-by "ext-c" dirs) '("ext-b")))
+      (should (equal (pai-ext-required-by "ext-b" dirs) '("ext-a")))
+      ;; the visible set itself is unchanged by the refactoring
+      (should (equal (pai-ext-visible-names dirs) '("ext-a" "ext-b" "ext-c" "ext-d"))))))
+
 (ert-deftest pai-ext-section-owners ()
   (pai-ext-visible-test--with-exts dir pai-ext-visible-test--specs
     (let ((dirs (list dir)))
