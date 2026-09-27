@@ -276,6 +276,10 @@ prompt is re-pinned to the bottom of the window."
     ("elisp_eval" 'emacs-lisp-mode)
     (_ nil)))
 
+(defcustom pai-tool-diff-max-lines 60
+  "Maximum lines of a file edit's diff shown in the transcript."
+  :type 'integer :group 'pai)
+
 (defun pai--render-tool-end (event)
   "Render the result of a tool call from EVENT, showing a diff for file edits."
   (let* ((result (plist-get event :result))
@@ -288,10 +292,14 @@ prompt is re-pinned to the bottom of the window."
       (pai--insert (concat "  " (pai-content-text (plist-get result :content)) "\n")
                    'pai-tool-result-face)
       (let* ((name (or (plist-get details :path) ""))
-             (diff (pai-diff-render old new name name)))
+             (lines (split-string (string-trim-right (pai-diff-render old new name name)) "\n"))
+             (more (- (length lines) pai-tool-diff-max-lines)))
         (pai--insert (concat (mapconcat (lambda (l) (concat "  " l))
-                                        (split-string (string-trim-right diff) "\n") "\n")
-                             "\n"))))
+                                        (if (> more 0) (seq-take lines pai-tool-diff-max-lines) lines)
+                                        "\n")
+                             "\n"))
+        (when (> more 0)
+          (pai--insert (format "  … (%d more diff lines)\n" more) 'pai-tool-result-face))))
      (t
       (let* ((text (pai-content-text (plist-get result :content)))
              (trunc (pai-tools-truncate text 20 4096 'head))
@@ -1856,7 +1864,20 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
   (when pai--compaction
     (user-error "Compaction in progress; send again when it finishes (C-c C-c stops it)"))
   (pai-ext-emit 'before-agent-start (pai--ext-context) :prompt text)
-  (pai--maybe-compact)
+  ;; Over the threshold: compact first, without blocking Emacs, and start
+  ;; the run when the summary is in (not at all when it is interrupted).
+  ;; Meanwhile the prompt counts as running: input typed now is queued as
+  ;; steering, and \[pai-interrupt] drops the prompt.
+  (setq pai--active t)
+  (unless (and (pai--auto-compact-due-p)
+               (pai--compact-async 'auto nil
+                                   (lambda (_ok)
+                                     (when pai--active
+                                       (pai--launch-run text)))))
+    (pai--launch-run text)))
+
+(defun pai--launch-run (text)
+  "Start the agent run for user input TEXT."
   (setq pai--active t
         pai--overflow-retried nil)
   (setq pai--run
@@ -1885,16 +1906,27 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
         (pai--render-note "Empty shell command" 'pai-error-face)
       (pai-ext-emit 'user-bash (pai--ext-context)
                     :command cmd :exclude-from-context exclude :cwd default-directory)
-      (let ((out (with-output-to-string
-                   (with-current-buffer standard-output
-                     (call-process shell-file-name nil t nil shell-command-switch cmd)))))
-        (pai--render-note (format "$ %s\n%s" cmd (string-trim-right out)) 'pai-tool-result-face)
-        (unless exclude
-          (let ((m (pai-user-message
-                    (format "I ran `%s` in the shell and got:\n\n```\n%s\n```"
-                            cmd (string-trim-right out)))))
-            (setq pai--context-messages (append pai--context-messages (list m)))
-            (when pai--session (pai-session-append-message pai--session m))))))))
+      ;; Asynchronous: a slow command (`!make') must not freeze Emacs.
+      (let ((buf (current-buffer)) (chunks '()))
+        (make-process
+         :name "pai-bang"
+         :command (list shell-file-name shell-command-switch cmd)
+         :connection-type 'pipe :noquery t :coding 'utf-8
+         :filter (lambda (_p chunk) (push chunk chunks))
+         :sentinel
+         (lambda (p _event)
+           (when (and (memq (process-status p) '(exit signal)) (buffer-live-p buf))
+             (with-current-buffer buf
+               (let* ((trunc (pai-tools-truncate (apply #'concat (nreverse chunks)) nil nil 'tail))
+                      (out (concat (string-trim-right (plist-get trunc :text))
+                                   (when (plist-get trunc :truncated) "\n[output truncated]"))))
+                 (pai--render-note (format "$ %s\n%s" cmd out) 'pai-tool-result-face)
+                 (unless exclude
+                   (let ((m (pai-user-message
+                             (format "I ran `%s` in the shell and got:\n\n```\n%s\n```"
+                                     cmd out))))
+                     (setq pai--context-messages (append pai--context-messages (list m)))
+                     (when pai--session (pai-session-append-message pai--session m)))))))))))))
 
 (defun pai-send (&optional record)
   "Submit the current input line.
@@ -1995,7 +2027,7 @@ Moving past the newest entry restores the input you were typing."
   "Set the current model to ID."
   (interactive
    (progn
-     (dolist (err (pai-models-refresh)) (message "%s" err))
+     (pai-models-refresh-for-choice)
      (list (completing-read "Model: " (pai-model-keys) nil t))))
   (if (pai-model id)
       (progn (pai--set-model-id id) (pai--render-note (format "model set to %s" id)))
