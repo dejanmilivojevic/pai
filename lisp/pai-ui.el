@@ -690,7 +690,8 @@ skip that wait (but never a rate-limit backoff)."
     (dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (and (derived-mode-p 'pai-mode) pai--model
-                   (equal (pai-model-provider pai--model) provider))
+                   (equal (pai-usage-id (pai-model-provider pai--model))
+                          (pai-usage-id provider)))
           ;; Compare with properties: the same numbers turning stale only
           ;; change their face.
           (unless (equal-including-properties pai--usage-summary summary)
