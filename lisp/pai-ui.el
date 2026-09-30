@@ -349,7 +349,10 @@ prompt is re-pinned to the bottom of the window."
          (progn (when pai--assistant-open
                   (pai--ensure-fresh-line)
                   (setq pai--assistant-open nil pai--assistant-content-start nil))
-                (pai--render-note "— interrupted —" 'pai-error-face))
+                (pai--render-note (if-let ((err (plist-get event :error)))
+                                      (format "— stopped by an internal error: %s —" err)
+                                    "— interrupted —")
+                                  'pai-error-face))
        (pai--render-note "— ready —"))
      (unless pai--steering-queue
        (pai-ext-emit 'agent-settled (pai--ext-context)))
@@ -367,7 +370,12 @@ Called as each message completes, so the header (context, cost, limits)
 and extension widgets update while the agent works, not only at the end."
   (when (and message (not (memq message pai--run-committed)))
     (push message pai--run-committed)
-    (when pai--session (pai-session-append-message pai--session message))
+    ;; a failed write must not abort the run's bookkeeping (e.g. agent-end)
+    (when pai--session
+      (condition-case err
+          (pai-session-append-message pai--session message)
+        (error (message "pai: could not save a message to the session: %s"
+                        (error-message-string err)))))
     (setq pai--context-messages (append pai--context-messages (list message)))
     (pai--update-usage (list message))))
 

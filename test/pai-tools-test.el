@@ -51,6 +51,52 @@ Waits for asynchronous tools (bash) to finish."
       (should (string-match-p "^b\nc" (pai-tools-test--text r)))
       (should-not (string-match-p "^a" (pai-tools-test--text r))))))
 
+(defun pai-tools-test--write-bytes (file bytes)
+  "Write unibyte BYTES to FILE literally."
+  (let ((coding-system-for-write 'no-conversion))
+    (with-temp-buffer (set-buffer-multibyte nil) (insert bytes) (write-region nil nil file nil 'silent))))
+
+(ert-deftest pai-tools-read-image-by-content ()
+  "An image is recognised by its first bytes, whatever its extension."
+  (pai-tools-test--with-tmpdir dir
+    (pai-tools-test--write-bytes (expand-file-name "shot.bin" dir)
+                                 (unibyte-string #xff #xd8 #xff #xe0 0 16 ?J ?F ?I ?F 0 1))
+    (let* ((r (pai-tools-test--run "read" '(:path "shot.bin") dir))
+           (block (car (plist-get r :content))))
+      (should-not (pai-tools-test--error-p r))
+      (should (eq (plist-get block :type) 'image))
+      (should (equal (plist-get block :mime-type) "image/jpeg")))))
+
+(ert-deftest pai-tools-read-refuses-binary ()
+  (pai-tools-test--with-tmpdir dir
+    (pai-tools-test--write-bytes (expand-file-name "blob.dat" dir)
+                                 (apply #'unibyte-string (number-sequence 0 255)))
+    (let ((r (pai-tools-test--run "read" '(:path "blob.dat") dir)))
+      (should (pai-tools-test--error-p r))
+      (should (string-match-p "Binary file" (pai-tools-test--text r))))))
+
+(ert-deftest pai-tools-read-text-with-a-stray-byte ()
+  "A text file with a few invalid bytes is shown, the bytes replaced."
+  (pai-tools-test--with-tmpdir dir
+    (pai-tools-test--write-bytes (expand-file-name "log.txt" dir)
+                                 (concat (make-string 500 ?x) "\n" (unibyte-string #xff) "end\n"))
+    (let ((r (pai-tools-test--run "read" '(:path "log.txt") dir)))
+      (should-not (pai-tools-test--error-p r))
+      (should (string-match-p "end" (pai-tools-test--text r))))))
+
+(ert-deftest pai-tools-valid-text ()
+  (let ((ok "plain é ✓"))
+    (should (eq (pai-tools-valid-text ok) ok)))
+  (should (equal (pai-tools-valid-text (concat "a" (string-to-multibyte (unibyte-string #xff)))) "a\uFFFD"))
+  (should (equal (pai-tools-valid-text (string ?a #xd800)) "a\uFFFD"))
+  (should (equal (pai-tools-valid-text (unibyte-string #xc3 #xa9)) "é"))
+  (let ((r (pai-tools-sanitize-result
+            (list :content (list (list :type 'text :text (string #xd800)))
+                  :details (list :raw (vector (string #xdfff)))))))
+    (should (pai-json-encode r)))
+  (let ((clean (pai-tool-ok-result "fine")))
+    (should (eq (pai-tools-sanitize-result clean) clean))))
+
 (ert-deftest pai-tools-read-missing ()
   (pai-tools-test--with-tmpdir dir
     (should (pai-tools-test--error-p (pai-tools-test--run "read" '(:path "nope.txt") dir)))))

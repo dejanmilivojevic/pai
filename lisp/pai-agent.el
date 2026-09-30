@@ -67,13 +67,19 @@ state (registries, settings) reachable.  If the origin buffer has been killed
 the continuation is not run at all: the run is marked aborted and finished
 without invoking callbacks in an unrelated buffer.  Once RUN is aborted or
 finished, late continuations (a killed stream's final event, a tool that
-completes after an interrupt) are dropped so the loop cannot resume."
+completes after an interrupt) are dropped so the loop cannot resume.
+An error in FN ends the run with that error (`pai-agent--fail') rather
+than escaping into a process filter and leaving the run hanging."
   (let ((buf (pai-run-origin-buffer run)))
     (lambda (value)
       (cond
        ((or (pai-run-aborted run) (pai-run-finished run)) nil)
        ((buffer-live-p buf)
-        (with-current-buffer buf (funcall fn value)))
+        (with-current-buffer buf
+          ;; not -unless-debug: with `debug-on-error' the run would hang again
+          (condition-case err
+              (funcall fn value)
+            (error (pai-agent--fail run err)))))
        (t (setf (pai-run-aborted run) t
                 (pai-run-finished run) t))))))
 
@@ -148,6 +154,24 @@ Kill the provider stream and running tools (see `pai-agent-on-abort'),
 keep the text streamed so far, and emit `agent-end' with `:aborted t'.
 No further events are emitted and ON-COMPLETE is not called: whoever aborts
 owns the completion."
+  (pai-agent--stop run))
+
+(defun pai-agent--fail (run err)
+  "Stop RUN because one of its continuations signalled ERR.
+Like `pai-agent-abort', with `agent-end' also carrying `:error' (the
+message text).  If ending the run errors too, the run is still marked
+finished so no continuation can resume it."
+  (let ((text (error-message-string err)))
+    (message "pai: run stopped by an internal error: %s" text)
+    (condition-case err2
+        (pai-agent--stop run text)
+      (error
+       (setf (pai-run-aborted run) t (pai-run-finished run) t)
+       (message "pai: ending the failed run failed as well: %s"
+                (error-message-string err2))))))
+
+(defun pai-agent--stop (run &optional error-text)
+  "Abort RUN; ERROR-TEXT non-nil is passed on as `agent-end' `:error'."
   (unless (or (pai-run-aborted run) (pai-run-finished run))
     ;; Mark first: killing a process runs its sentinel synchronously, and
     ;; the continuations it triggers must see the run is over.
@@ -163,8 +187,9 @@ owns the completion."
         (error (message "pai: abort handler failed: %s" (error-message-string err)))))
     (pai-agent--record-partial run)
     (setf (pai-run-finished run) t)
-    (pai-agent--emit run (list :type 'agent-end :messages (pai-run-new-messages run)
-                               :aborted t))))
+    (pai-agent--emit run (append (list :type 'agent-end :messages (pai-run-new-messages run)
+                                       :aborted t)
+                                 (when error-text (list :error error-text))))))
 
 (defun pai-agent-aborted-p (run)
   "Return non-nil if RUN has been aborted."
@@ -410,8 +435,9 @@ a synchronous ON-DONE) is not the tool's and is signalled again."
 (defun pai-agent--make-tool-result-message (tool-call result)
   "Build a tool-result message from TOOL-CALL and RESULT plist.
 RESULT is capped by `pai-tools-cap-result' first, so no single tool can
-flood the context (and the session file) with an unbounded result."
-  (setq result (pai-tools-cap-result result))
+flood the context (and the session file) with an unbounded result, and
+sanitized so it can always be serialized (`pai-tools-sanitize-result')."
+  (setq result (pai-tools-sanitize-result (pai-tools-cap-result result)))
   (pai-tool-result-message
    :tool-call-id (plist-get tool-call :id)
    :tool-name (plist-get tool-call :name)

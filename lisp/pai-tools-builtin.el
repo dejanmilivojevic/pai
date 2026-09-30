@@ -94,40 +94,78 @@
     ("png" "image/png") ("jpg" "image/jpeg") ("jpeg" "image/jpeg")
     ("gif" "image/gif") ("webp" "image/webp") ("bmp" "image/bmp") (_ nil)))
 
+(defun pai-tool--sniff-image-mime (path)
+  "Return the image MIME type of PATH from its first bytes, or nil.
+BMP is left out: \"BM\" is too weak a signature on its own."
+  (let ((head (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert-file-contents-literally path nil 0 12)
+                (buffer-string))))
+    (cond ((string-prefix-p "\x89PNG\r\n\x1a\n" head) "image/png")
+          ((string-prefix-p "\xff\xd8\xff" head) "image/jpeg")
+          ((or (string-prefix-p "GIF87a" head) (string-prefix-p "GIF89a" head)) "image/gif")
+          ((and (string-prefix-p "RIFF" head) (>= (length head) 12)
+                (equal (substring head 8 12) "WEBP"))
+           "image/webp"))))
+
+(defun pai-tool--binary-text-p (text)
+  "Return non-nil if TEXT, as decoded by `insert-file-contents', is binary.
+Checks its first 8000 characters for a NUL byte or more than 1% raw
+bytes.  A few stray bytes in real text are replaced later instead, by
+`pai-tools-sanitize-result'."
+  (let* ((sample (substring text 0 (min (length text) 8000)))
+         (bad 0) (pos 0))
+    (or (string-search "\0" sample)
+        (progn
+          (while (setq pos (string-match pai-tools--invalid-char-regexp sample pos))
+            (setq bad (1+ bad) pos (1+ pos)))
+          (> (* 100 bad) (length sample))))))
+
 (defun pai-tool-read--execute (args ctx _on-update on-done)
   "Run the read tool for ARGS in CTX, finishing via ON-DONE."
   (let* ((path (pai-tool-resolve-path ctx (plist-get args :path)))
          (offset (plist-get args :offset))
-         (limit (plist-get args :limit)))
+         (limit (plist-get args :limit))
+         (sniffed (and (file-regular-p path) (file-readable-p path)
+                       (pai-tool--sniff-image-mime path))))
     (cond
      ((not (file-exists-p path))
       (funcall on-done (pai-tool-error-result (format "File not found: %s" path))))
      ((file-directory-p path)
       (funcall on-done (pai-tool-error-result (format "Path is a directory: %s" path))))
-     ((member (downcase (or (file-name-extension path) "")) pai-tool--image-extensions)
+     ((or sniffed (member (downcase (or (file-name-extension path) "")) pai-tool--image-extensions))
       (let ((data (with-temp-buffer
                     (set-buffer-multibyte nil)
                     (insert-file-contents-literally path)
                     (base64-encode-string (buffer-string) t))))
-        (funcall on-done (list :content (list (pai-image data (pai-tool--image-mime path)))
+        (funcall on-done (list :content (list (pai-image data (or sniffed (pai-tool--image-mime path))))
                                :is-error :false))))
      (t
       (let* ((text (with-temp-buffer
                      (insert-file-contents path)
-                     (buffer-string)))
-             (all-lines (split-string text "\n"))
-             (total (length all-lines))
-             (start (if offset (max 0 (1- offset)) 0))
-             (chosen (nthcdr start all-lines))
-             (chosen (if limit (seq-take chosen limit) chosen))
-             (trunc (pai-tools-truncate (string-join chosen "\n") nil nil 'head))
-             (body (plist-get trunc :text))
-             (shown (min (length chosen) pai-tool-max-lines))
-             (note (when (or (plist-get trunc :truncated) limit (and offset (> offset 1)))
-                     (format "\n[showing lines %d-%d of %d; use offset/limit to page]"
-                             (1+ start) (+ start shown) total))))
-        (funcall on-done (pai-tool-ok-result (concat body note)
-                                             (list :total-lines total))))))))
+                     (buffer-string))))
+        (if (pai-tool--binary-text-p text)
+            (funcall on-done
+                     (pai-tool-error-result
+                      (format "Binary file, not shown: %s (%d bytes). Inspect it with bash (e.g. file, xxd | head)."
+                              path (file-attribute-size (file-attributes path)))))
+          (pai-tool-read--show-text text offset limit on-done)))))))
+
+(defun pai-tool-read--show-text (text offset limit on-done)
+  "Finish the read tool via ON-DONE with TEXT paged by OFFSET and LIMIT."
+  (let* ((all-lines (split-string text "\n"))
+         (total (length all-lines))
+         (start (if offset (max 0 (1- offset)) 0))
+         (chosen (nthcdr start all-lines))
+         (chosen (if limit (seq-take chosen limit) chosen))
+         (trunc (pai-tools-truncate (string-join chosen "\n") nil nil 'head))
+         (body (plist-get trunc :text))
+         (shown (min (length chosen) pai-tool-max-lines))
+         (note (when (or (plist-get trunc :truncated) limit (and offset (> offset 1)))
+                 (format "\n[showing lines %d-%d of %d; use offset/limit to page]"
+                         (1+ start) (+ start shown) total))))
+    (funcall on-done (pai-tool-ok-result (concat body note)
+                                         (list :total-lines total)))))
 
 (pai-register-tool
  (list :name "read"
