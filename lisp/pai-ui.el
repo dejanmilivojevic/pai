@@ -754,7 +754,7 @@ itself a mode-line construct, where `%' starts a directive: an unescaped
 ;; mode line is therefore evaluated at most once per
 ;; `pai-mode-line-cache-interval' per window, and again right after a
 ;; command, a change of the selected window or a resize; other redraws reuse
-;; the string.
+;; the string -- unless the window's active/inactive state changed since.
 
 (defcustom pai-mode-line-cache t
   "Non-nil to cache the global mode line in pai buffers (see above).
@@ -767,24 +767,38 @@ Time-based segments (a clock) in pai windows lag by up to this much."
   :type 'number :group 'pai)
 
 (defvar-local pai--mode-line-cache nil
-  "Cached global mode lines: alist WINDOW -> (TIME . STRING).")
+  "Cached global mode lines: alist WINDOW -> (TIME STATE . STRING).
+STATE is `pai--mode-line-state' when STRING was built.")
 
 (defun pai--mode-line-invalidate (&rest _)
-  "Forget the cached mode lines of this buffer's windows."
-  (setq pai--mode-line-cache nil))
+  "Forget the cached mode lines of this buffer's windows and redraw them.
+On a selection change this runs after the mode lines were drawn, so
+without the forced update a stale copy would stay until the next redraw."
+  (setq pai--mode-line-cache nil)
+  (force-mode-line-update))
+
+(defun pai--mode-line-state ()
+  "Return what decides the active/inactive look of the window being drawn.
+The look is baked into the cached string as faces, so a copy is only
+reused while this is unchanged.  Spaceline reads `powerline-selected-window'."
+  (list (and (fboundp 'mode-line-window-selected-p) (mode-line-window-selected-p))
+        (and (boundp 'powerline-selected-window) powerline-selected-window)))
 
 (defun pai--mode-line-host ()
   "Return the global mode line for the window being drawn, cached.
 During mode-line evaluation the window being drawn is the selected one."
   (let* ((win (selected-window))
          (hit (assq win pai--mode-line-cache))
+         (state (pai--mode-line-state))
          (now (float-time)))
-    (if (and hit (< (- now (cadr hit)) pai-mode-line-cache-interval))
-        (cddr hit)
+    (if (and hit
+             (< (- now (nth 1 hit)) pai-mode-line-cache-interval)
+             (equal state (nth 2 hit)))
+        (nthcdr 3 hit)
       (let ((text (pai--mode-line-escape
                    (format-mode-line (default-value 'mode-line-format) nil win))))
         (setq pai--mode-line-cache
-              (cons (cons win (cons now text))
+              (cons (cl-list* win now state text)
                     (seq-filter (lambda (c) (and (not (eq (car c) win)) (window-live-p (car c))))
                                 pai--mode-line-cache)))
         text))))

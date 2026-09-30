@@ -558,6 +558,41 @@ first argument: accepting a value neither chains nor offers it again."
                     (should (equal (pai--mode-line-host) "mode line #4")))
                 (delete-window other)))))))))
 
+(defvar powerline-selected-window)     ; spaceline's, bound dynamically below
+
+(ert-deftest pai-ui-mode-line-cache-tracks-active-state ()
+  "A copy built while the window was active is not reused once it is inactive.
+The active/inactive faces are baked into the cached string."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((calls 0)
+            (active t)
+            (pai-mode-line-cache-interval 60))
+        (cl-letf (((symbol-function 'format-mode-line)
+                   (lambda (&rest _) (cl-incf calls) (format "mode line #%d" calls)))
+                  ((symbol-function 'mode-line-window-selected-p) (lambda () active)))
+          (setq pai--mode-line-cache nil)
+          (should (equal (pai--mode-line-host) "mode line #1"))
+          (should (equal (pai--mode-line-host) "mode line #1"))
+          ;; deselected, with no invalidation hook having run yet
+          (setq active nil)
+          (should (equal (pai--mode-line-host) "mode line #2"))
+          (should (equal (pai--mode-line-host) "mode line #2"))
+          ;; spaceline's own idea of the selected window counts too
+          (let ((powerline-selected-window 'elsewhere))
+            (should (equal (pai--mode-line-host) "mode line #3"))))))))
+
+(ert-deftest pai-ui-mode-line-invalidate-forces-redraw ()
+  "Invalidating also marks the mode lines for redisplay."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((forced nil))
+        (cl-letf (((symbol-function 'force-mode-line-update) (lambda (&rest _) (setq forced t))))
+          (setq pai--mode-line-cache '((w 0 nil . "x")))
+          (pai--mode-line-invalidate (selected-window))
+          (should-not pai--mode-line-cache)
+          (should forced))))))
+
 (ert-deftest pai-ui-mode-line-cache-escapes-percent ()
   "A literal % in the global mode line is shown, not read as a directive."
   (pai-ui-test--with-buffer buf dir
