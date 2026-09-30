@@ -38,7 +38,7 @@
 (require 'pai-commands)
 (require 'pai-auth)
 (require 'pai-provider-anthropic)
-(require 'url)
+(require 'pai-http)
 
 (defvar pai-usage-providers nil
   "Alist of provider id (string) -> fetcher function.
@@ -260,51 +260,28 @@ provider sends Retry-After.  The last good numbers stay on screen."
   "GET URL with HEADERS without blocking Emacs.
 Call CALLBACK once with (STATUS BODY RETRY-AFTER): the HTTP status code
 \(nil when there was no answer), the decoded JSON body (or nil) and the
-Retry-After seconds (or nil)."
+Retry-After seconds (or nil).  Runs in curl, never `url-retrieve', whose
+name lookup blocks the UI thread (see `pai-http-request')."
   (let* ((done nil)
-         (timer nil)
-         (buffer nil)
          (finish (lambda (status body retry)
                    (unless done
                      (setq done t)
-                     (when timer (cancel-timer timer))
-                     (funcall callback status body retry))))
-         (url-request-method "GET")
-         (url-request-extra-headers headers))
-    (setq buffer
-          (condition-case nil
-              (url-retrieve
-               url
-               (lambda (_status)
-                 (let ((reply (current-buffer)))
-                   (unwind-protect
-                       (let ((code nil) (retry nil) (body nil) (case-fold-search t))
-                         (goto-char (point-min))
-                         (when (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
-                           (setq code (string-to-number (match-string 1))))
-                         (let ((head-end (save-excursion (re-search-forward "\r?\n\r?\n" nil t))))
-                           (when (and head-end
-                                      (re-search-forward "^retry-after:[ \t]*\\([0-9]+\\)" head-end t))
-                             (setq retry (string-to-number (match-string 1))))
-                           (when head-end
-                             (let ((text (string-trim (buffer-substring-no-properties head-end (point-max)))))
-                               (unless (string-empty-p text)
-                                 (setq body (ignore-errors (pai-json-decode text)))))))
-                         (funcall finish code body retry))
-                     (when (buffer-live-p reply)
-                       (let ((kill-buffer-query-functions nil)) (kill-buffer reply))))))
-               nil t t)
-            (error (funcall finish nil nil nil) nil)))
-    (unless done
-      (setq timer
-            (run-at-time pai-usage-request-timeout nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (let ((proc (get-buffer-process buffer)))
-                               (when proc (delete-process proc)))
-                             (let ((kill-buffer-query-functions nil)) (kill-buffer buffer)))
-                           (funcall finish nil nil nil)))))
-    buffer))
+                     (funcall callback status body retry)))))
+    (condition-case nil
+        (pai-http-request
+         :url url :headers headers
+         :connect-timeout (min 10 pai-usage-request-timeout)
+         :timeout pai-usage-request-timeout
+         :on-done
+         (lambda (status hdrs text)
+           (let ((retry (let ((v (cdr (assoc "retry-after" hdrs))))
+                          (and v (string-match "\\`[ \t]*\\([0-9]+\\)" v)
+                               (string-to-number (match-string 1 v)))))
+                 (text (and text (string-trim text))))
+             (funcall finish status
+                      (and text (not (string-empty-p text)) (ignore-errors (pai-json-decode text)))
+                      retry))))
+      (error (funcall finish nil nil nil) nil))))
 
 (defun pai-usage--settle (id result error &optional rate-limited retry-after)
   "Record the outcome of a fetch for ID and run the waiting callbacks.

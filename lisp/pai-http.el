@@ -170,5 +170,57 @@ Return the process; kill it to abort the request."
       (process-send-eof proc))
     proc))
 
+;;;; One-shot requests
+
+(defun pai-http--parse-response (text)
+  "Split curl -i output TEXT into (STATUS HEADERS BODY).
+Skips interim blocks (1xx, a proxy's CONNECT reply) so STATUS and HEADERS
+are the final response's; HEADERS is an alist with downcased names."
+  (let ((status nil) (headers nil) (rest text))
+    (while (string-match "\\`HTTP/[0-9.]+ +\\([0-9]+\\)" rest)
+      (setq status (string-to-number (match-string 1 rest)) headers nil)
+      (let* ((end (string-match "\r?\n\r?\n" rest))
+             (block (substring rest 0 end)))
+        (setq rest (if end (substring rest (match-end 0)) ""))
+        (dolist (line (cdr (split-string block "\r?\n")))
+          (when (string-match "\\`\\([^:]+\\):[ \t]*\\(.*\\)\\'" line)
+            (push (cons (downcase (match-string 1 line)) (match-string 2 line)) headers)))))
+    (list status (nreverse headers) rest)))
+
+(cl-defun pai-http-request (&key url (method "GET") headers
+                                 (connect-timeout 10) (timeout 30) on-done)
+  "Perform a one-shot HTTP request to URL in a curl subprocess.
+Name lookup, connect and TLS all run in curl: url.el resolves host names
+on Emacs' own thread on macOS, which froze the UI whenever DNS hung.
+HEADERS (an alist) reach curl on stdin, keeping tokens off the command line.
+ON-DONE gets (STATUS HEADERS BODY) once; STATUS is nil on a transport
+failure or timeout.  Return the process; deleting it also ends in ON-DONE."
+  (let* ((chunks nil)
+         (proc (make-process
+                :name "pai-http-request"
+                :command (append (list pai-curl-program "-sS" "-i" "-X" method
+                                       "--connect-timeout" (number-to-string connect-timeout)
+                                       "--max-time" (number-to-string timeout))
+                                 (when headers (list "-H" "@-"))
+                                 (list url))
+                :connection-type 'pipe
+                :coding 'utf-8
+                :noquery t
+                :filter (lambda (_p chunk) (push chunk chunks))
+                :sentinel
+                (lambda (p _event)
+                  (unless (process-live-p p)
+                    (let ((parsed (pai-http--parse-response
+                                   (apply #'concat (nreverse chunks)))))
+                      (when on-done
+                        (apply on-done (if (and (zerop (process-exit-status p)) (car parsed))
+                                           parsed
+                                         (list nil nil nil))))))))))
+    (when headers
+      (process-send-string
+       proc (mapconcat (lambda (h) (format "%s: %s\n" (car h) (cdr h))) headers "")))
+    (process-send-eof proc)
+    proc))
+
 (provide 'pai-http)
 ;;; pai-http.el ends here
