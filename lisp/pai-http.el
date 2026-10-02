@@ -130,14 +130,32 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
     (when (pai-http--state-on-close st)
       (funcall (pai-http--state-on-close st) exit-code))))
 
+(defun pai-http--write-temp (prefix pieces)
+  "Write PIECES (strings) to a new private temp file named after PREFIX.
+Multibyte pieces are written as UTF-8, unibyte ones as is.  Return the file."
+  (let ((file (with-file-modes #o600 (make-temp-file prefix))))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (dolist (piece pieces)
+        (insert (if (multibyte-string-p piece) (encode-coding-string piece 'utf-8) piece)))
+      (let ((coding-system-for-write 'binary))
+        (write-region nil nil file nil 'silent)))
+    file))
+
+(defun pai-http--delete-files (files)
+  "Delete FILES, ignoring errors."
+  (dolist (f files) (ignore-errors (delete-file f))))
+
 (cl-defun pai-http-stream (&key url (method "POST") headers body
                                 on-frame on-error on-close (timeout pai-request-timeout))
   "Start a streaming HTTP request to URL.
 METHOD defaults to POST.  HEADERS is an alist of (NAME . VALUE) strings.
-BODY, when non-nil, is sent as the raw request body via stdin: a string, or
-a list of strings sent one after the other (unibyte strings are sent as is,
-without the UTF-8 copy a multibyte string needs; see
-`pai-provider-encode-body').
+BODY, when non-nil, is sent as the raw request body: a string, or a list of
+strings sent one after the other (unibyte strings are sent as is, without
+the UTF-8 copy a multibyte string needs; see `pai-provider-encode-body').
+Body and headers reach curl through private temp files, deleted when the
+process ends: piping a multi-MB body blocked Emacs for seconds, and headers
+on the command line exposed API keys to `ps'.
 
 ON-FRAME is called with each SSE frame plist on a 2xx response.  ON-ERROR
 is called once with a descriptive string on any HTTP error (>=400) or
@@ -147,28 +165,38 @@ Return the process; kill it to abort the request."
   (let* ((st (pai-http--state-create
               :phase 'headers :on-frame on-frame
               :on-error on-error :on-close on-close))
+         (header-file (and headers
+                           (pai-http--write-temp
+                            "pai-http-headers-"
+                            (mapcar (lambda (h) (format "%s: %s\n" (car h) (cdr h)))
+                                    headers))))
+         (body-file (and body
+                         (condition-case err
+                             (pai-http--write-temp "pai-http-body-"
+                                                   (if (listp body) body (list body)))
+                           (error (pai-http--delete-files (list header-file))
+                                  (signal (car err) (cdr err))))))
+         (files (delq nil (list header-file body-file)))
          (args (append
                 (list "-sS" "-N" "--no-buffer" "-i"
                       "-X" method
                       "--max-time" (number-to-string timeout))
-                (mapcan (lambda (h) (list "-H" (format "%s: %s" (car h) (cdr h))))
-                        headers)
-                (when body (list "--data-binary" "@-"))
-                (list url)))
-         (proc (make-process
-                :name "pai-http"
-                :command (cons pai-curl-program args)
-                :connection-type 'pipe
-                :coding 'utf-8
-                :noquery t
-                :filter (lambda (_p chunk) (pai-http--filter st chunk))
-                :sentinel (lambda (p event)
-                            (pai-http--sentinel st p event (process-exit-status p))))))
-    (when body
-      (dolist (piece (if (listp body) body (list body)))
-        (process-send-string proc piece))
-      (process-send-eof proc))
-    proc))
+                (when header-file (list "-H" (concat "@" header-file)))
+                (when body-file (list "--data-binary" (concat "@" body-file)))
+                (list url))))
+    (condition-case err
+        (make-process
+         :name "pai-http"
+         :command (cons pai-curl-program args)
+         :connection-type 'pipe
+         :coding 'utf-8
+         :noquery t
+         :filter (lambda (_p chunk) (pai-http--filter st chunk))
+         :sentinel (lambda (p event)
+                     (unless (process-live-p p) (pai-http--delete-files files))
+                     (pai-http--sentinel st p event (process-exit-status p))))
+      (error (pai-http--delete-files files)
+             (signal (car err) (cdr err))))))
 
 ;;;; One-shot requests
 
