@@ -138,9 +138,74 @@ REDACTED non-nil marks safety-redacted reasoning."
           (when signature (list :thinking-signature signature))
           (when redacted (list :redacted t))))
 
+(defcustom pai-image-max-dimension 1568
+  "Longest edge, in pixels, an image content block may have; larger ones are downscaled.
+Anthropic rejects a request with more than 20 images when any of them
+exceeds 2000 px, and scales images above 1568 px down anyway.  nil
+disables downscaling."
+  :type '(choice (const :tag "No limit" nil) integer)
+  :group 'pai)
+
+(defun pai-image--be (s pos n)
+  "Read the N-byte big-endian unsigned integer at POS in unibyte S."
+  (let ((v 0)) (dotimes (i n v) (setq v (+ (ash v 8) (aref s (+ pos i)))))))
+
+(defun pai-image-dimensions (raw)
+  "Return (WIDTH . HEIGHT) of the PNG, GIF or JPEG bytes RAW, or nil."
+  (ignore-errors
+    (cond
+     ((string-prefix-p "\x89PNG" raw)
+      (cons (pai-image--be raw 16 4) (pai-image--be raw 20 4)))
+     ((string-prefix-p "GIF8" raw)
+      (cons (+ (aref raw 6) (ash (aref raw 7) 8)) (+ (aref raw 8) (ash (aref raw 9) 8))))
+     ((string-prefix-p "\xff\xd8" raw)
+      (let ((pos 2) dims)
+        (while (and (not dims) (< (+ pos 9) (length raw)) (= (aref raw pos) #xff))
+          (let ((marker (aref raw (1+ pos))))
+            (if (and (<= #xc0 marker #xcf) (not (memq marker '(#xc4 #xc8 #xcc))))
+                (setq dims (cons (pai-image--be raw (+ pos 7) 2) (pai-image--be raw (+ pos 5) 2)))
+              (setq pos (+ pos 2 (pai-image--be raw (+ pos 2) 2))))))
+        dims)))))
+
+(defun pai-image--resize-file (in out limit)
+  "Downscale image file IN into OUT so its longest edge is LIMIT; non-nil on success."
+  (cond
+   ((executable-find "sips")
+    (eq 0 (call-process "sips" nil nil nil "-Z" (number-to-string limit) in "--out" out)))
+   ((executable-find "magick")
+    (eq 0 (call-process "magick" nil nil nil in "-resize" (format "%dx%d>" limit limit) out)))
+   ((executable-find "convert")
+    (eq 0 (call-process "convert" nil nil nil in "-resize" (format "%dx%d>" limit limit) out)))))
+
+(defun pai-image-fit (data mime-type)
+  "Return base64 DATA downscaled to `pai-image-max-dimension', or DATA unchanged.
+DATA stays as is when it is small enough, not a PNG/GIF/JPEG, or no
+resizer (sips, ImageMagick) is available."
+  (let* ((limit pai-image-max-dimension)
+         (raw (and limit (stringp data) (> (length data) 0)
+                   (ignore-errors (base64-decode-string data))))
+         (dims (and raw (pai-image-dimensions raw))))
+    (if (not (and dims (> (max (car dims) (cdr dims)) limit)))
+        data
+      (let* ((ext (pcase mime-type ("image/jpeg" ".jpg") ("image/gif" ".gif") (_ ".png")))
+             (in (make-temp-file "pai-img-" nil ext))
+             (out (make-temp-file "pai-img-" nil ext)))
+        (unwind-protect
+            (progn
+              (let ((coding-system-for-write 'binary)) (write-region raw nil in nil 'silent))
+              (if (pai-image--resize-file in out limit)
+                  (with-temp-buffer
+                    (set-buffer-multibyte nil)
+                    (insert-file-contents-literally out)
+                    (if (> (buffer-size) 0) (base64-encode-string (buffer-string) t) data))
+                data))
+          (delete-file in)
+          (delete-file out))))))
+
 (defun pai-image (data mime-type)
-  "Make an image content block from base64 DATA with MIME-TYPE."
-  (list :type 'image :data data :mime-type mime-type))
+  "Make an image content block from base64 DATA with MIME-TYPE.
+DATA is downscaled first when larger than `pai-image-max-dimension'."
+  (list :type 'image :data (pai-image-fit data mime-type) :mime-type mime-type))
 
 (defun pai-tool-call (id name arguments &rest extra)
   "Make a tool-call content block.
