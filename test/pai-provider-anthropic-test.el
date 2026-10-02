@@ -99,6 +99,10 @@ Return the list of emitted unified events."
     (should (equal (plist-get (car blocks) :type) "image"))
     (should (equal (plist-get (plist-get (car blocks) :source) :media_type) "image/png"))))
 
+(ert-deftest pai-anthropic-empty-image-block-becomes-text ()
+  (let ((b (car (pai-anthropic--content-blocks (list (pai-image "" "image/png"))))))
+    (should (equal (plist-get b :type) "text"))))
+
 (ert-deftest pai-anthropic-unsigned-thinking-dropped ()
   ;; An assistant turn persisted with only an empty, unsigned thinking
   ;; block (stream ended right after thinking started) must not be sent:

@@ -67,6 +67,14 @@ Waits for asynchronous tools (bash) to finish."
       (should (eq (plist-get block :type) 'image))
       (should (equal (plist-get block :mime-type) "image/jpeg")))))
 
+(ert-deftest pai-tools-read-empty-image-is-error ()
+  "An empty image file is an error, not an empty image block."
+  (pai-tools-test--with-tmpdir dir
+    (pai-tools-test--write-bytes (expand-file-name "shot.png" dir) "")
+    (let ((r (pai-tools-test--run "read" '(:path "shot.png") dir)))
+      (should (pai-tools-test--error-p r))
+      (should (string-match-p "empty" (pai-tools-test--text r))))))
+
 (ert-deftest pai-tools-read-refuses-binary ()
   (pai-tools-test--with-tmpdir dir
     (pai-tools-test--write-bytes (expand-file-name "blob.dat" dir)

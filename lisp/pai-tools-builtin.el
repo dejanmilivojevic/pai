@@ -133,6 +133,10 @@ bytes.  A few stray bytes in real text are replaced later instead, by
       (funcall on-done (pai-tool-error-result (format "File not found: %s" path))))
      ((file-directory-p path)
       (funcall on-done (pai-tool-error-result (format "Path is a directory: %s" path))))
+     ((and (member (downcase (or (file-name-extension path) "")) pai-tool--image-extensions)
+           (zerop (file-attribute-size (file-attributes path))))
+      ;; The API rejects an empty image block and the whole session with it.
+      (funcall on-done (pai-tool-error-result (format "Image file is empty (0 bytes): %s" path))))
      ((or sniffed (member (downcase (or (file-name-extension path) "")) pai-tool--image-extensions))
       (let ((data (with-temp-buffer
                     (set-buffer-multibyte nil)
