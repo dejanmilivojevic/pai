@@ -57,7 +57,7 @@ only runtime requirement beyond Emacs 29.1+ is `curl` (for streaming HTTP).
   tables) and a header line showing context usage %, cost, and model. The input
   line stays pinned to the bottom of the window (terminal-style), so output
   streams above it and you can keep typing while a run is in progress.
-- **Programmatic/headless**: `pai-send-message` and `pai-oneshot` for scripts.
+- **Programmatic/headless**: `pai-send-message` (with optional image blocks) and `pai-oneshot` for scripts.
 
 ## Requirements
 

@@ -148,7 +148,9 @@ disables downscaling."
 
 (defun pai-image--be (s pos n)
   "Read the N-byte big-endian unsigned integer at POS in unibyte S."
-  (let ((v 0)) (dotimes (i n v) (setq v (+ (ash v 8) (aref s (+ pos i)))))))
+  (let ((v 0))
+    (dotimes (i n) (setq v (+ (ash v 8) (aref s (+ pos i)))))
+    v))
 
 (defun pai-image-dimensions (raw)
   "Return (WIDTH . HEIGHT) of the PNG, GIF or JPEG bytes RAW, or nil."

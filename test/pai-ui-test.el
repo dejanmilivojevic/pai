@@ -1981,5 +1981,22 @@ The trailing-punctuation check clobbered the match data the loop advanced by."
       (pai-history-add dir "multi\nline")
       (should (equal (pai-history-load dir) '("multi\nline" "a"))))))
 
+(ert-deftest pai-ui-send-message-attaches-images ()
+  "`pai-send-message' sends image blocks with the prompt and notes them."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "I see it." :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-send-message "what is this?" buf
+                        (list (pai-image (base64-encode-string "GIF89a\1\0\1\0") "image/gif")))
+      (let ((user (seq-find #'pai-user-message-p pai--context-messages)))
+        (should (equal (mapcar #'pai-block-type (pai-message-content user)) '(text image)))
+        (should (equal (pai-content-text (pai-message-content user)) "what is this?")))
+      (should (string-match-p "\\[1 image attached\\]" (buffer-string)))
+      ;; an image alone is a prompt too
+      (pai-faux-push '(:text "Again." :stop-reason stop))
+      (pai-send-message "" buf (list (pai-image "R0lG" "image/gif")))
+      (should (= (seq-count #'pai-user-message-p pai--context-messages) 2)))))
+
 (provide 'pai-ui-test)
 ;;; pai-ui-test.el ends here

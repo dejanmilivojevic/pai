@@ -175,7 +175,13 @@ prompt is re-pinned to the bottom of the window."
                'pai-user-face)
   (pai--insert (concat (pai-md-highlight-fences
                         (string-trim-right (pai-content-text (pai-message-content message))))
-                       "\n")))
+                       "\n"))
+  (let ((images (and (listp (pai-message-content message))
+                     (seq-count (lambda (b) (eq (pai-block-type b) 'image))
+                                (pai-message-content message)))))
+    (when (and images (> images 0))
+      (pai--insert (format "[%d image%s attached]\n" images (if (= images 1) "" "s"))
+                   'pai-note-face))))
 
 (defun pai--render-note (text &optional face)
   "Render a UI note TEXT with FACE (default `pai-note-face')."
@@ -1874,13 +1880,24 @@ are fully reloaded (including `require'd siblings), and settings/models refresh.
 (pai-register-command "changelog" :description "Show the changelog" :handler #'pai-changelog-command)
 (pai-register-command "import" :description "Import a session from a .jsonl file" :handler #'pai-import-command)
 
-(defun pai-send-message (text &optional buffer)
+(defvar pai-send-images nil
+  "Image content blocks attached to the input being submitted.
+Bound by `pai-send-message'; `pai-send' sends them with a prompt (or a
+steering message) and hands them to `input' handlers.")
+
+(defun pai-send-message (text &optional buffer images)
   "Programmatically submit TEXT to the pai chat in BUFFER.
-BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
+BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer.
+IMAGES, a list of image blocks (see `pai-image'), go with a prompt."
   (with-current-buffer (or buffer (pai--menu-buffer) (error "No pai buffer"))
     (goto-char (point-max))
     (insert text)
-    (pai-send)))
+    (let ((pai-send-images images))
+      (pai-send))))
+
+(defun pai--user-content (text images)
+  "Return user message content for TEXT with IMAGES (blocks), if any."
+  (if images (cons (pai-text text) images) text))
 
 (defun pai--maybe-compact ()
   "Compact the live context between runs when it exceeds the model's window."
@@ -1890,8 +1907,9 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
              (not (pai--relieved-before-compact 'auto)))
     (pai--compact-now nil 'auto)))
 
-(defun pai--start-run (text)
-  "Start an agent run for user input TEXT (noting @file and *buffer mentions)."
+(defun pai--start-run (text &optional images)
+  "Start an agent run for user input TEXT (noting @file and *buffer mentions).
+IMAGES, a list of image blocks, are sent with it."
   (unless pai--model
     (setq pai--model (pai-model (or (pai-settings-get :model) pai-default-model))))
   (unless pai--model
@@ -1903,7 +1921,8 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
   (setq pai--active t
         pai--overflow-retried nil)
   (setq pai--run
-        (pai-agent-run (list (pai-user-message (pai--expand-mentions text)))
+        (pai-agent-run (list (pai-user-message
+                              (pai--user-content (pai--expand-mentions text) images)))
                        (pai-context pai--context-messages (pai-tools-all))
                        (pai--config)
                        (pai--emit-fn)
@@ -1946,9 +1965,10 @@ project's input history browsed by \\[pai-history-previous] and \\[pai-history-n
 Programmatic submissions (subagents, extensions) are not recorded."
   (interactive (list t))
   (when record (pai-refs-record-focus))
-  (let ((text (pai--input-text)))
+  (let ((text (pai--input-text))
+        (images pai-send-images))
     (cond
-     ((or (null text) (string-empty-p text)) (message "Empty input"))
+     ((or (null text) (and (string-empty-p text) (null images))) (message "Empty input"))
      ((and pai--compaction (not pai--active) (not (pai-command-input-p text)))
       (message "Compacting the context; send again when it finishes (C-c C-c stops it)"))
      (t
@@ -1956,7 +1976,7 @@ Programmatic submissions (subagents, extensions) are not recorded."
       (when record
         (ignore-errors (pai-history-add default-directory text)))
       (pai--clear-input)
-      (let ((action (ignore-errors (pai-ext-run-input text (pai--ext-context)))))
+      (let ((action (ignore-errors (pai-ext-run-input text (pai--ext-context) images))))
         (cond
          ((and action (eq (plist-get action :action) 'handled)) nil)
          (t
@@ -1966,9 +1986,11 @@ Programmatic submissions (subagents, extensions) are not recorded."
            ((string-prefix-p "!" text) (pai--run-bang text))
            ((pai-command-input-p text) (pai--run-command text))
            (pai--active
-            (push (pai-user-message (pai--expand-mentions text)) pai--steering-queue)
-            (pai--render-note (format "queued (steering): %s" text)))
-           (t (pai--start-run text))))))
+            (push (pai-user-message (pai--user-content (pai--expand-mentions text) images))
+                  pai--steering-queue)
+            (pai--render-note (format "queued (steering): %s%s" text
+                                      (if images (format " [%d image(s)]" (length images)) ""))))
+           (t (pai--start-run text images))))))
       (goto-char (point-max))))))
 
 ;;;; Input history (M-p / M-n)
