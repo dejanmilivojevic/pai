@@ -123,6 +123,12 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
      ((and (numberp exit-code) (/= exit-code 0) (null status))
       (pai-http--emit-error
        st (format "curl failed (exit %s): %s" exit-code (string-trim event))))
+     ;; The response started but did not finish (--max-time, a reset
+     ;; connection): the body is incomplete, not a successful answer.
+     ((and (numberp exit-code) (/= exit-code 0))
+      (pai-http--emit-error
+       st (format "connection ended before the response was complete (curl exit %s): %s"
+                  exit-code (string-trim (concat (pai-http--state-buffer st) " " event)))))
      ((null status)
       (pai-http--emit-error st (format "no HTTP response: %s" (string-trim event)))))
     (unless (pai-http--state-done st)
@@ -141,6 +147,16 @@ Multibyte pieces are written as UTF-8, unibyte ones as is.  Return the file."
       (let ((coding-system-for-write 'binary))
         (write-region nil nil file nil 'silent)))
     file))
+
+(defun pai-http-header-file (headers)
+  "Write HEADERS, an alist of (NAME . VALUE), to a new private file; return it.
+Return nil when HEADERS is empty.  curl reads the file with `-H @FILE', so
+header values -- API keys -- never appear in its command line, which any
+local user can read (ps, /proc/PID/cmdline).  The caller deletes the file."
+  (and headers
+       (pai-http--write-temp "pai-http-headers-"
+                             (mapcar (lambda (h) (format "%s: %s\n" (car h) (cdr h)))
+                                     headers))))
 
 (defun pai-http--delete-files (files)
   "Delete FILES, ignoring errors."
@@ -165,11 +181,7 @@ Return the process; kill it to abort the request."
   (let* ((st (pai-http--state-create
               :phase 'headers :on-frame on-frame
               :on-error on-error :on-close on-close))
-         (header-file (and headers
-                           (pai-http--write-temp
-                            "pai-http-headers-"
-                            (mapcar (lambda (h) (format "%s: %s\n" (car h) (cdr h)))
-                                    headers))))
+         (header-file (pai-http-header-file headers))
          (body-file (and body
                          (condition-case err
                              (pai-http--write-temp "pai-http-body-"

@@ -49,17 +49,28 @@ Returns a plain string when there are no images, else an array of parts."
               calls))))
 
 (defun pai-openai--messages (messages)
-  "Translate unified MESSAGES to an OpenAI messages array."
-  (let (out)
+  "Translate unified MESSAGES to an OpenAI messages array.
+A `tool' message carries text only, so images a tool returned (e.g. `read'
+of a PNG) follow the batch of tool messages as a user message."
+  (let (out images)
     (dolist (m messages)
+      (unless (or (null images) (pai-tool-result-message-p m))
+        (push (list :role "user" :content (pai-openai--tool-images images)) out)
+        (setq images nil))
       (pcase (pai-message-role m)
         ('system (push (list :role "system" :content (pai-content-text (pai-message-content m))) out))
         ('user (push (list :role "user" :content (pai-openai--user-content (pai-message-content m))) out))
         ('tool-result
-         (push (list :role "tool"
-                     :tool_call_id (plist-get m :tool-call-id)
-                     :content (pai-content-text (plist-get m :content)))
-               out))
+         (let ((imgs (seq-filter (lambda (b) (eq (pai-block-type b) 'image))
+                                 (plist-get m :content)))
+               (text (pai-content-text (plist-get m :content))))
+           (push (list :role "tool"
+                       :tool_call_id (plist-get m :tool-call-id)
+                       :content (if (and imgs (string-empty-p text))
+                                    "(image attached below)"
+                                  text))
+                 out)
+           (setq images (append images imgs))))
         ('assistant
          (let* ((content (pai-message-content m))
                 (text (pai-content-text content))
@@ -68,7 +79,14 @@ Returns a plain string when there are no images, else an array of parts."
                          (list :content (if (string-empty-p text) :null text))
                          (when tool-calls (list :tool_calls tool-calls)))
                  out)))))
+    (when images
+      (push (list :role "user" :content (pai-openai--tool-images images)) out))
     (nreverse out)))
+
+(defun pai-openai--tool-images (images)
+  "Return user message content presenting IMAGES returned by tools."
+  (pai-openai--user-content
+   (cons (pai-text "Image(s) returned by the tool call(s) above:") images)))
 
 (defun pai-openai--tools (tools)
   "Translate unified TOOLS declarations to OpenAI tool objects, or nil."

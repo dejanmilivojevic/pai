@@ -291,7 +291,8 @@ Always writes a JSON object (never a bare array), so an empty store round-trips.
   (pai-auth--save)
   nil)
 
-(defvar pai-auth-oauth-refresh-handlers nil
+(defvar pai-auth-oauth-refresh-handlers
+  '(("anthropic" . pai-auth-oauth-anthropic-refresh))
   "Alist of provider id -> refresh function.
 Each function receives the stored oauth credential plist and returns a fresh
 credential plist (with new :access/:refresh/:expires) or nil on failure.")

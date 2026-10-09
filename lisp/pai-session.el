@@ -28,7 +28,10 @@
   ;; message arrives, so sessions that were opened but never used do not
   ;; leave a file behind (and thus never show up in the history).
   (persisted nil)
-  (pending '()))
+  (pending '())
+  ;; last cons of ENTRIES, valid while ENTRIES is still TAIL-OF: appending
+  ;; is O(1) instead of copying the whole list per entry
+  tail tail-of)
 
 ;;;; Paths
 
@@ -125,12 +128,25 @@ symbol `memory' for an in-memory session that is never written to disk."
       (setq id (format "%08x" (random (expt 2 32)))))
     id))
 
+(defun pai-session--push-entry (session entry)
+  "Add ENTRY at the end of SESSION's entry list, in constant time."
+  (let ((cell (list entry))
+        (entries (pai-session-entries session))
+        (tail (pai-session-tail session)))
+    (cond ((null entries) (setf (pai-session-entries session) cell))
+          ;; the remembered tail, unless the list was replaced or extended
+          ((and tail (eq entries (pai-session-tail-of session)) (null (cdr tail)))
+           (setcdr tail cell))
+          (t (setcdr (last entries) cell)))
+    (setf (pai-session-tail session) cell
+          (pai-session-tail-of session) (pai-session-entries session))))
+
 (defun pai-session-append (session entry)
   "Append ENTRY (a plist with a string :type) to SESSION and persist it.
 Assigns a unique :id and links :parentId to the current leaf, advancing it."
   (let* ((id (pai-session--gen-id session))
          (full (append (list :id id :parentId (pai-session-leaf-id session)) entry)))
-    (setf (pai-session-entries session) (append (pai-session-entries session) (list full)))
+    (pai-session--push-entry session full)
     (puthash id full (pai-session-by-id session))
     (setf (pai-session-leaf-id session) id)
     (pai-session--append-line session full)

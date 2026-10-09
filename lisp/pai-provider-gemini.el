@@ -24,9 +24,14 @@
               ('text (list :text (or (plist-get b :text) "")))
               ('image (list :inlineData (list :mimeType (plist-get b :mime-type)
                                               :data (plist-get b :data))))
-              ('tool-call (list :functionCall (list :name (plist-get b :name)
-                                                    :args (or (plist-get b :arguments)
-                                                              (pai-json-empty-object)))))
+              ('tool-call (append
+                           (list :functionCall (list :name (plist-get b :name)
+                                                     :args (or (plist-get b :arguments)
+                                                               (pai-json-empty-object))))
+                           ;; replayed as received: Gemini 3 rejects function
+                           ;; calls whose thought signature is missing
+                           (when (plist-get b :thought-signature)
+                             (list :thoughtSignature (plist-get b :thought-signature)))))
               (_ (list :text ""))))
           (pai-normalize-content content)))
 
@@ -46,11 +51,16 @@
         ('user (setq acc (pai-gemini--push-user acc (pai-gemini--parts (pai-message-content m)))))
         ('assistant (push (list :role "model" :parts (pai-gemini--parts (pai-message-content m))) acc))
         ('tool-result
-         (setq acc (pai-gemini--push-user
-                    acc (list (list :functionResponse
-                                    (list :name (plist-get m :tool-name)
-                                          :response (list :result (pai-content-text
-                                                                   (plist-get m :content)))))))))
+         ;; a functionResponse carries text only; images the tool returned
+         ;; (e.g. `read' of a PNG) follow it as inline parts of the same turn
+         (let ((images (seq-filter (lambda (b) (eq (pai-block-type b) 'image))
+                                   (plist-get m :content))))
+           (setq acc (pai-gemini--push-user
+                      acc (cons (list :functionResponse
+                                      (list :name (plist-get m :tool-name)
+                                            :response (list :result (pai-content-text
+                                                                     (plist-get m :content)))))
+                                (pai-gemini--parts images))))))
         ('system nil)))
     (nreverse acc)))
 
@@ -182,10 +192,13 @@ SAW-CALL non-nil forces `tool-use'."
                      (close-open)
                      (setq saw-call t)
                      (let* ((fc (plist-get part :functionCall))
+                            (sig (plist-get part :thoughtSignature))
                             (oi (pai-accum-toolcall-start
                                  acc emit (format "call_%d" (cl-incf call-counter))
                                  (plist-get fc :name))))
-                       (pai-accum-toolcall-end acc emit oi (plist-get fc :args))))
+                       (pai-accum-toolcall-end acc emit oi (plist-get fc :args)
+                                               (when (stringp sig)
+                                                 (list :thought-signature sig)))))
                     ((and (pai-truthy (plist-get part :thought)) (plist-get part :text))
                      (ensure 'thinking)
                      (pai-accum-thinking-delta acc emit (cdr open) (plist-get part :text)))
