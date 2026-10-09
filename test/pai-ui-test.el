@@ -268,6 +268,27 @@
           (pai--arg-completion-exit "se" 'exact)
           (should (= opened 1)))))))
 
+(ert-deftest pai-ui-command-opening-a-buffer-keeps-its-point ()
+  "A command that makes another buffer current (as `pop-to-buffer' does for
+/menu and /memory-review) keeps that buffer's point, and its message goes to
+the chat."
+  (pai-ui-test--with-buffer buf dir
+    (let ((other (generate-new-buffer "*zz-screen*")))
+      (with-current-buffer other (insert "line 1\nline 2\n") (goto-char 3))
+      (with-current-buffer buf
+        (pai-register-command "zz-open" :handler (lambda (_args _ctx)
+                                                   (set-buffer other)
+                                                   (list :message "opened the screen")))
+        (unwind-protect
+            (progn
+              (pai-ui-test--type-and-send "/zz-open")
+              (should (= (with-current-buffer other (point)) 3))
+              (should (equal (with-current-buffer other (buffer-string)) "line 1\nline 2\n"))
+              (should (string-match-p "opened the screen" (buffer-string)))
+              (should (= (point) (point-max))))
+          (pai-unregister-command "zz-open")
+          (kill-buffer other))))))
+
 (ert-deftest pai-ui-arg-completion-single-level-does-not-repeat ()
   "A completer that ignores the position (like `/model') completes only the
 first argument: accepting a value neither chains nor offers it again."
