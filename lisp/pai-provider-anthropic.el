@@ -64,10 +64,14 @@ client version derives it from here."
    (lambda (b)
      (pcase (pai-block-type b)
        ('text (list :type "text" :text (or (plist-get b :text) "")))
-       ('image (list :type "image"
-                     :source (list :type "base64"
-                                   :media_type (plist-get b :mime-type)
-                                   :data (plist-get b :data))))
+       ('image
+        ;; An empty image is a 400 that replays on every turn; send a note instead.
+        (if (member (plist-get b :data) '(nil ""))
+            (list :type "text" :text "[empty image omitted]")
+          (list :type "image"
+                :source (list :type "base64"
+                              :media_type (plist-get b :mime-type)
+                              :data (plist-get b :data)))))
        ('thinking
         ;; Unsigned thinking blocks (a stream that ended right after a
         ;; thinking block started) are rejected by the API with

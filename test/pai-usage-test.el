@@ -35,6 +35,18 @@ KEYS is an alist provider->api-key, CREDS provider->cred-plist, JSON a function
     (pai-usage-test--with '(("a" . "key-a")) nil (lambda (&rest _) nil)
       (should (equal (pai-usage-available-providers) '("a"))))))
 
+(ert-deftest pai-usage-aliases-share-one-entry ()
+  "Aliased providers resolve to one usage entry with its own key function."
+  (let ((pai-usage-providers nil) (pai-usage-key-functions nil)
+        (pai-usage-aliases '(("p1" . "acct") ("p2" . "acct"))))
+    (pai-register-usage-provider "acct" (lambda (k _c) (list :summary k))
+                                 (lambda (_id) "file-key"))
+    (pai-usage-test--with nil nil (lambda (&rest _) nil)
+      (should (pai-usage-provider-p "p1"))
+      (should (equal (pai-usage-available-providers) '("acct")))
+      (should (equal (plist-get (pai-usage-fetch "p2") :provider) "acct"))
+      (should (equal (plist-get (pai-usage-fetch "p2") :summary) "file-key")))))
+
 (ert-deftest pai-usage-fetch-error-captured ()
   (let ((pai-usage-providers nil))
     (pai-register-usage-provider "boom" (lambda (_k _c) (error "kaboom")))

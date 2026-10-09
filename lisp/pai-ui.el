@@ -175,7 +175,13 @@ prompt is re-pinned to the bottom of the window."
                'pai-user-face)
   (pai--insert (concat (pai-md-highlight-fences
                         (string-trim-right (pai-content-text (pai-message-content message))))
-                       "\n")))
+                       "\n"))
+  (let ((images (and (listp (pai-message-content message))
+                     (seq-count (lambda (b) (eq (pai-block-type b) 'image))
+                                (pai-message-content message)))))
+    (when (and images (> images 0))
+      (pai--insert (format "[%d image%s attached]\n" images (if (= images 1) "" "s"))
+                   'pai-note-face))))
 
 (defun pai--render-note (text &optional face)
   "Render a UI note TEXT with FACE (default `pai-note-face')."
@@ -357,7 +363,10 @@ prompt is re-pinned to the bottom of the window."
          (progn (when pai--assistant-open
                   (pai--ensure-fresh-line)
                   (setq pai--assistant-open nil pai--assistant-content-start nil))
-                (pai--render-note "— interrupted —" 'pai-error-face))
+                (pai--render-note (if-let ((err (plist-get event :error)))
+                                      (format "— stopped by an internal error: %s —" err)
+                                    "— interrupted —")
+                                  'pai-error-face))
        (pai--render-note "— ready —"))
      (unless pai--steering-queue
        (pai-ext-emit 'agent-settled (pai--ext-context)))
@@ -375,7 +384,12 @@ Called as each message completes, so the header (context, cost, limits)
 and extension widgets update while the agent works, not only at the end."
   (when (and message (not (memq message pai--run-committed)))
     (push message pai--run-committed)
-    (when pai--session (pai-session-append-message pai--session message))
+    ;; a failed write must not abort the run's bookkeeping (e.g. agent-end)
+    (when pai--session
+      (condition-case err
+          (pai-session-append-message pai--session message)
+        (error (message "pai: could not save a message to the session: %s"
+                        (error-message-string err)))))
     (setq pai--context-messages (append pai--context-messages (list message)))
     (pai--update-usage (list message))))
 
@@ -698,7 +712,8 @@ skip that wait (but never a rate-limit backoff)."
     (dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (and (derived-mode-p 'pai-mode) pai--model
-                   (equal (pai-model-provider pai--model) provider))
+                   (equal (pai-usage-id (pai-model-provider pai--model))
+                          (pai-usage-id provider)))
           ;; Compare with properties: the same numbers turning stale only
           ;; change their face.
           (unless (equal-including-properties pai--usage-summary summary)
@@ -761,7 +776,7 @@ itself a mode-line construct, where `%' starts a directive: an unescaped
 ;; mode line is therefore evaluated at most once per
 ;; `pai-mode-line-cache-interval' per window, and again right after a
 ;; command, a change of the selected window or a resize; other redraws reuse
-;; the string.
+;; the string -- unless the window's active/inactive state changed since.
 
 (defcustom pai-mode-line-cache t
   "Non-nil to cache the global mode line in pai buffers (see above).
@@ -774,24 +789,38 @@ Time-based segments (a clock) in pai windows lag by up to this much."
   :type 'number :group 'pai)
 
 (defvar-local pai--mode-line-cache nil
-  "Cached global mode lines: alist WINDOW -> (TIME . STRING).")
+  "Cached global mode lines: alist WINDOW -> (TIME STATE . STRING).
+STATE is `pai--mode-line-state' when STRING was built.")
 
 (defun pai--mode-line-invalidate (&rest _)
-  "Forget the cached mode lines of this buffer's windows."
-  (setq pai--mode-line-cache nil))
+  "Forget the cached mode lines of this buffer's windows and redraw them.
+On a selection change this runs after the mode lines were drawn, so
+without the forced update a stale copy would stay until the next redraw."
+  (setq pai--mode-line-cache nil)
+  (force-mode-line-update))
+
+(defun pai--mode-line-state ()
+  "Return what decides the active/inactive look of the window being drawn.
+The look is baked into the cached string as faces, so a copy is only
+reused while this is unchanged.  Spaceline reads `powerline-selected-window'."
+  (list (and (fboundp 'mode-line-window-selected-p) (mode-line-window-selected-p))
+        (and (boundp 'powerline-selected-window) powerline-selected-window)))
 
 (defun pai--mode-line-host ()
   "Return the global mode line for the window being drawn, cached.
 During mode-line evaluation the window being drawn is the selected one."
   (let* ((win (selected-window))
          (hit (assq win pai--mode-line-cache))
+         (state (pai--mode-line-state))
          (now (float-time)))
-    (if (and hit (< (- now (cadr hit)) pai-mode-line-cache-interval))
-        (cddr hit)
+    (if (and hit
+             (< (- now (nth 1 hit)) pai-mode-line-cache-interval)
+             (equal state (nth 2 hit)))
+        (nthcdr 3 hit)
       (let ((text (pai--mode-line-escape
                    (format-mode-line (default-value 'mode-line-format) nil win))))
         (setq pai--mode-line-cache
-              (cons (cons win (cons now text))
+              (cons (cl-list* win now state text)
                     (seq-filter (lambda (c) (and (not (eq (car c) win)) (window-live-p (car c))))
                                 pai--mode-line-cache)))
         text))))
@@ -958,7 +987,8 @@ when the kept tail maps back to session entries; see
   (let ((tokens (round (/ (plist-get state :chars) 4.0)))
         (limit pai-compaction-summary-max-tokens))
     (if (<= tokens 0)
-        (format "%s · waiting for the model" (plist-get state :what))
+        (format "%s · waiting for %s" (plist-get state :what)
+                (or (plist-get state :model-key) "the model"))
       (format "%s · %s %s/%s tokens"
               (plist-get state :what)
               (pai--compaction-bar (/ (float tokens) limit))
@@ -985,7 +1015,9 @@ asynchronous one only updates its activity line."
 NOTE is rendered in the transcript.  ASYNC marks a compaction that does not
 block Emacs."
   (let* ((buffer (current-buffer))
+         (model (pai--compact-model))
          (state (list :chars 0 :async async :reason reason :buffer buffer
+                      :model-key (and model (pai-model-key model))
                       :messages messages :before (length messages)
                       :what (format "%d messages, ~%s tokens" (length messages)
                                     (pai-activity-fmt-count
@@ -1025,6 +1057,8 @@ block Emacs."
                               (if (equal strategy "summary") ""
                                 (format " [%s]" strategy))
                               (plist-get state :before) (length pai--context-messages) took))
+    (when-let ((warning (plist-get result :warning)))
+      (pai--render-note warning 'pai-error-face))
     (message "pai: context compacted in %s (%d → %d messages)"
              took (plist-get state :before) (length pai--context-messages))
     t))
@@ -1191,6 +1225,15 @@ grew by the keep-recent budget (see `pai--compact-failed-at')."
              (>= (pai-estimate-context-tokens pai--context-messages)
                  (+ pai--compact-failed-at (pai-compaction-keep-recent-tokens)))))))
 
+(defun pai--relieved-before-compact (reason)
+  "Give `pre-compact' handlers (e.g. `/shake') a go before a REASON compaction.
+Return non-nil when they shrank the context below the compaction threshold,
+so no compaction is needed."
+  (let ((cw (and pai--model (plist-get pai--model :context-window))))
+    (and (pai-ext-run-pre-compact (pai--ext-context) :reason reason)
+         cw (> cw 0)
+         (not (pai-should-compact-p pai--context-messages cw)))))
+
 (defun pai--before-turn (resume)
   "Between two turns of a run: compact when due, then RESUME the run.
 Port of pi's compaction before the next assistant response: a `/compact'
@@ -1200,11 +1243,14 @@ with the compacted context.  Return non-nil when the run was paused."
   (let ((request pai--compact-request))
     (when (or request (pai--auto-compact-due-p))
       (setq pai--compact-request nil)
+      (if (and (not request) (pai--relieved-before-compact 'auto))
+          ;; shaken below the threshold: continue with the smaller context
+          (progn (funcall resume (list :messages pai--context-messages)) t)
       (pai--compact-async
        (if request 'manual 'auto) (plist-get request :instructions)
        (lambda (ok)
          (pai--set-status "working…")
-         (funcall resume (and ok (list :messages pai--context-messages))))))))
+         (funcall resume (and ok (list :messages pai--context-messages)))))))))
 
 (defun pai--recover-error (message resume)
   "Recover from the failed assistant MESSAGE of a run, then RESUME it.
@@ -1223,7 +1269,9 @@ non-nil when recovery started."
       (let ((without (remq message pai--context-messages)))
         (setq pai--context-messages without)
         (pai--render-note "Context overflow: compacting, then retrying the turn once.")
-        (or (pai--compact-async
+        (or (and (pai--relieved-before-compact 'overflow)
+                 (progn (funcall resume (list :messages pai--context-messages)) t))
+            (pai--compact-async
              'overflow nil
              (lambda (ok)
                (pai--set-status "working…")
@@ -1840,23 +1888,36 @@ are fully reloaded (including `require'd siblings), and settings/models refresh.
 (pai-register-command "changelog" :description "Show the changelog" :handler #'pai-changelog-command)
 (pai-register-command "import" :description "Import a session from a .jsonl file" :handler #'pai-import-command)
 
-(defun pai-send-message (text &optional buffer)
+(defvar pai-send-images nil
+  "Image content blocks attached to the input being submitted.
+Bound by `pai-send-message'; `pai-send' sends them with a prompt (or a
+steering message) and hands them to `input' handlers.")
+
+(defun pai-send-message (text &optional buffer images)
   "Programmatically submit TEXT to the pai chat in BUFFER.
-BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
+BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer.
+IMAGES, a list of image blocks (see `pai-image'), go with a prompt."
   (with-current-buffer (or buffer (pai--menu-buffer) (error "No pai buffer"))
     (goto-char (point-max))
     (insert text)
-    (pai-send)))
+    (let ((pai-send-images images))
+      (pai-send))))
+
+(defun pai--user-content (text images)
+  "Return user message content for TEXT with IMAGES (blocks), if any."
+  (if images (cons (pai-text text) images) text))
 
 (defun pai--maybe-compact ()
   "Compact the live context between runs when it exceeds the model's window."
   (require 'pai-compaction)
   (when (and pai--model
-             (pai-should-compact-p pai--context-messages (plist-get pai--model :context-window)))
+             (pai-should-compact-p pai--context-messages (plist-get pai--model :context-window))
+             (not (pai--relieved-before-compact 'auto)))
     (pai--compact-now nil 'auto)))
 
-(defun pai--start-run (text)
-  "Start an agent run for user input TEXT (noting @file and *buffer mentions)."
+(defun pai--start-run (text &optional images)
+  "Start an agent run for user input TEXT (noting @file and *buffer mentions).
+IMAGES, a list of image blocks, are sent with it."
   (unless pai--model
     (setq pai--model (pai-model (or (pai-settings-get :model) pai-default-model))))
   (unless pai--model
@@ -1873,15 +1934,16 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
                (pai--compact-async 'auto nil
                                    (lambda (_ok)
                                      (when pai--active
-                                       (pai--launch-run text)))))
-    (pai--launch-run text)))
+                                       (pai--launch-run text images)))))
+    (pai--launch-run text images)))
 
-(defun pai--launch-run (text)
-  "Start the agent run for user input TEXT."
+(defun pai--launch-run (text &optional images)
+  "Start the agent run for user input TEXT with IMAGES (image blocks)."
   (setq pai--active t
         pai--overflow-retried nil)
   (setq pai--run
-        (pai-agent-run (list (pai-user-message (pai--expand-mentions text)))
+        (pai-agent-run (list (pai-user-message
+                              (pai--user-content (pai--expand-mentions text) images)))
                        (pai-context pai--context-messages (pai-tools-all))
                        (pai--config)
                        (pai--emit-fn)
@@ -1889,7 +1951,9 @@ BUFFER defaults to the current pai buffer, else any live `pai-mode' buffer."
 
 (defun pai--run-command (text)
   "Dispatch slash-command TEXT."
-  (let* ((res (pai-command-dispatch text (pai--ext-context)))
+  ;; a command may make another buffer current (`pop-to-buffer' for /menu):
+  ;; its note and anything after it belong to the chat
+  (let* ((res (save-current-buffer (pai-command-dispatch text (pai--ext-context))))
          (r (plist-get res :result)))
     (cond
      ((not (plist-get res :handled))
@@ -1935,9 +1999,10 @@ project's input history browsed by \\[pai-history-previous] and \\[pai-history-n
 Programmatic submissions (subagents, extensions) are not recorded."
   (interactive (list t))
   (when record (pai-refs-record-focus))
-  (let ((text (pai--input-text)))
+  (let ((text (pai--input-text))
+        (images pai-send-images))
     (cond
-     ((or (null text) (string-empty-p text)) (message "Empty input"))
+     ((or (null text) (and (string-empty-p text) (null images))) (message "Empty input"))
      ((and pai--compaction (not pai--active) (not (pai-command-input-p text)))
       (message "Compacting the context; send again when it finishes (C-c C-c stops it)"))
      (t
@@ -1945,7 +2010,8 @@ Programmatic submissions (subagents, extensions) are not recorded."
       (when record
         (ignore-errors (pai-history-add default-directory text)))
       (pai--clear-input)
-      (let ((action (ignore-errors (pai-ext-run-input text (pai--ext-context)))))
+      (let ((action (save-current-buffer
+                      (ignore-errors (pai-ext-run-input text (pai--ext-context) images)))))
         (cond
          ((and action (eq (plist-get action :action) 'handled)) nil)
          (t
@@ -1955,9 +2021,11 @@ Programmatic submissions (subagents, extensions) are not recorded."
            ((string-prefix-p "!" text) (pai--run-bang text))
            ((pai-command-input-p text) (pai--run-command text))
            (pai--active
-            (push (pai-user-message (pai--expand-mentions text)) pai--steering-queue)
-            (pai--render-note (format "queued (steering): %s" text)))
-           (t (pai--start-run text))))))
+            (push (pai-user-message (pai--user-content (pai--expand-mentions text) images))
+                  pai--steering-queue)
+            (pai--render-note (format "queued (steering): %s%s" text
+                                      (if images (format " [%d image(s)]" (length images)) ""))))
+           (t (pai--start-run text images))))))
       (goto-char (point-max))))))
 
 ;;;; Input history (M-p / M-n)

@@ -197,5 +197,40 @@
     (should (equal (plist-get back :role) "user"))
     (should (equal (plist-get back :content) "hello world"))))
 
+(ert-deftest pai-core-image-dimensions ()
+  (should (equal (pai-image-dimensions
+                  (concat "\x89PNG\r\n\x1a\n" "\0\0\0\x0dIHDR" "\0\0\x04\x38" "\0\0\x09\x60"))
+                 '(1080 . 2400)))
+  (should (equal (pai-image-dimensions "GIF89a\x10\0\x20\0") '(16 . 32)))
+  (should (equal (pai-image-dimensions
+                  (concat "\xff\xd8" "\xff\xe0\0\x04\ ab" "\xff\xc0\0\x11\x08\x01\x00\x02\x00\x03"))
+                 '(512 . 256)))
+  (should-not (pai-image-dimensions "garbage")))
+
+(ert-deftest pai-core-image-fit-leaves-small-or-unknown-data ()
+  (should (equal (pai-image-fit "d" "image/png") "d"))
+  (should (equal (pai-image-fit "" "image/png") ""))
+  (let ((small (base64-encode-string
+                (concat "\x89PNG\r\n\x1a\n" "\0\0\0\x0dIHDR" "\0\0\0\x10" "\0\0\0\x10") t)))
+    (should (equal (pai-image-fit small "image/png") small))))
+
+(ert-deftest pai-core-image-fit-downscales-large-image ()
+  (skip-unless (executable-find "sips"))
+  (let* ((src (make-temp-file "pai-img-src" nil ".png"))
+         (pai-image-max-dimension 100))
+    (unwind-protect
+        (progn
+          ;; Any system PNG works; build one with sips from a generated TIFF-free source.
+          (should (eq 0 (call-process "sips" nil nil nil "-s" "format" "png" "-z" "400" "200"
+                                      "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericDocumentIcon.icns"
+                                      "--out" src)))
+          (let* ((data (with-temp-buffer (set-buffer-multibyte nil)
+                                         (insert-file-contents-literally src)
+                                         (base64-encode-string (buffer-string) t)))
+                 (fit (pai-image-fit data "image/png")))
+            (should (equal (pai-image-dimensions (base64-decode-string fit)) '(50 . 100)))
+            (should (equal (plist-get (pai-image data "image/png") :data) fit))))
+      (delete-file src))))
+
 (provide 'pai-core-test)
 ;;; pai-core-test.el ends here

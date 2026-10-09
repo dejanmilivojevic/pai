@@ -427,22 +427,105 @@ Be concise. Focus on what's needed to understand the kept suffix."
 Bound by the UI around a compaction to show progress; the summary itself
 is unaffected.")
 
+(defconst pai-compaction-update-instructions
+  "The conversation above holds NEW messages to incorporate into the existing summary given in <previous-summary> tags. Update that summary:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed
+- UPDATE \"Next Steps\" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Keep exactly the structure of the previous summary."
+  "Instructions for folding the next part of a long transcript into the
+summary of the parts before it (after pi's update prompt).")
+
+(defun pai-compaction--request-text (text custom-instructions &optional kind previous)
+  "Return the summarization context for the serialized transcript TEXT.
+KIND `turn-prefix' asks for pi's split-turn prefix summary instead of the
+full structured summary.  With PREVIOUS, the summary of the transcript's
+earlier parts, TEXT is folded into it instead."
+  (pai-context
+   (list (pai-system-message pai-compaction-system-prompt)
+         (pai-user-message
+          (concat (if (eq kind 'turn-prefix)
+                      pai-compaction-turn-prefix-instructions
+                    pai-compaction-format-instructions)
+                  (when (and custom-instructions (not (eq kind 'turn-prefix))
+                             (not (string-empty-p custom-instructions)))
+                    (concat "\n\nAdditional instructions: " custom-instructions))
+                  "\n\n<conversation>\n" text "\n</conversation>"
+                  (when previous
+                    (concat "\n\n<previous-summary>\n" previous "\n</previous-summary>\n\n"
+                            pai-compaction-update-instructions)))))
+   nil))
+
 (defun pai-compaction--request (messages custom-instructions &optional kind)
   "Return the summarization context for MESSAGES with CUSTOM-INSTRUCTIONS.
-KIND `turn-prefix' asks for pi's split-turn prefix summary instead of the
-full structured summary."
-  (let ((convo (pai-compaction--serialize messages)))
-    (pai-context
-     (list (pai-system-message pai-compaction-system-prompt)
-           (pai-user-message
-            (concat (if (eq kind 'turn-prefix)
-                        pai-compaction-turn-prefix-instructions
-                      pai-compaction-format-instructions)
-                    (when (and custom-instructions (not (eq kind 'turn-prefix))
-                               (not (string-empty-p custom-instructions)))
-                      (concat "\n\nAdditional instructions: " custom-instructions))
-                    "\n\n<conversation>\n" convo "\n</conversation>")))
-     nil)))
+KIND is as for `pai-compaction--request-text'."
+  (pai-compaction--request-text (pai-compaction--serialize messages)
+                                custom-instructions kind))
+
+;;;; Fitting the summarizer's context window
+
+(defcustom pai-compaction-window-fraction 0.8
+  "Share of the summarizing model's context window a summary request may fill.
+Longer transcripts are summarized in parts, each folded into the summary of
+the parts before it.  The rest of the window leaves room for the estimate's
+error, the instructions, the previous summary and the answer."
+  :type 'number :group 'pai)
+
+(defconst pai-compaction--prompt-overhead-tokens 2000
+  "Estimated tokens of a summary request besides the transcript and summary.")
+
+(defun pai-compaction-input-budget (model kind)
+  "Return how many characters of transcript one KIND summary request to MODEL
+may carry, or nil when MODEL's context window is unknown."
+  (let ((cw (plist-get model :context-window)))
+    (when (and (numberp cw) (> cw 0))
+      (* (max 1000 (- (floor (* pai-compaction-window-fraction cw))
+                      (pai-compaction--max-tokens kind)
+                      pai-compaction-summary-max-tokens ; the previous summary
+                      pai-compaction--prompt-overhead-tokens))
+         (max 1 pai-estimate-chars-per-token)))))
+
+(defun pai-compaction--split-text (text size)
+  "Split TEXT into pieces of at most SIZE characters, at line ends when possible."
+  (let ((pieces nil) (start 0) (n (length text)))
+    (while (> (- n start) size)
+      (let* ((end (+ start size))
+             (nl (string-search "\n" (substring text (+ start (/ (* size 9) 10)) end))))
+        (when nl (setq end (+ start (/ (* size 9) 10) nl 1)))
+        (push (substring text start end) pieces)
+        (setq start end)))
+    (push (substring text start) pieces)
+    (nreverse pieces)))
+
+(defun pai-compaction-chunk-texts (messages model kind)
+  "Return MESSAGES serialized as the transcript texts of KIND summary requests.
+Each fits one request to MODEL (see `pai-compaction-input-budget'); messages
+are kept whole where they fit, a single larger one is cut at line ends.  One
+text when MODEL's window is unknown or everything fits."
+  (let ((budget (pai-compaction-input-budget model kind))
+        (whole (pai-compaction--serialize messages)))
+    (if (or (null budget) (<= (length whole) budget))
+        (list whole)
+      (let ((chunks nil) (cur nil) (cur-len 0))
+        (cl-flet ((flush () (when cur
+                              (push (mapconcat #'identity (nreverse cur) "\n\n") chunks)
+                              (setq cur nil cur-len 0))))
+          (dolist (m (seq-remove #'pai-system-message-p messages))
+            (let ((text (pai-compaction--serialize (list m))))
+              (unless (string-empty-p text)
+                (if (> (length text) budget)
+                    (progn (flush)
+                           (dolist (piece (pai-compaction--split-text text budget))
+                             (push piece chunks)))
+                  (when (> (+ cur-len (length text) 2) budget) (flush))
+                  (push text cur)
+                  (setq cur-len (+ cur-len (length text) 2))))))
+          (flush))
+        (nreverse chunks)))))
 
 (defun pai-compaction--progress-handler (progress)
   "Return a stream-event handler feeding text deltas to PROGRESS, or nil."
@@ -473,12 +556,13 @@ summary must not become the context."
       (/ pai-compaction-summary-max-tokens 2)
     pai-compaction-summary-max-tokens))
 
-(defun pai-compaction--summarize-step (messages model instructions kind sync progress callback
-                                                 &optional reasoning)
-  "Summarize MESSAGES of KIND with MODEL, then call CALLBACK with the result.
-SYNC blocks until done; otherwise return the stream handle.  REASONING is
-the thinking level (a symbol, nil for off) of the `:compact' role."
-  (let ((ctx (pai-compaction--request messages instructions kind))
+(defun pai-compaction--summarize-text (text model instructions kind previous sync progress
+                                             callback &optional reasoning)
+  "Summarize the transcript TEXT of KIND with MODEL, then call CALLBACK.
+PREVIOUS, when non-nil, is the summary TEXT is folded into.  SYNC blocks
+until done; otherwise return the stream handle.  REASONING is the thinking
+level (a symbol, nil for off) of the `:compact' role."
+  (let ((ctx (pai-compaction--request-text text instructions kind previous))
         (opts (append (list :max-tokens (pai-compaction--max-tokens kind))
                       (when reasoning (list :reasoning reasoning))))
         (on-delta (pai-compaction--progress-handler progress)))
@@ -495,6 +579,41 @@ the thinking level (a symbol, nil for off) of the `:compact' role."
            (when (and (not done) (memq (plist-get ev :type) '(done error)))
              (setq done t)
              (funcall callback (pai-compaction--final-result (plist-get ev :message) kind)))))))))
+
+(defun pai-compaction--summarize-step (messages model instructions kind sync progress callback
+                                                 &optional reasoning set-handle)
+  "Summarize MESSAGES of KIND with MODEL, then call CALLBACK with the result.
+When MESSAGES do not fit one request to MODEL they are summarized in parts
+\(`pai-compaction-chunk-texts'), each folded into the summary of the ones
+before it.  SYNC blocks until done.  SET-HANDLE, when given, is called with
+the stream handle of every request, for aborting.  REASONING is the thinking
+level (a symbol, nil for off) of the `:compact' role."
+  (let* ((texts (pai-compaction-chunk-texts messages model kind))
+         (n (length texts))
+         (usage nil)
+         (next nil))
+    (setq next
+          (lambda (i previous)
+            (let ((h (pai-compaction--summarize-text
+                      (nth i texts) model instructions kind previous sync progress
+                      (lambda (r)
+                        (cond
+                         ((plist-get r :error)
+                          (funcall callback
+                                   (if (> n 1)
+                                       (list :error (format "part %d of %d: %s"
+                                                            (1+ i) n (plist-get r :error)))
+                                     r)))
+                         (t
+                          (setq usage (pai-compaction--merge-usage usage (plist-get r :usage)))
+                          (if (< (1+ i) n)
+                              (funcall next (1+ i) (plist-get r :text))
+                            (funcall callback (list :text (plist-get r :text) :usage usage
+                                                    :parts n))))))
+                      reasoning)))
+              (when (and h set-handle) (funcall set-handle h)))))
+    (funcall next 0 nil)
+    nil))
 
 (defun pai-compaction-summarize (messages model &optional custom-instructions reasoning)
   "Summarize MESSAGES with MODEL synchronously, thinking at REASONING.
@@ -536,14 +655,14 @@ REASONING is the thinking level (a symbol, nil for off) of every call."
          (step (lambda (msgs kind k)
                  (if (plist-get state :cancelled)
                      (funcall finish nil)
-                   (plist-put state :handle
-                              (pai-compaction--summarize-step
-                               msgs model custom-instructions kind sync progress
-                               (lambda (r)
-                                 (if (or (plist-get r :error) (plist-get state :cancelled))
-                                     (funcall finish r)
-                                   (funcall k r)))
-                               reasoning))))))
+                   (pai-compaction--summarize-step
+                    msgs model custom-instructions kind sync progress
+                    (lambda (r)
+                      (if (or (plist-get r :error) (plist-get state :cancelled))
+                          (funcall finish r)
+                        (funcall k r)))
+                    reasoning
+                    (lambda (h) (plist-put state :handle h)))))))
     (cond
      ((null prefix)
       (funcall step history 'history finish))

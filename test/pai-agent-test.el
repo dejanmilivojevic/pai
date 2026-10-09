@@ -135,6 +135,49 @@
                             (pai-content-text (plist-get tr :content))))
     (should (equal (pai-content-text (pai-message-content (nth 3 messages))) "recovered"))))
 
+(ert-deftest pai-agent-error-in-continuation-ends-run ()
+  "An error after a tool finished (here: in the event sink) ends the run.
+It used to escape into the process filter and leave the run hanging."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "echo" :arguments (:msg "x"))) :stop-reason tool-use)
+                 '(:text "never reached" :stop-reason stop))
+  (let* ((events '()) (completed nil)
+         (run (pai-agent-run (list (pai-user-message "go"))
+                             (pai-context nil (list (pai-agent-test--echo-tool)))
+                             (list :model (pai-model "faux"))
+                             (lambda (ev)
+                               (push ev events)
+                               (when (eq (plist-get ev :type) 'tool-execution-end)
+                                 (signal 'wrong-type-argument '(utf-8-string-p "\377"))))
+                             (lambda (_msgs) (setq completed t))))
+         (end (seq-find (lambda (e) (eq (plist-get e :type) 'agent-end)) events)))
+    (should (pai-run-finished run))
+    (should (pai-run-aborted run))
+    (should end)
+    (should (plist-get end :aborted))
+    (should (string-match-p "utf-8-string-p" (plist-get end :error)))
+    (should-not completed)              ; like an abort: the stopper owns completion
+    ;; the second turn never started
+    (should (= 1 (seq-count (lambda (e) (eq (plist-get e :type) 'message-end))
+                            (seq-filter (lambda (e) (pai-assistant-message-p (plist-get e :message)))
+                                        events))))))
+
+(ert-deftest pai-agent-tool-result-is-sanitized ()
+  "Raw bytes in a tool result are replaced, so it can always be serialized."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "raw" :arguments nil)) :stop-reason tool-use)
+                 '(:text "ok" :stop-reason stop))
+  (let* ((tool (list :name "raw" :description "raw bytes" :deferred nil
+                     :parameters (list :type "object" :properties nil)
+                     :execute (lambda (_a _c _u on-done)
+                                (funcall on-done (pai-tool-ok-result
+                                                  (concat "a" (string-to-multibyte (unibyte-string #xff)) "b"))))))
+         (out (pai-agent-test--run (list (pai-user-message "go"))
+                                   (list :model (pai-model "faux") :tools (list tool))))
+         (tr (nth 2 (cdr out))))
+    (should (equal (pai-content-text (plist-get tr :content)) "a\uFFFDb"))
+    (should (pai-json-encode tr))))
+
 ;;;; Hooks
 
 (ert-deftest pai-agent-should-stop-after-turn ()

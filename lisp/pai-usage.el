@@ -38,29 +38,49 @@
 (require 'pai-commands)
 (require 'pai-auth)
 (require 'pai-provider-anthropic)
-(require 'url)
+(require 'pai-http)
 
 (defvar pai-usage-providers nil
   "Alist of provider id (string) -> fetcher function.
 The fetcher takes (KEY CRED) and returns a plist (:summary :detail) or signals.")
 
-(defun pai-register-usage-provider (id fetcher)
-  "Register FETCHER as the usage reporter for provider ID.  Re-registering replaces."
+(defvar pai-usage-key-functions nil
+  "Alist of provider id -> function of ID returning its token, or nil.
+For providers whose token `pai-api-key' cannot resolve (e.g. a key file).")
+
+(defun pai-register-usage-provider (id fetcher &optional key-fn)
+  "Register FETCHER as the usage reporter for provider ID.  Re-registering replaces.
+KEY-FN, if given, resolves ID's token instead of `pai-api-key'."
   (setf (alist-get id pai-usage-providers nil nil #'equal) fetcher)
+  (setf (alist-get id pai-usage-key-functions nil t #'equal) key-fn)
   id)
+
+(defvar pai-usage-aliases nil
+  "Alist of model provider id -> usage provider id reporting for it.
+Lets providers that share one account (and token) share one usage entry.")
+
+(defun pai-usage-id (provider)
+  "Return the usage provider id reporting for model PROVIDER."
+  (or (cdr (assoc provider pai-usage-aliases)) provider))
+
+(defun pai-usage--key (id)
+  "Return the token for usage provider ID."
+  (let ((fn (cdr (assoc id pai-usage-key-functions))))
+    (if fn (funcall fn id) (pai-api-key id))))
 
 (defun pai-usage-provider-p (id)
   "Return non-nil if a usage fetcher is registered for provider ID."
-  (and (assoc id pai-usage-providers) t))
+  (and (assoc (pai-usage-id id) pai-usage-providers) t))
 
 (defun pai-usage-fetch (id)
   "Fetch usage for provider ID.
 Return a plist (:provider ID :summary S :detail D) or (:provider ID :error E),
 or nil when no fetcher is registered."
+  (setq id (pai-usage-id id))
   (let ((fetcher (cdr (assoc id pai-usage-providers))))
     (when fetcher
       (condition-case err
-          (let* ((key (pai-api-key id))
+          (let* ((key (pai-usage--key id))
                  (cred (and (fboundp 'pai-auth-get) (pai-auth-get id))))
             (if (not (or key cred))
                 (list :provider id :error "not logged in")
@@ -77,7 +97,7 @@ or nil when no fetcher is registered."
 (defun pai-usage-available-providers ()
   "Return ids of providers that have a fetcher AND a resolvable credential."
   (cl-loop for (id . _) in pai-usage-providers
-           when (or (pai-api-key id)
+           when (or (pai-usage--key id)
                     (and (fboundp 'pai-auth-get) (pai-auth-get id)))
            collect id))
 
@@ -240,51 +260,28 @@ provider sends Retry-After.  The last good numbers stay on screen."
   "GET URL with HEADERS without blocking Emacs.
 Call CALLBACK once with (STATUS BODY RETRY-AFTER): the HTTP status code
 \(nil when there was no answer), the decoded JSON body (or nil) and the
-Retry-After seconds (or nil)."
+Retry-After seconds (or nil).  Runs in curl, never `url-retrieve', whose
+name lookup blocks the UI thread (see `pai-http-request')."
   (let* ((done nil)
-         (timer nil)
-         (buffer nil)
          (finish (lambda (status body retry)
                    (unless done
                      (setq done t)
-                     (when timer (cancel-timer timer))
-                     (funcall callback status body retry))))
-         (url-request-method "GET")
-         (url-request-extra-headers headers))
-    (setq buffer
-          (condition-case nil
-              (url-retrieve
-               url
-               (lambda (_status)
-                 (let ((reply (current-buffer)))
-                   (unwind-protect
-                       (let ((code nil) (retry nil) (body nil) (case-fold-search t))
-                         (goto-char (point-min))
-                         (when (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
-                           (setq code (string-to-number (match-string 1))))
-                         (let ((head-end (save-excursion (re-search-forward "\r?\n\r?\n" nil t))))
-                           (when (and head-end
-                                      (re-search-forward "^retry-after:[ \t]*\\([0-9]+\\)" head-end t))
-                             (setq retry (string-to-number (match-string 1))))
-                           (when head-end
-                             (let ((text (string-trim (buffer-substring-no-properties head-end (point-max)))))
-                               (unless (string-empty-p text)
-                                 (setq body (ignore-errors (pai-json-decode text)))))))
-                         (funcall finish code body retry))
-                     (when (buffer-live-p reply)
-                       (let ((kill-buffer-query-functions nil)) (kill-buffer reply))))))
-               nil t t)
-            (error (funcall finish nil nil nil) nil)))
-    (unless done
-      (setq timer
-            (run-at-time pai-usage-request-timeout nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (let ((proc (get-buffer-process buffer)))
-                               (when proc (delete-process proc)))
-                             (let ((kill-buffer-query-functions nil)) (kill-buffer buffer)))
-                           (funcall finish nil nil nil)))))
-    buffer))
+                     (funcall callback status body retry)))))
+    (condition-case nil
+        (pai-http-request
+         :url url :headers headers
+         :connect-timeout (min 10 pai-usage-request-timeout)
+         :timeout pai-usage-request-timeout
+         :on-done
+         (lambda (status hdrs text)
+           (let ((retry (let ((v (cdr (assoc "retry-after" hdrs))))
+                          (and v (string-match "\\`[ \t]*\\([0-9]+\\)" v)
+                               (string-to-number (match-string 1 v)))))
+                 (text (and text (string-trim text))))
+             (funcall finish status
+                      (and text (not (string-empty-p text)) (ignore-errors (pai-json-decode text)))
+                      retry))))
+      (error (funcall finish nil nil nil) nil))))
 
 (defun pai-usage--settle (id result error &optional rate-limited retry-after)
   "Record the outcome of a fetch for ID and run the waiting callbacks.
@@ -319,6 +316,7 @@ The fetch starts only when the cached result is older than `pai-usage-ttl'
 \(FORCE skips that wait, but never a rate-limit backoff) and no request is
 already in flight; otherwise CALLBACK gets the cached state at once, or
 when the request in flight completes.  Never blocks Emacs."
+  (setq id (pai-usage-id id))
   (let* ((fetcher (cdr (assoc id pai-usage-providers)))
          (state (pai-usage--state id))
          (now (float-time)))
@@ -332,7 +330,7 @@ when the request in flight completes.  Never blocks Emacs."
      (t
       (pai-usage--put id :pending (list (or callback #'ignore)))
       (condition-case err
-          (let* ((key (pai-api-key id))
+          (let* ((key (pai-usage--key id))
                  (cred (and (fboundp 'pai-auth-get) (pai-auth-get id))))
             (if (not (or key cred))
                 (pai-usage--settle id nil "not logged in")
@@ -382,6 +380,7 @@ good numbers in `pai-usage-stale-face' when the latest refresh failed or
 they are older than `pai-usage-stale-after'; and, without any numbers, the
 provider's placeholder (see `pai-usage-placeholders') in
 `pai-usage-unavailable-face'.  Hovering shows why."
+  (setq id (pai-usage-id id))
   (let* ((state (pai-usage--state id))
          (summary (plist-get (plist-get state :result) :summary))
          (err (plist-get state :error))

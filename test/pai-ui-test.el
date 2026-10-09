@@ -274,6 +274,27 @@
           (pai--arg-completion-exit "se" 'exact)
           (should (= opened 1)))))))
 
+(ert-deftest pai-ui-command-opening-a-buffer-keeps-its-point ()
+  "A command that makes another buffer current (as `pop-to-buffer' does for
+/menu and /memory-review) keeps that buffer's point, and its message goes to
+the chat."
+  (pai-ui-test--with-buffer buf dir
+    (let ((other (generate-new-buffer "*zz-screen*")))
+      (with-current-buffer other (insert "line 1\nline 2\n") (goto-char 3))
+      (with-current-buffer buf
+        (pai-register-command "zz-open" :handler (lambda (_args _ctx)
+                                                   (set-buffer other)
+                                                   (list :message "opened the screen")))
+        (unwind-protect
+            (progn
+              (pai-ui-test--type-and-send "/zz-open")
+              (should (= (with-current-buffer other (point)) 3))
+              (should (equal (with-current-buffer other (buffer-string)) "line 1\nline 2\n"))
+              (should (string-match-p "opened the screen" (buffer-string)))
+              (should (= (point) (point-max))))
+          (pai-unregister-command "zz-open")
+          (kill-buffer other))))))
+
 (ert-deftest pai-ui-arg-completion-single-level-does-not-repeat ()
   "A completer that ignores the position (like `/model') completes only the
 first argument: accepting a value neither chains nor offers it again."
@@ -564,6 +585,41 @@ first argument: accepting a value neither chains nor offers it again."
                     (should (equal (pai--mode-line-host) "mode line #4")))
                 (delete-window other)))))))))
 
+(defvar powerline-selected-window)     ; spaceline's, bound dynamically below
+
+(ert-deftest pai-ui-mode-line-cache-tracks-active-state ()
+  "A copy built while the window was active is not reused once it is inactive.
+The active/inactive faces are baked into the cached string."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((calls 0)
+            (active t)
+            (pai-mode-line-cache-interval 60))
+        (cl-letf (((symbol-function 'format-mode-line)
+                   (lambda (&rest _) (cl-incf calls) (format "mode line #%d" calls)))
+                  ((symbol-function 'mode-line-window-selected-p) (lambda () active)))
+          (setq pai--mode-line-cache nil)
+          (should (equal (pai--mode-line-host) "mode line #1"))
+          (should (equal (pai--mode-line-host) "mode line #1"))
+          ;; deselected, with no invalidation hook having run yet
+          (setq active nil)
+          (should (equal (pai--mode-line-host) "mode line #2"))
+          (should (equal (pai--mode-line-host) "mode line #2"))
+          ;; spaceline's own idea of the selected window counts too
+          (let ((powerline-selected-window 'elsewhere))
+            (should (equal (pai--mode-line-host) "mode line #3"))))))))
+
+(ert-deftest pai-ui-mode-line-invalidate-forces-redraw ()
+  "Invalidating also marks the mode lines for redisplay."
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((forced nil))
+        (cl-letf (((symbol-function 'force-mode-line-update) (lambda (&rest _) (setq forced t))))
+          (setq pai--mode-line-cache '((w 0 nil . "x")))
+          (pai--mode-line-invalidate (selected-window))
+          (should-not pai--mode-line-cache)
+          (should forced))))))
+
 (ert-deftest pai-ui-mode-line-cache-escapes-percent ()
   "A literal % in the global mode line is shown, not read as a directive."
   (pai-ui-test--with-buffer buf dir
@@ -670,6 +726,92 @@ first argument: accepting a value neither chains nor offers it again."
         ;; request order: turn 1, the summary, turn 2 -- only the summary
         ;; thinks at the :compact level; the conversation keeps its own (off)
         (should (equal (reverse seen) '(nil minimal nil)))))))
+
+(defun pai-ui-test--shrink-tool-results ()
+  "A stand-in `pre-compact' handler: blank every tool result; return t."
+  (setq pai--context-messages
+        (mapcar (lambda (m)
+                  (if (eq (pai-message-role m) 'tool-result)
+                      (plist-put (copy-sequence m) :content (list (pai-text "[shaken]")))
+                    m))
+                pai--context-messages))
+  t)
+
+(ert-deftest pai-ui-pre-compact-can-spare-the-compaction ()
+  "When a `pre-compact' handler brings the context under the threshold,
+the run continues with it and nothing is summarized."
+  (pai-faux-reset)
+  (pai-faux-push '(:tool-calls ((:id "c1" :name "elisp_eval"
+                                 :arguments (:form "(make-string 60000 ?x)")))
+                  :stop-reason tool-use)
+                 '(:text "done without compacting" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.1
+                                                  :compact-keep-recent-tokens 50))
+            (reasons nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact)
+                   (lambda (_ctx &rest props)
+                     (push (plist-get props :reason) reasons)
+                     (pai-ui-test--shrink-tool-results))))
+          (pai-ui-test--type-and-send "go")
+          (pai-ui-test--wait-idle))
+        (should (equal reasons '(auto)))
+        (let ((content (buffer-string)))
+          (should-not (string-match-p "Compacting context" content))
+          (should (string-match-p "done without compacting" content)))
+        ;; the continued turn was sent the shrunk context
+        (let ((result (seq-find (lambda (m) (eq (pai-message-role m) 'tool-result))
+                                (plist-get pai-faux-last-context :messages))))
+          (should (equal (pai-content-text (plist-get result :content)) "[shaken]")))
+        (should-not (seq-find (lambda (e) (equal (plist-get e :type) "compaction"))
+                              (pai-session-entries pai--session)))))))
+
+(ert-deftest pai-ui-pre-compact-not-enough-still-compacts ()
+  "A `pre-compact' handler that leaves the context over the threshold
+does not prevent the compaction."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "## Goal\nS" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-threshold 0.001
+                                                  :compact-keep-recent-tokens 50))
+            (reasons nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact)
+                   (lambda (_ctx &rest props) (push (plist-get props :reason) reasons) t)))
+          (pai--maybe-compact))
+        (should (equal reasons '(auto)))
+        (should (string-match-p "Compacted context" (buffer-string)))))))
+
+(ert-deftest pai-ui-manual-compact-skips-pre-compact ()
+  (pai-faux-reset)
+  (pai-faux-push '(:text "## Goal\nS" :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50))
+            (called nil))
+        (cl-letf (((symbol-function 'pai-ext-run-pre-compact) (lambda (&rest _) (setq called t))))
+          (should (pai--compact-now nil)))
+        (should-not called)))))
+
+(ert-deftest pai-ui-compaction-names-its-model-and-shows-warnings ()
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-ui-test--big-context)
+      (let ((pai-settings--global '(:auto-compact t :compact-keep-recent-tokens 50))
+            (detail nil))
+        (cl-letf (((symbol-function 'pai-ext-run-compact)
+                   (lambda (messages &rest _)
+                     (setq detail (plist-get (car (pai-activity-running "compaction")) :detail))
+                     (list :messages (append (list (car messages) (pai-user-message "S"))
+                                             (last messages 2))
+                           :summary "S" :strategy "test"
+                           :warning "PART OF IT COULD NOT BE SUMMARIZED"))))
+          (should (pai--compact-now nil)))
+        (should (string-match-p "waiting for faux/faux" detail))
+        (should (string-match-p "PART OF IT COULD NOT BE SUMMARIZED" (buffer-string)))))))
 
 (ert-deftest pai-ui-compact-during-run-is-queued-for-turn-boundary ()
   (pai-faux-reset)
@@ -1870,6 +2012,23 @@ The trailing-punctuation check clobbered the match data the loop advanced by."
     (let ((pai-history-size 2))
       (pai-history-add dir "multi\nline")
       (should (equal (pai-history-load dir) '("multi\nline" "a"))))))
+
+(ert-deftest pai-ui-send-message-attaches-images ()
+  "`pai-send-message' sends image blocks with the prompt and notes them."
+  (pai-faux-reset)
+  (pai-faux-push '(:text "I see it." :stop-reason stop))
+  (pai-ui-test--with-buffer buf dir
+    (with-current-buffer buf
+      (pai-send-message "what is this?" buf
+                        (list (pai-image (base64-encode-string "GIF89a\1\0\1\0") "image/gif")))
+      (let ((user (seq-find #'pai-user-message-p pai--context-messages)))
+        (should (equal (mapcar #'pai-block-type (pai-message-content user)) '(text image)))
+        (should (equal (pai-content-text (pai-message-content user)) "what is this?")))
+      (should (string-match-p "\\[1 image attached\\]" (buffer-string)))
+      ;; an image alone is a prompt too
+      (pai-faux-push '(:text "Again." :stop-reason stop))
+      (pai-send-message "" buf (list (pai-image "R0lG" "image/gif")))
+      (should (= (seq-count #'pai-user-message-p pai--context-messages) 2)))))
 
 (provide 'pai-ui-test)
 ;;; pai-ui-test.el ends here

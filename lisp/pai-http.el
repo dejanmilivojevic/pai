@@ -136,27 +136,42 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
     (when (pai-http--state-on-close st)
       (funcall (pai-http--state-on-close st) exit-code))))
 
+(defun pai-http--write-temp (prefix pieces)
+  "Write PIECES (strings) to a new private temp file named after PREFIX.
+Multibyte pieces are written as UTF-8, unibyte ones as is.  Return the file."
+  (let ((file (with-file-modes #o600 (make-temp-file prefix))))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (dolist (piece pieces)
+        (insert (if (multibyte-string-p piece) (encode-coding-string piece 'utf-8) piece)))
+      (let ((coding-system-for-write 'binary))
+        (write-region nil nil file nil 'silent)))
+    file))
+
 (defun pai-http-header-file (headers)
   "Write HEADERS, an alist of (NAME . VALUE), to a new private file; return it.
 Return nil when HEADERS is empty.  curl reads the file with `-H @FILE', so
 header values -- API keys -- never appear in its command line, which any
 local user can read (ps, /proc/PID/cmdline).  The caller deletes the file."
-  (when headers
-    (let ((file (with-file-modes #o600 (make-temp-file "pai-headers-"))))
-      (let ((coding-system-for-write 'utf-8-unix))
-        (with-temp-file file
-          (dolist (h headers)
-            (insert (format "%s: %s\n" (car h) (cdr h))))))
-      file)))
+  (and headers
+       (pai-http--write-temp "pai-http-headers-"
+                             (mapcar (lambda (h) (format "%s: %s\n" (car h) (cdr h)))
+                                     headers))))
+
+(defun pai-http--delete-files (files)
+  "Delete FILES, ignoring errors."
+  (dolist (f files) (ignore-errors (delete-file f))))
 
 (cl-defun pai-http-stream (&key url (method "POST") headers body
                                 on-frame on-error on-close (timeout pai-request-timeout))
   "Start a streaming HTTP request to URL.
 METHOD defaults to POST.  HEADERS is an alist of (NAME . VALUE) strings.
-BODY, when non-nil, is sent as the raw request body via stdin: a string, or
-a list of strings sent one after the other (unibyte strings are sent as is,
-without the UTF-8 copy a multibyte string needs; see
-`pai-provider-encode-body').
+BODY, when non-nil, is sent as the raw request body: a string, or a list of
+strings sent one after the other (unibyte strings are sent as is, without
+the UTF-8 copy a multibyte string needs; see `pai-provider-encode-body').
+Body and headers reach curl through private temp files, deleted when the
+process ends: piping a multi-MB body blocked Emacs for seconds, and headers
+on the command line exposed API keys to `ps'.
 
 ON-FRAME is called with each SSE frame plist on a 2xx response.  ON-ERROR
 is called once with a descriptive string on any HTTP error (>=400) or
@@ -167,31 +182,84 @@ Return the process; kill it to abort the request."
               :phase 'headers :on-frame on-frame
               :on-error on-error :on-close on-close))
          (header-file (pai-http-header-file headers))
+         (body-file (and body
+                         (condition-case err
+                             (pai-http--write-temp "pai-http-body-"
+                                                   (if (listp body) body (list body)))
+                           (error (pai-http--delete-files (list header-file))
+                                  (signal (car err) (cdr err))))))
+         (files (delq nil (list header-file body-file)))
          (args (append
                 (list "-sS" "-N" "--no-buffer" "-i"
                       "-X" method
                       "--max-time" (number-to-string timeout))
                 (when header-file (list "-H" (concat "@" header-file)))
-                (when body (list "--data-binary" "@-"))
-                (list url)))
-         (proc (condition-case err
-                   (make-process
-                    :name "pai-http"
-                    :command (cons pai-curl-program args)
-                    :connection-type 'pipe
-                    :coding 'utf-8
-                    :noquery t
-                    :filter (lambda (_p chunk) (pai-http--filter st chunk))
-                    :sentinel (lambda (p event)
-                                (when (memq (process-status p) '(exit signal))
-                                  (when header-file (ignore-errors (delete-file header-file))))
-                                (pai-http--sentinel st p event (process-exit-status p))))
-                 (error (when header-file (ignore-errors (delete-file header-file)))
-                        (signal (car err) (cdr err))))))
-    (when body
-      (dolist (piece (if (listp body) body (list body)))
-        (process-send-string proc piece))
-      (process-send-eof proc))
+                (when body-file (list "--data-binary" (concat "@" body-file)))
+                (list url))))
+    (condition-case err
+        (make-process
+         :name "pai-http"
+         :command (cons pai-curl-program args)
+         :connection-type 'pipe
+         :coding 'utf-8
+         :noquery t
+         :filter (lambda (_p chunk) (pai-http--filter st chunk))
+         :sentinel (lambda (p event)
+                     (unless (process-live-p p) (pai-http--delete-files files))
+                     (pai-http--sentinel st p event (process-exit-status p))))
+      (error (pai-http--delete-files files)
+             (signal (car err) (cdr err))))))
+
+;;;; One-shot requests
+
+(defun pai-http--parse-response (text)
+  "Split curl -i output TEXT into (STATUS HEADERS BODY).
+Skips interim blocks (1xx, a proxy's CONNECT reply) so STATUS and HEADERS
+are the final response's; HEADERS is an alist with downcased names."
+  (let ((status nil) (headers nil) (rest text))
+    (while (string-match "\\`HTTP/[0-9.]+ +\\([0-9]+\\)" rest)
+      (setq status (string-to-number (match-string 1 rest)) headers nil)
+      (let* ((end (string-match "\r?\n\r?\n" rest))
+             (block (substring rest 0 end)))
+        (setq rest (if end (substring rest (match-end 0)) ""))
+        (dolist (line (cdr (split-string block "\r?\n")))
+          (when (string-match "\\`\\([^:]+\\):[ \t]*\\(.*\\)\\'" line)
+            (push (cons (downcase (match-string 1 line)) (match-string 2 line)) headers)))))
+    (list status (nreverse headers) rest)))
+
+(cl-defun pai-http-request (&key url (method "GET") headers
+                                 (connect-timeout 10) (timeout 30) on-done)
+  "Perform a one-shot HTTP request to URL in a curl subprocess.
+Name lookup, connect and TLS all run in curl: url.el resolves host names
+on Emacs' own thread on macOS, which froze the UI whenever DNS hung.
+HEADERS (an alist) reach curl on stdin, keeping tokens off the command line.
+ON-DONE gets (STATUS HEADERS BODY) once; STATUS is nil on a transport
+failure or timeout.  Return the process; deleting it also ends in ON-DONE."
+  (let* ((chunks nil)
+         (proc (make-process
+                :name "pai-http-request"
+                :command (append (list pai-curl-program "-sS" "-i" "-X" method
+                                       "--connect-timeout" (number-to-string connect-timeout)
+                                       "--max-time" (number-to-string timeout))
+                                 (when headers (list "-H" "@-"))
+                                 (list url))
+                :connection-type 'pipe
+                :coding 'utf-8
+                :noquery t
+                :filter (lambda (_p chunk) (push chunk chunks))
+                :sentinel
+                (lambda (p _event)
+                  (unless (process-live-p p)
+                    (let ((parsed (pai-http--parse-response
+                                   (apply #'concat (nreverse chunks)))))
+                      (when on-done
+                        (apply on-done (if (and (zerop (process-exit-status p)) (car parsed))
+                                           parsed
+                                         (list nil nil nil))))))))))
+    (when headers
+      (process-send-string
+       proc (mapconcat (lambda (h) (format "%s: %s\n" (car h) (cdr h))) headers "")))
+    (process-send-eof proc)
     proc))
 
 (provide 'pai-http)

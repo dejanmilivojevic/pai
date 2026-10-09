@@ -422,6 +422,50 @@ left alone.  Return RESULT itself when nothing exceeds the limit."
         (when details (setq r (plist-put r :details new-details)))
         r))))
 
+(defconst pai-tools--invalid-char-regexp "[^\0-\uD7FF\uE000-\U0010FFFF]"
+  "Matches characters that are not Unicode scalar values.
+Raw bytes (from reading a binary file) and lone surrogates make
+`json-serialize' fail, so no request or session line could be written.")
+
+(defun pai-tools-valid-text (string)
+  "Return STRING with every non-Unicode character replaced by U+FFFD.
+A unibyte STRING is decoded as UTF-8 first.  Return STRING itself (`eq')
+when it is already valid."
+  (let ((s (if (and (not (multibyte-string-p string))
+                    (string-match-p "[^[:ascii:]]" string))
+               (decode-coding-string string 'utf-8 t)
+             string)))
+    (if (string-match-p pai-tools--invalid-char-regexp s)
+        (replace-regexp-in-string pai-tools--invalid-char-regexp "\uFFFD" s t t)
+      s)))
+
+(defun pai-tools-sanitize-result (result)
+  "Return tool RESULT with all its strings made valid Unicode.
+See `pai-tools-valid-text'.  Return RESULT itself when nothing changed."
+  (cl-labels ((clean (x)
+                (cond ((stringp x) (pai-tools-valid-text x))
+                      ((consp x)
+                       ;; the spine in a loop: a long list (a tool's details
+                       ;; with thousands of items) must not recurse per cell
+                       (let ((out '()) (rest x) (changed nil))
+                         (while (consp rest)
+                           (let ((c (clean (car rest))))
+                             (unless (eq c (car rest)) (setq changed t))
+                             (push c out))
+                           (setq rest (cdr rest)))
+                         (let ((tail (and rest (clean rest))))
+                           (unless (eq tail rest) (setq changed t))
+                           (if (not changed)
+                               x
+                             (setq out (nreverse out))
+                             (when tail (setcdr (last out) tail))
+                             out))))
+                      ((vectorp x)
+                       (let ((v (mapcar #'clean x)))
+                         (if (cl-every #'eq v (append x nil)) x (vconcat v))))
+                      (t x))))
+    (clean result)))
+
 (defun pai-tools--cap-text (text max-bytes)
   "Return TEXT cut to MAX-BYTES with a note saying how much was dropped."
   (let* ((trunc (pai-tools-truncate text most-positive-fixnum max-bytes 'head))

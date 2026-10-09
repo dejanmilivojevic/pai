@@ -357,13 +357,14 @@ symbol or nil for off; use both for any summary) and :custom-instructions.  A ha
 shaped like `pai-compact''s result:
 
   (:messages NEW :summary S :strategy STRATEGY
-   [:tokens-before T :usage U :first-kept-entry-id ID])
+   [:tokens-before T :usage U :first-kept-entry-id ID :warning TEXT])
 
 NEW must be the leading system messages of MESSAGES, then exactly one summary
 message, then the kept tail of MESSAGES.  STRATEGY is a string naming the
 handler's method (recorded in the session).  :first-kept-entry-id is the
 session entry of the first kept message; when absent it is derived from the
-kept tail's length.  Returning nil leaves compaction to the next handler and
+kept tail's length.  :warning is shown in the transcript after the
+compaction (e.g. a part that could not be summarized).  Returning nil leaves compaction to the next handler and
 finally to the built-in `pai-compact'.  Return the winning plist or nil."
   (catch 'done
     (dolist (entry (pai-ext--handlers 'compact))
@@ -372,6 +373,19 @@ finally to the built-in `pai-compact'.  Return the winning plist or nil."
         (when (and ret (plist-get ret :messages))
           (throw 'done ret))))
     nil))
+
+(defun pai-ext-run-pre-compact (ctx &rest props)
+  "Let `pre-compact' handlers shrink the live context before a compaction.
+Runs before an automatic or overflow compaction (not `/compact'); PROPS
+carry :reason (`auto' or `overflow').  A handler changes the context of the
+pai buffer in CTX itself (e.g. `/shake') and returns non-nil when it did;
+the compaction then only runs when the context is still over the
+threshold.  Return non-nil when any handler changed the context."
+  (let ((changed nil))
+    (dolist (entry (pai-ext--handlers 'pre-compact))
+      (when (pai-ext--call entry (append (list :type 'pre-compact) props) ctx)
+        (setq changed t)))
+    changed))
 
 (defun pai-ext-run-compact-async (messages ctx callback &rest props)
   "Run `compact' handlers over MESSAGES without blocking; call CALLBACK once.

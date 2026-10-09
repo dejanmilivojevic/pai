@@ -179,7 +179,10 @@ model. This needs an evaluation on real sessions before it can be on by default.
   re-adds the same text to that prompt on every later request and after `/resume`,
   so the provider's prompt cache stays valid. The transcript keeps the user's own
   words.
-- **Indicator:** a transcript note, `🧠 recalled N from M session(s)`.
+- **Indicator:** a transcript note, `▸ 🧠 recalled N from M session(s)`, which is a
+  button: RET or a click expands the recalled notes, each with a link to its source
+  session. The hits are saved with the `memory.recall` entry, and `/memory recall`
+  lists every recall in the session together with its prompt.
 - **Dropped:** the optional model query rewrite (see above).
 
 ### A3. Semantic search (embeddings)

@@ -171,8 +171,11 @@ sentinel and the run never reached `agent-end' (the UI stayed \"working…\")."
       (pai-agent-run (list (pai-user-message "go"))
                      (pai-context nil (pai-builtin-tools))
                      (list :model (pai-model "faux") :stream-fn #'pai-regression--encoding-stream)
-                     (lambda (ev) (when (eq (plist-get ev :type) 'agent-end) (setq ended t))))
-      (should (pai-regression--wait (lambda () ended) 5)))))
+                     (lambda (ev) (when (eq (plist-get ev :type) 'agent-end) (setq ended ev))))
+      (should (pai-regression--wait (lambda () ended) 5))
+      ;; ended normally, not stopped by an internal error
+      (should-not (plist-get ended :error))
+      (should-not (plist-get ended :aborted)))))
 
 (ert-deftest pai-regression-invalid-utf8-message-can-be-saved ()
   "The session writer accepts the same bytes (it signalled on them too)."
@@ -213,7 +216,7 @@ half-streamed tool call whose arguments were silently dropped."
             (insert "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
             (dolist (f frames) (insert "data: " (pai-json-encode f) "\n\n")))
           (setq pai-curl-program
-                (pai-regression--script dir "curl" (format "cat >/dev/null\ncat '%s'\nexit 28" data)))
+                (pai-regression--script dir "curl" (format "cat '%s'\nexit 28" data)))
           (pai-register-provider-config
            '(:id "review-anth" :api "anthropic" :base-url "http://127.0.0.1:9/v1" :model "m"))
           ;; callbacks run in the origin buffer, so it must outlive the wait
@@ -295,7 +298,7 @@ local user can read (ps, /proc/PID/cmdline) -- API keys included."
   (let* ((dir (make-temp-file "pai-regression-argv" t))
          (argv (expand-file-name "argv" dir))
          (pai-curl-program
-          (pai-regression--script dir "curl" (format "echo \"$@\" > '%s'\ncat >/dev/null\nexit 7" argv)))
+          (pai-regression--script dir "curl" (format "echo \"$@\" > '%s'\nexit 7" argv)))
          (closed nil))
     (unwind-protect
         (progn
@@ -344,8 +347,10 @@ interpreted, ~250 byte-compiled) so the run never ended."
     (with-temp-buffer
       (pai-agent-run (list (pai-user-message "go")) (pai-context nil (pai-builtin-tools))
                      (list :model (pai-model "faux") :stream-fn #'pai-regression--async-faux)
-                     (lambda (ev) (when (eq (plist-get ev :type) 'agent-end) (setq ended t))))
-      (should (pai-regression--wait (lambda () ended) 10)))))
+                     (lambda (ev) (when (eq (plist-get ev :type) 'agent-end) (setq ended ev))))
+      (should (pai-regression--wait (lambda () ended) 10))
+      (should-not (plist-get ended :error))
+      (should-not (plist-get ended :aborted)))))
 
 ;;;; UI blocking
 
@@ -439,6 +444,21 @@ inside the agent loop, and every level rescanned the rest (quadratic)."
     ;; nothing oversized: returned as is
     (let ((small (list :content (list (pai-text "x")) :details (make-list 5000 "a"))))
       (should (eq (pai-tools-cap-result small) small)))))
+
+(ert-deftest pai-regression-sanitize-result-handles-long-lists ()
+  "`pai-tools-sanitize-result' (applied to every tool result) handles long
+lists.  It recursed once per list cell, so a tool whose details held ~2000
+items (byte-compiled; ~500 interpreted) stopped the run with an internal
+error, even when every string was valid."
+  (let* ((clean (list :content (list (pai-text "x")) :details (make-list 20000 "a")))
+         (dirty (list :content (list (pai-text "x"))
+                      :details (append (make-list 20000 "a")
+                                       (list (decode-coding-string "ok \377" 'utf-8))))))
+    ;; nothing to fix: returned as is
+    (should (eq (pai-tools-sanitize-result clean) clean))
+    (let ((details (plist-get (pai-tools-sanitize-result dirty) :details)))
+      (should (= (length details) 20001))
+      (should (equal (car (last details)) "ok \ufffd")))))
 
 (ert-deftest pai-regression-oauth-refresh-handler-registered ()
   "Expired Anthropic OAuth tokens are refreshed.  Core defined

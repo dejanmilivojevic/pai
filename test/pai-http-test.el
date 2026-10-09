@@ -12,8 +12,9 @@
 
 (defvar pai-http-test--server nil)
 
-(defun pai-http-test--start-server (response)
+(defun pai-http-test--start-server (response &optional on-request)
   "Start a localhost TCP server that replies with RESPONSE then half-closes.
+ON-REQUEST, when non-nil, gets the request head the server received.
 Return a cons (PROCESS . PORT)."
   (let* ((proc (make-network-process
                 :name "pai-http-test-server" :server t :host 'local :service t
@@ -25,6 +26,7 @@ Return a cons (PROCESS . PORT)."
                     (when (and (string-match-p "\r\n\r\n" acc)
                                (not (process-get conn 'replied)))
                       (process-put conn 'replied t)
+                      (when on-request (funcall on-request acc))
                       (process-send-string conn response)
                       (process-send-eof conn))))))
          (port (cadr (process-contact proc))))
@@ -175,6 +177,70 @@ The plist has :frames (list), :error (string or nil), :closed (bool)."
             (should (eq (plist-get assistant :stop-reason) 'stop))
             (should (= (plist-get (plist-get assistant :usage) :output) 3))))
       (when (process-live-p proc) (delete-process proc)))))
+
+;;;; One-shot requests
+
+(defun pai-http-test--wait (pred &optional secs)
+  "Pump process output until PRED returns non-nil or SECS (default 10) pass."
+  (let ((deadline (+ (float-time) (or secs 10))))
+    (while (and (not (funcall pred)) (< (float-time) deadline))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest pai-http-parse-response-skips-interim-blocks ()
+  (should (equal (pai-http--parse-response
+                  (concat "HTTP/1.1 200 Connection established\r\n\r\n"
+                          "HTTP/1.1 100 Continue\r\n\r\n"
+                          "HTTP/2 429\r\nRetry-After: 30\r\nX-A: b: c\r\n\r\n{\"x\":1}"))
+                 '(429 (("retry-after" . "30") ("x-a" . "b: c")) "{\"x\":1}")))
+  (should (equal (pai-http--parse-response "") '(nil nil ""))))
+
+(ert-deftest pai-http-request-returns-status-headers-body ()
+  (let* ((srv (pai-http-test--start-server
+               "HTTP/1.1 200 OK\r\nRetry-After: 7\r\n\r\n{\"ok\":true}"))
+         (result nil))
+    (unwind-protect
+        (progn
+          (pai-http-request :url (format "http://127.0.0.1:%d/" (cdr srv))
+                            :headers '(("Authorization" . "Bearer t"))
+                            :on-done (lambda (&rest r) (setq result r)))
+          (pai-http-test--wait (lambda () result))
+          (should (equal result '(200 (("retry-after" . "7")) "{\"ok\":true}"))))
+      (delete-process (car srv)))))
+
+(ert-deftest pai-http-request-sends-headers-on-stdin-not-argv ()
+  "Tokens must not show up in the process list."
+  (let* ((received "")
+         (srv (pai-http-test--start-server "HTTP/1.1 204 No Content\r\n\r\n"
+                                           (lambda (req) (setq received req))))
+         (done nil)
+         (proc (pai-http-request :url (format "http://127.0.0.1:%d/" (cdr srv))
+                                 :headers '(("Authorization" . "Bearer SECRET"))
+                                 :on-done (lambda (&rest _) (setq done t)))))
+    (unwind-protect
+        (progn
+          (should-not (string-match-p "SECRET" (mapconcat #'identity (process-command proc) " ")))
+          (pai-http-test--wait (lambda () done))
+          ;; ...yet the header did reach the server.
+          (should (string-match-p "Authorization: Bearer SECRET" received)))
+      (delete-process (car srv)))))
+
+(ert-deftest pai-http-request-never-blocks-on-name-lookup ()
+  "An unresolvable host fails in curl, not on Emacs' thread (the UI freeze)."
+  (let* ((result 'pending)
+         (t0 (float-time)))
+    (pai-http-request :url "https://pai-test-host.invalid/"
+                      :on-done (lambda (&rest r) (setq result r)))
+    (should (< (- (float-time) t0) 0.5))
+    (pai-http-test--wait (lambda () (not (eq result 'pending))) 20)
+    (should (equal result '(nil nil nil)))))
+
+(ert-deftest pai-http-request-deleted-process-reports-failure ()
+  (let* ((result 'pending)
+         (proc (pai-http-request :url "http://10.255.255.1/" :connect-timeout 20
+                                 :on-done (lambda (&rest r) (setq result r)))))
+    (delete-process proc)
+    (pai-http-test--wait (lambda () (not (eq result 'pending))) 5)
+    (should (equal result '(nil nil nil)))))
 
 (provide 'pai-http-test)
 ;;; pai-http-test.el ends here
