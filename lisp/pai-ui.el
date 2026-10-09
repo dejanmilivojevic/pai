@@ -1930,7 +1930,9 @@ IMAGES, a list of image blocks, are sent with it."
 
 (defun pai--run-command (text)
   "Dispatch slash-command TEXT."
-  (let* ((res (pai-command-dispatch text (pai--ext-context)))
+  ;; a command may make another buffer current (`pop-to-buffer' for /menu):
+  ;; its note and anything after it belong to the chat
+  (let* ((res (save-current-buffer (pai-command-dispatch text (pai--ext-context))))
          (r (plist-get res :result)))
     (cond
      ((not (plist-get res :handled))
@@ -1976,7 +1978,8 @@ Programmatic submissions (subagents, extensions) are not recorded."
       (when record
         (ignore-errors (pai-history-add default-directory text)))
       (pai--clear-input)
-      (let ((action (ignore-errors (pai-ext-run-input text (pai--ext-context) images))))
+      (let ((action (save-current-buffer
+                      (ignore-errors (pai-ext-run-input text (pai--ext-context) images)))))
         (cond
          ((and action (eq (plist-get action :action) 'handled)) nil)
          (t
