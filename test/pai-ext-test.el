@@ -80,6 +80,34 @@
             (should-not (member "nested" names))))
       (delete-directory dir t))))
 
+(ert-deftest pai-skills-shared-dirs-discovered-after-own ()
+  "`~/.agents/skills' style shared dirs are scanned after pai's own skills."
+  (let* ((root (file-name-as-directory (make-temp-file "pai-skills" t)))
+         (pai-directory (expand-file-name "pai" root))
+         (shared (expand-file-name "agents-skills" root))
+         (pai-skills-shared-dirs (list shared))
+         (default-directory root))
+    (unwind-protect
+        (cl-flet ((mk (dir name desc)
+                    (make-directory (expand-file-name name dir) t)
+                    (with-temp-file (expand-file-name (concat name "/SKILL.md") dir)
+                      (insert (format "---\nname: %s\ndescription: %s\nmetadata:\n  version: \"1\"\n---\nbody" name desc)))))
+          (mk (expand-file-name "skills" pai-directory) "dup" "own")
+          (mk shared "dup" "shared")
+          (mk shared "reverse-engineer-anything" "rea")
+          ;; Reference docs without frontmatter are not skills.
+          (make-directory (expand-file-name "reverse-engineer-anything/references" shared) t)
+          (with-temp-file (expand-file-name "reverse-engineer-anything/references/x.md" shared)
+            (insert "# just docs"))
+          (let ((skills (pai-discover-skills)))
+            (should (equal (mapcar (lambda (s) (plist-get s :name)) skills)
+                           '("dup" "reverse-engineer-anything")))
+            (should (equal (plist-get (car skills) :description) "own")))
+          (should (pai-skills-shared-dir-p shared))
+          (should (pai-skills-shared-dir-p (expand-file-name ".agents/skills" root)))
+          (should-not (pai-skills-shared-dir-p (expand-file-name "skills" pai-directory))))
+      (delete-directory root t))))
+
 (ert-deftest pai-skills-invalid-rejected ()
   (let ((dir (file-name-as-directory (make-temp-file "pai-skills" t))))
     (unwind-protect

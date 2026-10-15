@@ -14,12 +14,37 @@
 (require 'subr-x)
 (require 'pai-config)
 
+(defcustom pai-skills-shared-dirs '("~/.agents/skills")
+  "Global skill directories shared with other coding agents.
+`~/.agents/skills' is the cross-agent Agent Skills location that installers
+such as `npx skills add' and `rea setup' write to.  pai discovers the skills
+there after its own `skills' directory (pai's own skills win on a name
+clash), but treats them as read-only: memory workers never patch, merge or
+archive them.  The project-level counterpart `.agents/skills' is scanned
+for trusted projects."
+  :type '(repeat directory)
+  :group 'pai)
+
+(defun pai-skills--shared-dirs ()
+  "Return the expanded `pai-skills-shared-dirs' that exist."
+  (seq-filter #'file-directory-p
+              (mapcar #'expand-file-name pai-skills-shared-dirs)))
+
+(defun pai-skills-shared-dir-p (dir)
+  "Return non-nil if DIR is a shared (read-only to pai) skill directory."
+  (let ((d (file-name-as-directory (expand-file-name dir))))
+    (or (equal d (file-name-as-directory (expand-file-name ".agents/skills" default-directory)))
+        (seq-some (lambda (s) (equal d (file-name-as-directory (expand-file-name s))))
+                  pai-skills-shared-dirs))))
+
 (defun pai-skills-default-dirs ()
   "Return the default skill search directories that exist."
   (seq-filter #'file-directory-p
-              (list (expand-file-name "skills" pai-directory)
-                    (expand-file-name ".pai/skills" default-directory)
-                    (expand-file-name ".skills" default-directory))))
+              (append (list (expand-file-name "skills" pai-directory))
+                      (mapcar #'expand-file-name pai-skills-shared-dirs)
+                      (list (expand-file-name ".pai/skills" default-directory)
+                            (expand-file-name ".skills" default-directory)
+                            (expand-file-name ".agents/skills" default-directory)))))
 
 (defun pai-skills--parse-frontmatter (text)
   "Parse leading YAML frontmatter from TEXT.

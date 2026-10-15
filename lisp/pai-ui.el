@@ -2829,10 +2829,12 @@ transcript output is inserted above it."
 
 (defun pai--skill-dirs ()
   "Return the skill directories to scan, gating project dirs by trust."
-  (let ((dirs (list (expand-file-name "skills" pai-directory))))
+  (let ((dirs (cons (expand-file-name "skills" pai-directory)
+                    (mapcar #'expand-file-name pai-skills-shared-dirs))))
     (when pai--trusted
       (setq dirs (append dirs (list (expand-file-name ".pai/skills" default-directory)
-                                    (expand-file-name ".skills" default-directory)))))
+                                    (expand-file-name ".skills" default-directory)
+                                    (expand-file-name ".agents/skills" default-directory)))))
     (seq-filter #'file-directory-p dirs)))
 
 (defun pai--prompt-dirs ()
