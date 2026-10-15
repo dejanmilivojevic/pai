@@ -116,8 +116,14 @@ Returns a plain string when there are no images, else an array of parts."
                 ;; reports the billed `cost'
                 (when (pai-openai--openrouter-p model)
                   (list :usage (list :include t)))
-                (when (and reasoning (pai-model-reasoning-p model))
-                  (list :reasoning_effort (pai-openai--reasoning-effort reasoning)))
+                (when (pai-model-reasoning-p model)
+                  (cond (reasoning
+                         (list :reasoning_effort (pai-openai--reasoning-effort reasoning)))
+                        ;; thinking off: models declaring `:reasoning-off'
+                        ;; (local servers default to "none") get it sent
+                        ;; explicitly, else they think at their own default
+                        ((stringp (plist-get model :reasoning-off))
+                         (list :reasoning_effort (plist-get model :reasoning-off)))))
                 (when (and (plist-get options :temperature) (not (pai-model-reasoning-p model)))
                   (list :temperature (plist-get options :temperature))))))
     (list :url (concat (plist-get model :base-url) "/chat/completions")

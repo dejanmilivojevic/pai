@@ -54,6 +54,22 @@ An omitted API means OpenAI-compatible; unknown API names are never guessed."
   "Return provider ID's configured full API base URL, or nil."
   (plist-get (pai-provider id) :base-url))
 
+(defun pai-providers--reasoning-default (provider base api)
+  "Return non-nil when PROVIDER's models default to accepting a thinking level.
+PROVIDER's `:reasoning' setting (t or false) decides when present.
+Otherwise OpenAI-compatible providers on this machine or a private network
+\(llama.cpp, Strata, Ollama, LM Studio...) at BASE default to reasoning, so
+the chosen thinking level is sent as `reasoning_effort' instead of leaving
+the server at its own (often maximal) default.  API is the adapter symbol."
+  (if (plist-member provider :reasoning)
+      (pai-truthy (plist-get provider :reasoning))
+    (and (eq api 'openai-completions)
+         (if (plist-member provider :local)
+             (pai-truthy (plist-get provider :local))
+           (and (stringp base)
+                (pai-providers--private-host-p
+                 (url-host (url-generic-parse-url base))))))))
+
 (defun pai-providers--model (spec provider &optional extension)
   "Normalize model SPEC using PROVIDER metadata, preserving declared fields.
 EXTENSION allows callback-defined APIs and models without HTTP base URLs."
@@ -68,6 +84,18 @@ EXTENSION allows callback-defined APIs and models without HTTP base URLs."
     (append (list :id id :provider (plist-get provider :id) :api api
                   :base-url (and base (pai-providers--url base)))
             spec
+            (unless (or extension (plist-member spec :reasoning))
+              (if (pai-providers--reasoning-default provider base api)
+                  ;; thinking "off" must be sent too, or the server thinks
+                  ;; at its own default level
+                  (append (list :reasoning t)
+                          (unless (or (plist-member spec :reasoning-off)
+                                      (plist-member provider :reasoning-off))
+                            (list :reasoning-off "none")))
+                (list :reasoning :false)))
+            (when (and (not (plist-member spec :reasoning-off))
+                       (plist-member provider :reasoning-off))
+              (list :reasoning-off (plist-get provider :reasoning-off)))
             (pai-make-model :id id :api api :provider (plist-get provider :id)
                             :base-url base))))
 

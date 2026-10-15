@@ -364,5 +364,36 @@
                (lambda (k &optional _d) (when (eq k :scoped-models) '(:compact "local/qwen")))))
       (should (equal (pai-model-key (pai-scoped-model :compact 'fallback)) "local/qwen")))))
 
+(ert-deftest pai-providers-local-openai-models-honor-thinking-level ()
+  "Local OpenAI-compatible models accept the thinking level, off included."
+  (pai-providers-test--isolated
+    (pai-register-provider-config
+     '(:id "strata" :api "openai-completions" :base-url "http://172.26.160.1:8080/v1"
+       :models ("qwen" (:id "plain" :reasoning :false))))
+    (pai-register-provider-config
+     '(:id "hosted" :api "openai-completions" :base-url "https://api.example.com/v1"
+       :models ("m")))
+    (pai-register-provider-config
+     '(:id "lan" :api "openai-completions" :base-url "http://10.0.0.2:8000/v1"
+       :reasoning :false :models ("m")))
+    (let* ((body (lambda (key reasoning)
+                   (plist-get (pai-openai-build-request
+                               (pai-model key)
+                               (pai-context (list (pai-user-message "hi")) nil)
+                               (list :reasoning reasoning))
+                              :body)))
+           (effort (lambda (key reasoning)
+                     (plist-get (funcall body key reasoning) :reasoning_effort))))
+      (should (pai-model-reasoning-p (pai-model "strata/qwen")))
+      (should (equal (funcall effort "strata/qwen" 'low) "low"))
+      (should (equal (funcall effort "strata/qwen" 'minimal) "minimal"))
+      ;; thinking off is sent explicitly instead of the server default
+      (should (equal (funcall effort "strata/qwen" nil) "none"))
+      ;; explicit opt-outs, and hosted providers keep the old behavior
+      (should-not (plist-member (funcall body "strata/plain" 'low) :reasoning_effort))
+      (should-not (plist-member (funcall body "lan/m" 'low) :reasoning_effort))
+      (should-not (plist-member (funcall body "hosted/m" 'low) :reasoning_effort))
+      (should-not (plist-member (funcall body "hosted/m" nil) :reasoning_effort)))))
+
 (provide 'pai-providers-test)
 ;;; pai-providers-test.el ends here
