@@ -83,11 +83,38 @@ vectors, symbols other than t become strings."
    ((symbolp value) (symbol-name value))
    (t value)))
 
+(defconst pai-json--raw-byte-regexp (string ?\[ #x3fff80 ?- #x3fffff ?\])
+  "Regexp matching a raw-byte character (a byte that did not decode).")
+
+(defun pai-json--valid-string (string)
+  "Return STRING with bytes that are not valid UTF-8 replaced by U+FFFD.
+Tool output decoded as UTF-8 keeps such bytes (a binary or Latin-1 file) as
+raw-byte characters, which `json-serialize' rejects."
+  (let ((s (if (multibyte-string-p string) string (decode-coding-string string 'utf-8))))
+    (if (not (string-match-p pai-json--raw-byte-regexp s))
+        s
+      (apply #'string (mapcar (lambda (c) (if (>= c #x3fff80) #xfffd c)) s)))))
+
+(defun pai-json--sanitize (value)
+  "Return VALUE with every string made valid UTF-8 (see `pai-json--valid-string')."
+  (cond ((stringp value) (pai-json--valid-string value))
+        ((consp value) (mapcar #'pai-json--sanitize value))
+        ((vectorp value) (apply #'vector (mapcar #'pai-json--sanitize value)))
+        ((hash-table-p value)
+         (let ((out (copy-hash-table value)))
+           (maphash (lambda (k v) (puthash k (pai-json--sanitize v) out)) value)
+           out))
+        (t value)))
+
 (defun pai-json-encode (value)
-  "Encode internal VALUE to a JSON string."
-  (json-serialize (pai-json--prepare value)
-                  :false-object :false
-                  :null-object :null))
+  "Encode internal VALUE to a JSON string.
+Strings that are not valid UTF-8 (raw bytes from tool output) are encoded
+with the offending bytes replaced by U+FFFD instead of signalling."
+  (let ((prepared (pai-json--prepare value)))
+    (condition-case nil
+        (json-serialize prepared :false-object :false :null-object :null)
+      (wrong-type-argument
+       (json-serialize (pai-json--sanitize prepared) :false-object :false :null-object :null)))))
 
 (defun pai-json-decode (string)
   "Decode JSON STRING into internal representation."

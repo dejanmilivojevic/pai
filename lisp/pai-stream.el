@@ -147,7 +147,10 @@
   "Begin a tool-call block (ID, NAME) in ACC; emit `toolcall-start'.
 INITIAL-JSON seeds the arguments JSON buffer.  Return the block index."
   (let* ((block (append (pai-tool-call id name nil)
-                        (list :_json (or initial-json ""))))
+                        ;; JSON fragments, newest first: joined once at the end,
+                        ;; so streaming large arguments stays linear
+                        (list :_json (and initial-json (not (string-empty-p initial-json))
+                                          (list initial-json)))))
          (idx (pai-accum-push-block acc block)))
     (pai-accum--emit acc emit 'toolcall-start :content-index idx)
     idx))
@@ -156,7 +159,7 @@ INITIAL-JSON seeds the arguments JSON buffer.  Return the block index."
   "Append JSON-FRAGMENT to the tool-call args buffer at IDX; emit `toolcall-delta'."
   (let ((block (pai-accum-block acc idx)))
     (pai-accum-set-block acc idx
-                         (plist-put block :_json (concat (plist-get block :_json) json-fragment)))
+                         (plist-put block :_json (cons json-fragment (plist-get block :_json))))
     (pai-accum--emit acc emit 'toolcall-delta :content-index idx :delta json-fragment)))
 
 (defun pai-accum--parse-args (json)
@@ -167,13 +170,17 @@ INITIAL-JSON seeds the arguments JSON buffer.  Return the block index."
         (pai-json-decode json)
       (error nil))))
 
-(defun pai-accum-toolcall-end (acc emit idx &optional final-args)
+(defun pai-accum-toolcall-end (acc emit idx &optional final-args extra)
   "Finish the tool-call block at IDX; emit `toolcall-end'.
 FINAL-ARGS, when non-nil, is used directly as the parsed arguments plist;
-otherwise the accumulated JSON buffer is parsed."
+otherwise the accumulated JSON fragments are parsed.  EXTRA is a plist of
+further block properties, e.g. `:thought-signature'."
   (let* ((block (pai-accum-block acc idx))
-         (args (or final-args (pai-accum--parse-args (plist-get block :_json))))
-         (clean (pai-tool-call (plist-get block :id) (plist-get block :name) args)))
+         (args (or final-args
+                   (pai-accum--parse-args
+                    (apply #'concat (reverse (plist-get block :_json))))))
+         (clean (apply #'pai-tool-call (plist-get block :id) (plist-get block :name) args
+                       extra)))
     (pai-accum-set-block acc idx clean)
     (pai-accum--emit acc emit 'toolcall-end :content-index idx :tool-call clean)))
 

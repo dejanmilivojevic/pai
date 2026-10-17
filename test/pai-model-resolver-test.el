@@ -241,21 +241,27 @@
 
 (ert-deftest pai-mr-model-completions-refresh-only-on-opening ()
   (pai-mr-test--sandbox dir
-    (let ((refreshes 0)
+    (let ((refreshes 0) (background 0)
           (complete (plist-get (pai-command-get "model") :arg-completions)))
       (cl-letf (((symbol-function 'pai-models-refresh)
                  (lambda ()
                    (cl-incf refreshes)
                    (pai-mr-test--model "first" "shared")
                    (pai-mr-test--model "second" "shared")
-                   nil)))
+                   nil))
+                ((symbol-function 'pai-models-refresh-async)
+                 (lambda (&optional _callback) (cl-incf background))))
+        ;; nothing known yet: the first opening has to wait for discovery
         (should (equal (sort (funcall complete "") #'string<)
                        '("first/shared" "second/shared")))
         (funcall complete "f")
         (funcall complete "first/")
         (should (= refreshes 1))
+        (should (= background 0))
+        ;; models known: offered at once, refreshed in the background
         (funcall complete "")
-        (should (= refreshes 2))))))
+        (should (= refreshes 1))
+        (should (= background 1))))))
 
 (ert-deftest pai-mr-thinking-command ()
   (let* ((set nil)

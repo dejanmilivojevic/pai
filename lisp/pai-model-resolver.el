@@ -291,7 +291,7 @@ either place clears that setting so ROLE inherits it."
                       :handler #'pai-model-command
                       :arg-completions
                       (lambda (prefix)
-                        (when (string-empty-p prefix) (pai-models-refresh))
+                        (when (string-empty-p prefix) (pai-models-refresh-for-choice))
                         (pai-model-keys)))
 (pai-register-command "thinking" :description "Show or set the reasoning level"
                       :handler #'pai-thinking-command

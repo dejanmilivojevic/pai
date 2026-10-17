@@ -313,36 +313,57 @@ Deferred tools are declared as stable stubs (see `pai-tool-declaration')."
      (when (plist-get config :session-id) (list :session-id (plist-get config :session-id))))))
 
 (defun pai-agent--stream-assistant (run)
-  "Stream one assistant response for RUN, then continue via on-assistant-done."
+  "Stream one assistant response for RUN, then continue via on-assistant-done.
+An error while building or sending the request (a hook, the request
+encoder) ends the turn as an error message; it must not escape into the
+process filter or sentinel that continued the run, which would leave the
+run hanging forever."
   (let* ((config (pai-run-config run))
          (model (plist-get config :model))
-         (ctx (pai-context (pai-agent--convert-context run) (pai-agent--tool-declarations run)))
-         (options (pai-agent--stream-options run))
-         (started nil))
-    (setf (pai-run-handle run)
-          (funcall (pai-run-streamfn run) model ctx options
-                   (pai-agent--deferred run (lambda (ev)
-                     (pcase (plist-get ev :type)
-                       ((or 'done 'error) (setf (pai-run-partial run) nil))
-                       (_ (when (plist-get ev :partial)
-                            (setf (pai-run-partial run) (plist-get ev :partial)))))
-                     (pcase (plist-get ev :type)
-                       ('start
-                        (setq started t)
-                        (pai-agent--emit run (list :type 'message-start
-                                                   :message (plist-get ev :partial))))
-                       ((or 'text-start 'text-delta 'text-end
-                            'thinking-start 'thinking-delta 'thinking-end
-                            'toolcall-start 'toolcall-delta 'toolcall-end)
-                        (pai-agent--emit run (list :type 'message-update
-                                                   :message (plist-get ev :partial)
-                                                   :event ev)))
-                       ((or 'done 'error)
-                        (let ((final (plist-get ev :message)))
-                          (unless started
-                            (pai-agent--emit run (list :type 'message-start :message final)))
-                          (pai-agent--emit run (list :type 'message-end :message final))
-                          (pai-agent--on-assistant-done run final))))))))))
+         (started nil)
+         (settled nil))
+    (condition-case err
+        (let ((ctx (pai-context (pai-agent--convert-context run) (pai-agent--tool-declarations run)))
+              (options (pai-agent--stream-options run)))
+          (setf (pai-run-handle run)
+                (funcall (pai-run-streamfn run) model ctx options
+                         (pai-agent--deferred run (lambda (ev)
+                           (pcase (plist-get ev :type)
+                             ((or 'done 'error) (setf (pai-run-partial run) nil))
+                             (_ (when (plist-get ev :partial)
+                                  (setf (pai-run-partial run) (plist-get ev :partial)))))
+                           (pcase (plist-get ev :type)
+                             ('start
+                              (setq started t)
+                              (pai-agent--emit run (list :type 'message-start
+                                                         :message (plist-get ev :partial))))
+                             ((or 'text-start 'text-delta 'text-end
+                                  'thinking-start 'thinking-delta 'thinking-end
+                                  'toolcall-start 'toolcall-delta 'toolcall-end)
+                              (pai-agent--emit run (list :type 'message-update
+                                                         :message (plist-get ev :partial)
+                                                         :event ev)))
+                             ((or 'done 'error)
+                              (setq settled t)
+                              (let ((final (plist-get ev :message)))
+                                (unless started
+                                  (pai-agent--emit run (list :type 'message-start :message final)))
+                                (pai-agent--emit run (list :type 'message-end :message final))
+                                (pai-agent--on-assistant-done run final)))))))))
+      (error
+       ;; once the stream settled, the error is not the request's (a
+       ;; synchronous stream continues the run inside this call)
+       (if (or settled (pai-run-finished run) (pai-run-aborted run))
+           (signal (car err) (cdr err))
+         (let ((acc (pai-accum-new model)))
+           (setf (pai-accum-stop-reason acc) 'error
+                 (pai-accum-error-message acc)
+                 (format "Could not send the request: %s" (error-message-string err)))
+           (let ((final (pai-accum-message acc)))
+             (unless started
+               (pai-agent--emit run (list :type 'message-start :message final)))
+             (pai-agent--emit run (list :type 'message-end :message final))
+             (pai-agent--on-assistant-done run final))))))))
 
 (defun pai-agent--end-failed-turn (run message)
   "End RUN after its turn failed with MESSAGE (stop-reason error or aborted)."
@@ -477,10 +498,14 @@ sanitized so it can always be serialized (`pai-tools-sanitize-result')."
     (pai-agent--execute-tools-sequential run message tool-calls)))
 
 (defun pai-agent--execute-tools-sequential (run message tool-calls)
-  "Execute TOOL-CALLS from MESSAGE sequentially, then finish the batch."
+  "Execute TOOL-CALLS from MESSAGE sequentially, then finish the batch.
+Tools that finish synchronously are handled in a loop, not by recursion,
+so a batch of any size runs in constant stack depth; a tool finishing
+later resumes the loop from its callback."
   (let ((results '()) (terminate t))
     (cl-labels
-        ((finish-call (tc tool args _ctx result remaining)
+        ((record (tc tool args result)
+           ;; Return non-nil when the batch goes on with the next call.
            (let* ((over (pai-agent--call run :after-tool-call
                                          (list :tool-call tc :args args :tool tool
                                                :result result
@@ -500,51 +525,68 @@ sanitized so it can always be serialized (`pai-tools-sanitize-result')."
                                         :is-error (pai-truthy (plist-get final :is-error))))
              (push (pai-agent--make-tool-result-message tc final) results)
              (if (pai-run-aborted run)
-                 (pai-agent--finish-tool-batch run message (nreverse results) nil)
-               (step (cdr remaining)))))
-         (step (remaining)
-           (if (null remaining)
-               (pai-agent--finish-tool-batch run message (nreverse results)
-                                             (and results terminate))
-             (let* ((tc (car remaining))
-                    (name (plist-get tc :name))
-                    (args (plist-get tc :arguments))
-                    (tool (pai-agent--find-tool run name))
-                    (ctx (pai-agent--tool-ctx run (plist-get tc :id)))
-                    (reveal (pai-agent--pending-reveal run tool)))
-               (pai-agent--emit run (list :type 'tool-execution-start
-                                          :tool-call-id (plist-get tc :id)
-                                          :tool-name name :args args))
-               ;; A reveal executes nothing, so it skips the before-tool-call
-               ;; (permission) hook.
-               (let ((pre (unless reveal
-                            (pai-agent--call run :before-tool-call
-                                             (list :tool-call tc :args args :tool tool
-                                                   :context (pai-run-context run))))))
-                 (cond
-                  (reveal (finish-call tc tool args ctx reveal remaining))
-                  ((and pre (pai-truthy (plist-get pre :block)))
-                   (let ((result (append
-                                  (pai-tool-error-result
-                                   (or (plist-get pre :reason)
-                                       (format "Tool \"%s\" was blocked." name)))
-                                  (when (plist-member pre :terminate)
-                                    (list :terminate (plist-get pre :terminate))))))
-                     (finish-call tc tool args ctx result remaining)))
-                  ((null tool)
-                   (finish-call tc tool args ctx
-                                (pai-tool-error-result (format "Unknown tool: %s" name))
-                                remaining))
-                  (t
-                   (pai-agent--invoke-tool tool args ctx
-                            (pai-agent--deferred run (lambda (partial)
-                              (pai-agent--emit run (list :type 'tool-execution-update
-                                                         :tool-call-id (plist-get tc :id)
-                                                         :tool-name name :args args
-                                                         :partial-result partial))))
-                            (pai-agent--deferred run (lambda (result)
-                              (finish-call tc tool args ctx result remaining)))))))))))
-      (step tool-calls))))
+                 (progn (pai-agent--finish-tool-batch run message (nreverse results) nil)
+                        nil)
+               t)))
+         (start (tc on-result)
+           ;; Launch TC; ON-RESULT receives its result, now or later.
+           (let* ((name (plist-get tc :name))
+                  (args (plist-get tc :arguments))
+                  (tool (pai-agent--find-tool run name))
+                  (ctx (pai-agent--tool-ctx run (plist-get tc :id)))
+                  (reveal (pai-agent--pending-reveal run tool)))
+             (pai-agent--emit run (list :type 'tool-execution-start
+                                        :tool-call-id (plist-get tc :id)
+                                        :tool-name name :args args))
+             ;; A reveal executes nothing, so it skips the before-tool-call
+             ;; (permission) hook.
+             (let ((pre (unless reveal
+                          (pai-agent--call run :before-tool-call
+                                           (list :tool-call tc :args args :tool tool
+                                                 :context (pai-run-context run))))))
+               (cond
+                (reveal (funcall on-result tool args reveal))
+                ((and pre (pai-truthy (plist-get pre :block)))
+                 (funcall on-result tool args
+                          (append
+                           (pai-tool-error-result
+                            (or (plist-get pre :reason)
+                                (format "Tool \"%s\" was blocked." name)))
+                           (when (plist-member pre :terminate)
+                             (list :terminate (plist-get pre :terminate))))))
+                ((null tool)
+                 (funcall on-result tool args
+                          (pai-tool-error-result (format "Unknown tool: %s" name))))
+                (t
+                 (pai-agent--invoke-tool tool args ctx
+                          (pai-agent--deferred run (lambda (partial)
+                            (pai-agent--emit run (list :type 'tool-execution-update
+                                                       :tool-call-id (plist-get tc :id)
+                                                       :tool-name name :args args
+                                                       :partial-result partial))))
+                          (pai-agent--deferred run (lambda (result)
+                            (funcall on-result tool args result)))))))))
+         (drive (remaining)
+           (let ((go t))
+             (while go
+               (if (null remaining)
+                   (progn (setq go nil)
+                          (pai-agent--finish-tool-batch run message (nreverse results)
+                                                        (and results terminate)))
+                 (let* ((tc (car remaining))
+                        (rest (cdr remaining))
+                        (sync t) (got nil) got-tool got-args got-result)
+                   (start tc (lambda (tool args result)
+                               (if sync
+                                   (setq got t got-tool tool got-args args got-result result)
+                                 ;; finished later: resume the loop from here
+                                 (when (record tc tool args result)
+                                   (drive rest)))))
+                   (setq sync nil)
+                   (if (and got (record tc got-tool got-args got-result))
+                       (setq remaining rest)
+                     (setq go nil))))))))
+      (drive tool-calls))))
 
 (defun pai-agent--execute-tools-parallel (run message tool-calls)
   "Execute TOOL-CALLS from MESSAGE concurrently, then finish the batch.

@@ -27,37 +27,66 @@
      (when (plist-get ctx :tool-call-id)
        (list (format "PAI_TOOL_CALL_ID=%s" (plist-get ctx :tool-call-id)))))))
 
+(defcustom pai-tool-bash-update-interval 0.2
+  "Minimum seconds between progress updates of a running bash command."
+  :type 'number :group 'pai)
+
 (defun pai-tool-bash--execute (args ctx on-update on-done)
-  "Run the bash tool for ARGS in CTX, streaming via ON-UPDATE, finishing ON-DONE."
+  "Run the bash tool for ARGS in CTX, streaming via ON-UPDATE, finishing ON-DONE.
+Output is kept as a list of chunks, and only its tail: the result shows at
+most `pai-tool-max-bytes' of it, so a command printing megabytes costs time
+linear in its output instead of re-copying all of it per chunk."
   (let* ((command (plist-get args :command))
          (timeout (plist-get args :timeout))
          (default-directory (pai-tool-ctx-cwd ctx))
-         (output "")
+         (chunks '())                   ; newest first
+         (kept 0)                       ; characters in CHUNKS
+         (keep (* 4 pai-tool-max-bytes))
+         (dropped nil)
+         (last-update 0)
          (process-environment (append (pai-tool-bash--env ctx) process-environment))
-         (finished nil)
+         (finished nil) (timed-out nil)
          proc timer)
-    (cl-flet ((done (code)
+    (cl-flet ((output () (apply #'concat (reverse chunks)))
+              (done (code)
                 (unless finished
                   (setq finished t)
                   (when timer (cancel-timer timer))
-                  (let* ((trunc (pai-tools-truncate output nil nil 'tail))
+                  (let* ((trunc (pai-tools-truncate (apply #'concat (reverse chunks)) nil nil 'tail))
                          (text (plist-get trunc :text))
-                         (note (when (plist-get trunc :truncated)
-                                 (format "\n[output truncated to last %d lines]" pai-tool-max-lines)))
+                         (note (when (or dropped (plist-get trunc :truncated))
+                                 (format "\n[output truncated to its last %d lines / %d bytes]"
+                                         pai-tool-max-lines pai-tool-max-bytes)))
                          (body (concat (if (string-empty-p (string-trim text)) "(no output)" text) note
+                                       (when timed-out
+                                         (format "\n[timed out after %s seconds]" timeout))
                                        (unless (eq code 0) (format "\n[exited with code %s]" code)))))
                     (funcall on-done (list :content (list (pai-text body))
                                            :is-error (if (eq code 0) :false t)
-                                           :details (list :exit-code code)))))))
+                                           :details (list :exit-code code
+                                                          :timed-out (and timed-out t))))))))
       (condition-case err
           (setq proc (make-process
                       :name "pai-bash"
                       :command (list shell-file-name shell-command-switch command)
                       :connection-type 'pipe :noquery t :coding 'utf-8
                       :filter (lambda (_p chunk)
-                                (setq output (concat output chunk))
-                                (when on-update
-                                  (funcall on-update (pai-tool-ok-result output))))
+                                (push chunk chunks)
+                                (setq kept (+ kept (length chunk)))
+                                ;; forget the head once the tail alone fills the result
+                                (when (> kept (* 2 keep))
+                                  (let ((cell chunks) (n 0))
+                                    (while (and cell (< n keep))
+                                      (setq n (+ n (length (car cell))))
+                                      (unless (>= n keep) (setq cell (cdr cell))))
+                                    (when (cdr cell)
+                                      (setcdr cell nil)
+                                      (setq kept n dropped t))))
+                                (when (and on-update
+                                           (>= (- (float-time) last-update)
+                                               pai-tool-bash-update-interval))
+                                  (setq last-update (float-time))
+                                  (funcall on-update (pai-tool-ok-result (output)))))
                       :sentinel (lambda (p _e)
                                   (when (memq (process-status p) '(exit signal))
                                     (done (process-exit-status p))))))
@@ -67,8 +96,10 @@
         (setq timer (run-at-time timeout nil
                                  (lambda ()
                                    (when (and proc (process-live-p proc))
-                                     (delete-process proc)
-                                     (setq output (concat output "\n[timed out]")))))))
+                                     ;; before `delete-process': it runs the
+                                     ;; sentinel, which reports the result
+                                     (setq timed-out t)
+                                     (delete-process proc))))))
       proc)))
 
 (pai-register-tool
@@ -145,31 +176,65 @@ bytes.  A few stray bytes in real text are replaced later instead, by
         (funcall on-done (list :content (list (pai-image data (or sniffed (pai-tool--image-mime path))))
                                :is-error :false))))
      (t
-      (let* ((text (with-temp-buffer
-                     (insert-file-contents path)
-                     (buffer-string))))
-        (if (pai-tool--binary-text-p text)
-            (funcall on-done
-                     (pai-tool-error-result
-                      (format "Binary file, not shown: %s (%d bytes). Inspect it with bash (e.g. file, xxd | head)."
-                              path (file-attribute-size (file-attributes path)))))
-          (pai-tool-read--show-text text offset limit on-done)))))))
+      ;; binary check on the head only: the slice below decodes just the
+      ;; lines shown, so a huge file is never read whole
+      (if (pai-tool--binary-text-p (with-temp-buffer
+                                     (insert-file-contents path nil 0 32768)
+                                     (buffer-string)))
+          (funcall on-done
+                   (pai-tool-error-result
+                    (format "Binary file, not shown: %s (%d bytes). Inspect it with bash (e.g. file, xxd | head)."
+                            path (file-attribute-size (file-attributes path)))))
+        (let* ((start (if offset (max 0 (1- (truncate offset))) 0))
+               (slice (pai-tool-read--slice path start (and limit (truncate limit))))
+               (total (plist-get slice :total))
+               (trunc (pai-tools-truncate (plist-get slice :text) nil nil 'head))
+               (body (plist-get trunc :text))
+               (shown (pai-tool--shown-lines body (plist-get slice :empty)))
+               (note (when (or (plist-get trunc :truncated) (plist-get slice :more)
+                               limit (and offset (> offset 1)))
+                       (format "\n[showing lines %d-%d of %d; use offset/limit to page]"
+                               (1+ start) (+ start shown) total))))
+          (funcall on-done (pai-tool-ok-result (concat body note)
+                                               (list :total-lines total)))))))))
 
-(defun pai-tool-read--show-text (text offset limit on-done)
-  "Finish the read tool via ON-DONE with TEXT paged by OFFSET and LIMIT."
-  (let* ((all-lines (split-string text "\n"))
-         (total (length all-lines))
-         (start (if offset (max 0 (1- offset)) 0))
-         (chosen (nthcdr start all-lines))
-         (chosen (if limit (seq-take chosen limit) chosen))
-         (trunc (pai-tools-truncate (string-join chosen "\n") nil nil 'head))
-         (body (plist-get trunc :text))
-         (shown (min (length chosen) pai-tool-max-lines))
-         (note (when (or (plist-get trunc :truncated) limit (and offset (> offset 1)))
-                 (format "\n[showing lines %d-%d of %d; use offset/limit to page]"
-                         (1+ start) (+ start shown) total))))
-    (funcall on-done (pai-tool-ok-result (concat body note)
-                                         (list :total-lines total)))))
+(defun pai-tool--shown-lines (body &optional empty)
+  "Return how many lines BODY, a shown slice, holds (0 when EMPTY)."
+  (if empty 0 (1+ (cl-count ?\n body))))
+
+(defun pai-tool-read--slice (path start limit)
+  "Return lines START (0-based) onwards of file PATH, at most LIMIT of them.
+The file is scanned undecoded -- only the returned lines are decoded -- and
+at most `pai-tool-max-lines' + 1 lines (or LIMIT) are taken, so reading a
+few lines of a huge file stays cheap.  Return a plist (:text STRING :total
+N :more BOOL :empty BOOL), where :total counts lines as `split-string' on
+\"\\n\" does and :more is non-nil when lines were left out after the slice."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path)
+    (let* ((total (+ (count-lines (point-min) (point-max))
+                     (if (or (= (point-min) (point-max)) (eq (char-before (point-max)) ?\n)) 1 0)))
+           (want (min (or limit most-positive-fixnum) (1+ pai-tool-max-lines)))
+           (beg (progn (goto-char (point-min)) (forward-line start) (point)))
+           ;; all WANT lines taken: the text after the last one is left out,
+           ;; including the empty \"line\" after a final newline
+           (full (= 0 (forward-line want)))
+           (end (point))
+           (cap (+ beg (* 8 pai-tool-max-bytes)))
+           (more full))
+      ;; a few very long lines: stop early, at a line or character boundary
+      (when (> end cap)
+        (goto-char cap)
+        (if (search-backward "\n" beg t)
+            (setq end (1+ (point)))
+          (setq end cap)
+          (while (and (> end beg) (<= #x80 (char-after end) #xbf)) (setq end (1- end))))
+        (setq more t))
+      (let* ((raw (buffer-substring-no-properties beg end))
+             (raw (if (and more (string-suffix-p "\n" raw)) (substring raw 0 -1) raw))
+             (text (decode-coding-string raw (car (detect-coding-string raw)))))
+        (list :text text :total total :more (and more (< end (point-max)))
+              :empty (and (= beg end) (= beg (point-max))))))))
 
 (pai-register-tool
  (list :name "read"
@@ -221,9 +286,19 @@ bytes.  A few stray bytes in real text are replaced later instead, by
   "Count non-overlapping occurrences of NEEDLE from point-min in current buffer."
   (save-excursion
     (goto-char (point-min))
-    (let ((n 0))
+    (let ((n 0) (case-fold-search nil))
       (while (search-forward needle nil t) (setq n (1+ n)))
       n)))
+
+(defun pai-tool--write-coding (detected)
+  "Return the coding system to write back a file read with DETECTED.
+The file keeps its encoding and line endings (CRLF stays CRLF); text that
+was undetermined (plain ASCII) is written as UTF-8 with the same endings."
+  (let* ((eol (coding-system-eol-type detected))
+         (eol (if (integerp eol) eol 0)))
+    (if (memq (coding-system-base detected) '(undecided nil))
+        (coding-system-change-eol-conversion 'utf-8 eol)
+      detected)))
 
 (defun pai-tool-edit--execute (args ctx _on-update on-done)
   "Run the edit tool for ARGS in CTX, finishing via ON-DONE."
@@ -236,15 +311,19 @@ bytes.  A few stray bytes in real text are replaced later instead, by
       (funcall on-done (pai-tool-error-result "No edits provided.")))
      (t
       (condition-case err
-          (let ((count 0)
-                (old-content (with-temp-buffer (insert-file-contents path) (buffer-string)))
-                (new-content nil))
+          (let* ((count 0)
+                 (coding nil)
+                 (old-content (with-temp-buffer
+                                (insert-file-contents path)
+                                (setq coding last-coding-system-used)
+                                (buffer-string)))
+                 (new-content nil))
             (with-temp-buffer
               (insert old-content)
               (dolist (e edits)
                 (let* ((old (plist-get e :oldText))
                        (new (or (plist-get e :newText) ""))
-                       (n (pai-tool--count-occurrences old)))
+                       (n (if (string-empty-p (or old "")) 0 (pai-tool--count-occurrences old))))
                   (cond
                    ((string-empty-p (or old ""))
                     (error "An edit has empty oldText"))
@@ -254,12 +333,17 @@ bytes.  A few stray bytes in real text are replaced later instead, by
                     (error "oldText is ambiguous (%d matches): %s" n
                            (truncate-string-to-width old 60)))
                    (t (goto-char (point-min))
-                      (search-forward old nil t)
+                      (let ((case-fold-search nil)) (search-forward old nil t))
                       (replace-match new t t)
                       (setq count (1+ count))))))
               (setq new-content (buffer-string))
-              (let ((coding-system-for-write 'utf-8))
-                (write-region (point-min) (point-max) path)))
+              (let ((coding-system-for-write (pai-tool--write-coding coding)))
+                ;; new text the file's encoding cannot hold: UTF-8, same endings
+                (when (unencodable-char-position (point-min) (point-max) coding-system-for-write)
+                  (setq coding-system-for-write
+                        (coding-system-change-eol-conversion
+                         'utf-8 (coding-system-eol-type coding-system-for-write))))
+                (write-region (point-min) (point-max) path nil 'silent)))
             (funcall on-done (pai-tool-ok-result
                               (format "Replaced %d block(s) in %s" count path)
                               (list :blocks count :old old-content :new new-content
@@ -327,29 +411,36 @@ bytes.  A few stray bytes in real text are replaced later instead, by
          (limit (or (plist-get args :limit) 100))
          (default-directory (pai-tool-ctx-cwd ctx))
          (rg (executable-find "rg"))
-         (grep (executable-find "grep")))
+         (grep (executable-find "grep"))
+         (chunks '()))
+    ;; Asynchronous, so a long search never freezes Emacs; the process is
+    ;; returned so aborting the run kills it.
     (condition-case err
-        (let* ((out (with-output-to-string
-                      (with-current-buffer standard-output
-                        (cond
-                         (rg (apply #'call-process rg nil t nil
-                                    (append '("--line-number" "--no-heading" "--color" "never")
-                                            (when ignore-case '("--ignore-case"))
-                                            (when literal '("--fixed-strings"))
-                                            (list "-e" pattern "--" path))))
-                         (grep (apply #'call-process grep nil t nil
-                                      (append '("-rnI")
-                                              (when ignore-case '("-i"))
-                                              (when literal '("-F"))
-                                              (list "-e" pattern path))))
-                         (t (error "Neither rg nor grep is available"))))))
-               (lines (seq-remove #'string-empty-p (split-string out "\n")))
-               (total (length lines))
-               (shown (seq-take lines limit))
-               (note (when (> total limit) (format "\n[%d of %d matches shown]" limit total))))
-          (funcall on-done (pai-tool-ok-result
-                            (if lines (concat (string-join shown "\n") note)
-                              "(no matches)"))))
+        (make-process
+         :name "pai-grep"
+         :command (cond
+                   (rg (append (list rg "--line-number" "--no-heading" "--color" "never")
+                               (when ignore-case '("--ignore-case"))
+                               (when literal '("--fixed-strings"))
+                               (list "-e" pattern "--" path)))
+                   (grep (append (list grep "-rnI")
+                                 (when ignore-case '("-i"))
+                                 (when literal '("-F"))
+                                 (list "-e" pattern path)))
+                   (t (error "Neither rg nor grep is available")))
+         :connection-type 'pipe :noquery t :coding 'utf-8
+         :filter (lambda (_p chunk) (push chunk chunks))
+         :sentinel
+         (lambda (p _event)
+           (when (memq (process-status p) '(exit signal))
+             (let* ((out (apply #'concat (nreverse chunks)))
+                    (lines (seq-remove #'string-empty-p (split-string out "\n")))
+                    (total (length lines))
+                    (shown (seq-take lines limit))
+                    (note (when (> total limit) (format "\n[%d of %d matches shown]" limit total))))
+               (funcall on-done (pai-tool-ok-result
+                                 (if lines (concat (string-join shown "\n") note)
+                                   "(no matches)")))))))
       (error (funcall on-done (pai-tool-error-result (error-message-string err)))))))
 
 (pai-register-tool
@@ -398,6 +489,15 @@ bytes.  A few stray bytes in real text are replaced later instead, by
 
 ;;;; elisp_eval (Emacs-native) -------------------------------------------
 
+(defun pai-tool-elisp--blank-p (string pos)
+  "Return non-nil when STRING from POS holds only whitespace and comments."
+  (with-temp-buffer
+    (with-syntax-table emacs-lisp-mode-syntax-table
+      (insert (substring string pos))
+      (goto-char (point-min))
+      (forward-comment (buffer-size))
+      (eobp))))
+
 (defun pai-tool-elisp--execute (args _ctx _on-update on-done)
   "Evaluate Emacs Lisp from ARGS in the live image, finishing via ON-DONE."
   (let ((form-str (plist-get args :form)))
@@ -407,8 +507,12 @@ bytes.  A few stray bytes in real text are replaced later instead, by
             (let ((standard-output (current-buffer))
                   (pos 0) (len (length form-str)))
               (while (< pos len)
-                (let ((res (condition-case nil (read-from-string form-str pos)
-                             (error nil))))
+                (let ((res (condition-case err (read-from-string form-str pos)
+                             ;; only whitespace and comments left: done
+                             (end-of-file
+                              (if (pai-tool-elisp--blank-p form-str pos) nil
+                                (signal 'error (list (format "Incomplete form: %s"
+                                                             (error-message-string err)))))))))
                   (if (null res) (setq pos len)
                     (setq value (eval (car res) t))
                     (setq pos (cdr res))))))
@@ -490,7 +594,7 @@ lines of a huge buffer copies only those lines."
                         (point-max)))
                  (text (string-trim-right (buffer-substring-no-properties beg end) "\n"))
                  (trunc (pai-tools-truncate text nil nil 'head))
-                 (shown (min (count-lines beg end) pai-tool-max-lines))
+                 (shown (pai-tool--shown-lines (plist-get trunc :text) (= beg end)))
                  (note (when (or (plist-get trunc :truncated) limit (> first 1))
                          (format "\n[showing lines %d-%d of %d; use offset/limit to page]"
                                  first (+ first (max 0 (1- shown))) total))))
