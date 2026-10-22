@@ -96,5 +96,12 @@
       (should (string-match-p "note.txt" (pai-remote-test--text
                                           (pai-remote-test--run-tool "ls" nil ctx)))))))
 
+(ert-deftest pai-local-directory-for-helper-processes ()
+  "Helper processes (curl, diff) never start in a remote chat directory."
+  (let ((default-directory "/docker:box:/workspace/"))
+    (should-not (file-remote-p (pai-local-directory))))
+  (let ((default-directory "/tmp/"))
+    (should (equal (pai-local-directory) "/tmp/"))))
+
 (provide 'pai-tools-remote-test)
 ;;; pai-tools-remote-test.el ends here

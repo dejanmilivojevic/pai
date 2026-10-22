@@ -181,7 +181,8 @@ FORCE downloads regardless of age.  Never blocks; errors are reported in
              (not (process-live-p pai-pricing--process))
              (or force (pai-pricing--stale-p))
              (executable-find pai-curl-program))
-    (let ((tmp (make-temp-file "pai-models-dev" nil ".json")))
+    (let ((tmp (make-temp-file "pai-models-dev" nil ".json"))
+          (default-directory (pai-local-directory)))
       (setq pai-pricing--process
             (make-process
              :name "pai-pricing"

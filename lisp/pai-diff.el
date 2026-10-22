@@ -10,6 +10,7 @@
 ;;; Code:
 
 (require 'subr-x)
+(require 'pai-config)
 
 (defface pai-diff-added
   '((t :inherit diff-added))
@@ -56,7 +57,8 @@ line-based fallback.  Never signals: returns \"\" on failure."
         (new-name (or new-name "b")))
     (condition-case nil
         (if (executable-find "diff")
-            (let ((old-file (make-temp-file "pai-diff-old"))
+            (let ((default-directory (pai-local-directory))
+                  (old-file (make-temp-file "pai-diff-old"))
                   (new-file (make-temp-file "pai-diff-new")))
               (unwind-protect
                   (progn

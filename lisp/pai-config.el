@@ -91,5 +91,14 @@ copy/paste or file/command artifact) is stripped; an all-blank value is nil."
     (make-directory dir t)
     dir))
 
+(defun pai-local-directory ()
+  "Return `default-directory' if it is local, else a local stand-in.
+A pai chat may work in a remote directory (TRAMP), where its tools run;
+its own helper processes (curl, diff, image tools) are local programs
+working on local files and must not start there."
+  (if (file-remote-p default-directory)
+      (file-name-as-directory temporary-file-directory)
+    default-directory))
+
 (provide 'pai-config)
 ;;; pai-config.el ends here

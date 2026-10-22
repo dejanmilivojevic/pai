@@ -28,6 +28,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'pai-config)
 
 ;;;; Booleans
 
@@ -171,13 +172,14 @@ disables downscaling."
 
 (defun pai-image--resize-file (in out limit)
   "Downscale image file IN into OUT so its longest edge is LIMIT; non-nil on success."
+  (let ((default-directory (pai-local-directory)))
   (cond
    ((executable-find "sips")
     (eq 0 (call-process "sips" nil nil nil "-Z" (number-to-string limit) in "--out" out)))
    ((executable-find "magick")
     (eq 0 (call-process "magick" nil nil nil in "-resize" (format "%dx%d>" limit limit) out)))
    ((executable-find "convert")
-    (eq 0 (call-process "convert" nil nil nil in "-resize" (format "%dx%d>" limit limit) out)))))
+    (eq 0 (call-process "convert" nil nil nil in "-resize" (format "%dx%d>" limit limit) out))))))
 
 (defun pai-image-fit (data mime-type)
   "Return base64 DATA downscaled to `pai-image-max-dimension', or DATA unchanged.

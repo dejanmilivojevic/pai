@@ -177,7 +177,8 @@ is called once with a descriptive string on any HTTP error (>=400) or
 transport failure.  ON-CLOSE is called last with the process exit code.
 
 Return the process; kill it to abort the request."
-  (let* ((st (pai-http--state-create
+  (let* ((default-directory (pai-local-directory)) ; curl is local, the chat may not be
+         (st (pai-http--state-create
               :phase 'headers :on-frame on-frame
               :on-error on-error :on-close on-close))
          (header-file (and headers
@@ -238,7 +239,8 @@ on Emacs' own thread on macOS, which froze the UI whenever DNS hung.
 HEADERS (an alist) reach curl on stdin, keeping tokens off the command line.
 ON-DONE gets (STATUS HEADERS BODY) once; STATUS is nil on a transport
 failure or timeout.  Return the process; deleting it also ends in ON-DONE."
-  (let* ((chunks nil)
+  (let* ((default-directory (pai-local-directory))
+         (chunks nil)
          (proc (make-process
                 :name "pai-http-request"
                 :command (append (list pai-curl-program "-sS" "-i" "-X" method

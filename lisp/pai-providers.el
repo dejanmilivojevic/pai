@@ -8,6 +8,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'pai-config)
 (require 'url-parse)
 (require 'url-util)
 (require 'pai-settings)
@@ -220,7 +221,8 @@ This does not discover models; call `pai-models-refresh' separately."
 
 (defun pai-providers--get-json (url headers)
   "GET URL with HEADERS using bounded curl; decode JSON or signal an error."
-  (let ((stderr (make-temp-file "pai-model-discovery-")))
+  (let ((default-directory (pai-local-directory))
+        (stderr (make-temp-file "pai-model-discovery-")))
     (unwind-protect
         (with-temp-buffer
           (let* ((args (append '("--silent" "--show-error" "--fail"
