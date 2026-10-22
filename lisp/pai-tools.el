@@ -260,8 +260,17 @@ See `pai-tool--coerce-value'.  ARGS itself is not modified."
   (or (plist-get ctx :cwd) default-directory))
 
 (defun pai-tool-resolve-path (ctx path)
-  "Resolve PATH against the working directory in CTX."
-  (expand-file-name path (pai-tool-ctx-cwd ctx)))
+  "Resolve PATH against the working directory in CTX.
+When that directory is remote (TRAMP), an absolute local-looking PATH such
+as /workspace/a.txt names a file on the same remote host: the model only
+ever sees that host's own paths."
+  (let ((cwd (pai-tool-ctx-cwd ctx)))
+    (if-let ((remote (and (file-name-absolute-p path)
+                          (not (file-remote-p path))
+                          (not (string-prefix-p "~" path))
+                          (file-remote-p cwd))))
+        (concat remote path)
+      (expand-file-name path cwd))))
 
 ;;;; Output truncation
 

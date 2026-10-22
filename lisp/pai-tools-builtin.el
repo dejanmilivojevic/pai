@@ -27,6 +27,17 @@
      (when (plist-get ctx :tool-call-id)
        (list (format "PAI_TOOL_CALL_ID=%s" (plist-get ctx :tool-call-id)))))))
 
+(defun pai-tool-bash--command (command)
+  "Return the process command line running shell COMMAND.
+Locally this is `shell-file-name'; on a remote `default-directory' (TRAMP)
+bash is used when the host has it, else POSIX sh, since the local shell's
+path means nothing there."
+  (if (file-remote-p default-directory)
+      (list "/bin/sh" "-c"
+            "if command -v bash >/dev/null 2>&1; then exec bash -c \"$0\"; else exec sh -c \"$0\"; fi"
+            command)
+    (list shell-file-name shell-command-switch command)))
+
 (defun pai-tool-bash--execute (args ctx on-update on-done)
   "Run the bash tool for ARGS in CTX, streaming via ON-UPDATE, finishing ON-DONE."
   (let* ((command (plist-get args :command))
@@ -52,7 +63,10 @@
       (condition-case err
           (setq proc (make-process
                       :name "pai-bash"
-                      :command (list shell-file-name shell-command-switch command)
+                      :command (pai-tool-bash--command command)
+                      ;; A remote working directory (TRAMP) runs the command
+                      ;; on that host, e.g. inside a container for /docker:.
+                      :file-handler t
                       :connection-type 'pipe :noquery t :coding 'utf-8
                       :filter (lambda (_p chunk)
                                 (setq output (concat output chunk))
@@ -326,22 +340,26 @@ bytes.  A few stray bytes in real text are replaced later instead, by
          (literal (pai-truthy (plist-get args :literal)))
          (limit (or (plist-get args :limit) 100))
          (default-directory (pai-tool-ctx-cwd ctx))
-         (rg (executable-find "rg"))
-         (grep (executable-find "grep")))
+         ;; On a remote working directory (TRAMP) search there, with the
+         ;; host's own programs and its local path names.
+         (remote (file-remote-p default-directory))
+         (target (file-local-name path))
+         (rg (executable-find "rg" remote))
+         (grep (executable-find "grep" remote)))
     (condition-case err
         (let* ((out (with-output-to-string
                       (with-current-buffer standard-output
                         (cond
-                         (rg (apply #'call-process rg nil t nil
+                         (rg (apply #'process-file rg nil t nil
                                     (append '("--line-number" "--no-heading" "--color" "never")
                                             (when ignore-case '("--ignore-case"))
                                             (when literal '("--fixed-strings"))
-                                            (list "-e" pattern "--" path))))
-                         (grep (apply #'call-process grep nil t nil
+                                            (list "-e" pattern "--" target))))
+                         (grep (apply #'process-file grep nil t nil
                                       (append '("-rnI")
                                               (when ignore-case '("-i"))
                                               (when literal '("-F"))
-                                              (list "-e" pattern path))))
+                                              (list "-e" pattern target))))
                          (t (error "Neither rg nor grep is available"))))))
                (lines (seq-remove #'string-empty-p (split-string out "\n")))
                (total (length lines))
