@@ -231,22 +231,33 @@ are the final response's; HEADERS is an alist with downcased names."
             (push (cons (downcase (match-string 1 line)) (match-string 2 line)) headers)))))
     (list status (nreverse headers) rest)))
 
-(cl-defun pai-http-request (&key url (method "GET") headers
+(cl-defun pai-http-request (&key url (method "GET") headers body
                                  (connect-timeout 10) (timeout 30) on-done)
   "Perform a one-shot HTTP request to URL in a curl subprocess.
 Name lookup, connect and TLS all run in curl: url.el resolves host names
 on Emacs' own thread on macOS, which froze the UI whenever DNS hung.
 HEADERS (an alist) reach curl on stdin, keeping tokens off the command line.
+BODY, a string, is sent as the request body from a private temporary file
+\(it may hold secrets, so it never appears on the command line either).
 ON-DONE gets (STATUS HEADERS BODY) once; STATUS is nil on a transport
 failure or timeout.  Return the process; deleting it also ends in ON-DONE."
   (let* ((default-directory (pai-local-directory))
          (chunks nil)
+         (body-file (when body
+                      (let ((file (make-temp-file "pai-http-body-")))
+                        (set-file-modes file #o600)
+                        (let ((coding-system-for-write 'binary))
+                          (write-region (encode-coding-string body 'utf-8)
+                                        nil file nil 'silent))
+                        file)))
          (proc (make-process
                 :name "pai-http-request"
                 :command (append (list pai-curl-program "-sS" "-i" "-X" method
                                        "--connect-timeout" (number-to-string connect-timeout)
                                        "--max-time" (number-to-string timeout))
                                  (when headers (list "-H" "@-"))
+                                 (when body-file
+                                   (list "--data-binary" (concat "@" body-file)))
                                  (list url))
                 :connection-type 'pipe
                 :coding 'utf-8
@@ -255,6 +266,7 @@ failure or timeout.  Return the process; deleting it also ends in ON-DONE."
                 :sentinel
                 (lambda (p _event)
                   (unless (process-live-p p)
+                    (when body-file (ignore-errors (delete-file body-file)))
                     (let ((parsed (pai-http--parse-response
                                    (apply #'concat (nreverse chunks)))))
                       (when on-done

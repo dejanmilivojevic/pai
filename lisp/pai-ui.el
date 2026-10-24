@@ -103,6 +103,31 @@ Like pi, overflow recovery is attempted once until a turn succeeds.")
 (defvar-local pai--rate-limit nil
   "This buffer's `pai-rate-limit-state': retries waiting out provider limits.")
 
+(defcustom pai-transient-retry-delays '(2 4 8 16 32)
+  "Seconds to wait before each retry of a turn that failed transiently.
+A turn rejected because the provider is overloaded or briefly unavailable
+\(HTTP 429, 500, 502, 503, 504, 529) is retried once per element, waiting
+that long (plus up to 20% jitter); nil disables retrying.  The count
+restarts after a successful turn."
+  :type '(repeat number) :group 'pai)
+
+(defcustom pai-transient-error-patterns
+  '("\\`HTTP \\(?:429\\|50[0234]\\|529\\)\\b" "overloaded" "temporarily unavailable")
+  "Regexps (case-insensitive) matching a transient provider error message."
+  :type '(repeat regexp) :group 'pai)
+
+(defcustom pai-transient-error-exclude-patterns
+  '("quota" "credit" "billing" "insufficient" "subscription" "balance")
+  "Regexps (case-insensitive) of errors never retried even if transient-looking.
+A spent quota or missing credits will not recover within a few seconds."
+  :type '(repeat regexp) :group 'pai)
+
+(defvar-local pai--transient-retries 0
+  "Transient-error retries made since the last successful turn.")
+
+(defvar-local pai--transient-retry-timer nil
+  "Timer of a pending transient-error retry.")
+
 (defvar-local pai--status "idle" "Short status string for the header line.")
 (defvar-local pai--assistant-open nil "Non-nil while an assistant block is being rendered.")
 (defvar-local pai--reasoning nil "Thinking level for this buffer, or nil.")
@@ -344,7 +369,8 @@ prompt is re-pinned to the bottom of the window."
     ('turn-end
      (mapc #'pai--commit-message (plist-get event :tool-results))
      (unless (memq (plist-get (plist-get event :message) :stop-reason) '(error aborted))
-       (setq pai--overflow-retried nil)
+       (setq pai--overflow-retried nil
+             pai--transient-retries 0)
        (pai-rate-limit-reset pai--rate-limit))
      (pai--schedule-usage-refresh))
     ('agent-end
@@ -1250,13 +1276,52 @@ with the compacted context.  Return non-nil when the run was paused."
          (pai--set-status "working…")
          (funcall resume (and ok (list :messages pai--context-messages)))))))))
 
+(defun pai-transient-error-p (message)
+  "Return non-nil when assistant MESSAGE failed with a transient provider error.
+See `pai-transient-error-patterns' and `pai-transient-error-exclude-patterns'."
+  (let ((err (plist-get message :error-message))
+        (case-fold-search t))
+    (and (eq (plist-get message :stop-reason) 'error) (stringp err)
+         (seq-some (lambda (p) (string-match-p p err)) pai-transient-error-patterns)
+         (not (seq-some (lambda (p) (string-match-p p err))
+                        pai-transient-error-exclude-patterns)))))
+
+(defun pai--retry-transient (message resume)
+  "Retry the turn that failed with transient MESSAGE after a backoff; RESUME it.
+The failed reply is dropped from the live context (the session keeps it).
+Return non-nil when a retry was scheduled."
+  (let ((delay (nth pai--transient-retries pai-transient-retry-delays))
+        (buf (current-buffer)))
+    (when (and delay (pai-transient-error-p message))
+      (setq pai--transient-retries (1+ pai--transient-retries))
+      (setq pai--context-messages (remq message pai--context-messages))
+      (let ((wait (* delay (+ 1 (* 0.2 (/ (random 1000) 1000.0))))))
+        (pai--render-note
+         (format "%s is busy; retrying in %.0fs (%d/%d), C-c C-c stops."
+                 (or (plist-get message :provider) "The provider")
+                 wait pai--transient-retries (length pai-transient-retry-delays)))
+        (pai--set-status (format "retrying in %.0fs…" wait))
+        (when (timerp pai--transient-retry-timer) (cancel-timer pai--transient-retry-timer))
+        (setq pai--transient-retry-timer
+              (run-at-time wait nil
+                           (lambda ()
+                             (when (buffer-live-p buf)
+                               (with-current-buffer buf
+                                 (setq pai--transient-retry-timer nil)
+                                 (pai--set-status "working…")
+                                 (funcall resume (list :messages pai--context-messages)))))))
+        t))))
+
 (defun pai--recover-error (message resume)
   "Recover from the failed assistant MESSAGE of a run, then RESUME it.
 A context overflow compacts and retries (see `pai--recover-overflow'); a
 rate or usage limit waits until it lifts and retries (see
-`pai--recover-rate-limit').  Return non-nil when recovery started."
+`pai--recover-rate-limit'; a transient provider error (overloaded, 5xx) is
+retried after a backoff, see `pai--retry-transient'.  Return non-nil when
+recovery started."
   (or (pai--recover-overflow message resume)
-      (pai--recover-rate-limit message resume)))
+      (pai--recover-rate-limit message resume)
+      (pai--retry-transient message resume)))
 
 (defun pai--rate-limit-error-line (message)
   "Return MESSAGE's error text cut to one short line."
@@ -1973,7 +2038,8 @@ IMAGES, a list of image blocks, are sent with it."
   (pai-ext-emit 'before-agent-start (pai--ext-context) :prompt text)
   (pai--maybe-compact)
   (setq pai--active t
-        pai--overflow-retried nil)
+        pai--overflow-retried nil
+        pai--transient-retries 0)
   (pai-rate-limit-reset pai--rate-limit)
   (setq pai--run
         (pai-agent-run (list (pai-user-message
@@ -2104,6 +2170,10 @@ Moving past the newest entry restores the input you were typing."
         ;; a run paused for compaction: stop the summary first
         (pai--compaction-cancel)
         (setq pai--compact-request nil)
+        ;; a run waiting to retry a transient error: drop the retry
+        (when (timerp pai--transient-retry-timer)
+          (cancel-timer pai--transient-retry-timer)
+          (setq pai--transient-retry-timer nil))
         ;; Aborting emits `agent-end' (:aborted t), which resets the UI.
         (when run (pai-agent-abort run))
         (if pai--active               ; no run, or its buffer sink is gone
