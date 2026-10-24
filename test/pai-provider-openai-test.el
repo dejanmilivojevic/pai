@@ -58,6 +58,17 @@
          (out (pai-openai--messages msgs)))
     (should (eq (plist-get (car out) :content) :null))))
 
+(ert-deftest pai-openai-drops-empty-assistant-message ()
+  ;; A reply cut off before any output (stop-reason length) has no text
+  ;; and no tool calls; strict servers (Moonshot) 400 on it, so drop it.
+  (let* ((msgs (list (pai-user-message "hi")
+                     (pai-assistant-message :content nil)
+                     (pai-assistant-message :content (list (pai-text "")))
+                     (pai-user-message "again")))
+         (out (pai-openai--messages msgs)))
+    (should (equal (mapcar (lambda (m) (plist-get m :role)) out)
+                   '("user" "user")))))
+
 (defconst pai-openai-test--text-frames
   '((:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}")
     (:data "{\"id\":\"cc1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}")

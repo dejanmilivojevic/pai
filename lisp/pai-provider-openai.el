@@ -49,7 +49,11 @@ Returns a plain string when there are no images, else an array of parts."
               calls))))
 
 (defun pai-openai--messages (messages)
-  "Translate unified MESSAGES to an OpenAI messages array."
+  "Translate unified MESSAGES to an OpenAI messages array.
+Assistant messages with neither text nor tool calls (a reply cut off by
+the length limit or an error before any output) are dropped: strict
+OpenAI-compatible servers (Moonshot/Kimi via OpenRouter) reject an empty
+assistant message with a 400 that would replay on every later turn."
   (let (out)
     (dolist (m messages)
       (pcase (pai-message-role m)
@@ -64,10 +68,11 @@ Returns a plain string when there are no images, else an array of parts."
          (let* ((content (pai-message-content m))
                 (text (pai-content-text content))
                 (tool-calls (pai-openai--assistant-tool-calls content)))
-           (push (append (list :role "assistant")
-                         (list :content (if (string-empty-p text) :null text))
-                         (when tool-calls (list :tool_calls tool-calls)))
-                 out)))))
+           (when (or tool-calls (not (string-empty-p text)))
+             (push (append (list :role "assistant")
+                           (list :content (if (string-empty-p text) :null text))
+                           (when tool-calls (list :tool_calls tool-calls)))
+                   out))))))
     (nreverse out)))
 
 (defun pai-openai--tools (tools)
