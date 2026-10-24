@@ -533,7 +533,9 @@ Falls back to CRED's refresh token when RESP omits one.  Return the cred or nil.
 
 (defvar pai-auth-oauth-handlers nil
   "Alist of provider IDs to login functions installed by extensions.
-Each function takes no arguments and returns non-nil on successful login.")
+Each function takes no arguments and returns non-nil on successful login.
+A function that finishes asynchronously (e.g. a device flow polling in the
+background) returns a string instead, shown as the command's message.")
 
 (defun pai-auth-login-command (args _ctx)
   "Handle the `/login [provider]' command.
@@ -549,9 +551,10 @@ its flow; otherwise prompt for an API key and store it."
                   "No providers configured.  Use /login <provider>.")))
       (let ((login (cdr (assoc provider pai-auth-oauth-handlers))))
         (if login
-            (list :message (if (funcall login)
-                               (format "Logged in to %s" provider)
-                             (format "Login to %s failed" provider)))
+            (let ((result (funcall login)))
+              (list :message (cond ((stringp result) result)
+                                   (result (format "Logged in to %s" provider))
+                                   (t (format "Login to %s failed" provider)))))
         (let ((key (read-passwd (format "API key for %s: " provider))))
           (pai-auth-set provider (list :type "api_key" :key key))
           (list :message (format "Logged in to %s" provider))))))))
