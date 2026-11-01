@@ -45,7 +45,7 @@ failed reply; after the last delay the error is left to end the run."
                 ((symbol-function 'pai--render-note) (lambda (text &rest _) (push text notes)))
                 ((symbol-function 'pai--set-status) #'ignore))
         (dotimes (i 2)
-          (let ((failed (pai-transient-retry-test--failed "HTTP 429: engine is currently overloaded")))
+          (let ((failed (pai-transient-retry-test--failed "HTTP 503: engine is currently overloaded")))
             (setq pai--context-messages (list (pai-user-message "hi") failed))
             (should (pai--recover-error failed (lambda (u) (push u resumed))))
             (should (= pai--transient-retries (1+ i)))
@@ -56,7 +56,7 @@ failed reply; after the last delay the error is left to end the run."
             (should (equal (plist-get (car resumed) :messages) pai--context-messages))))
         (should (string-match-p "kimi is busy; retrying in [0-9]+s (2/2)" (car notes)))
         ;; delays used up: not taken, so the run ends with the error
-        (let ((failed (pai-transient-retry-test--failed "HTTP 429: engine is currently overloaded")))
+        (let ((failed (pai-transient-retry-test--failed "HTTP 503: engine is currently overloaded")))
           (setq pai--context-messages (list failed))
           (should-not (pai--recover-error failed #'ignore))
           (should (memq failed pai--context-messages)))))))
