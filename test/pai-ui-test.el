@@ -900,6 +900,67 @@ does not prevent the compaction."
           (should-not (string-match-p "NOT REACHED" content)))
         (should-not pai--active)))))
 
+(ert-deftest pai-ui-rate-limit-waits-then-retries-the-turn ()
+  "A rate-limited turn waits until the limit lifts, then runs again."
+  (pai-faux-reset)
+  (pai-faux-push '(:error "HTTP 429: {\"type\":\"rate_limit_error\"} try again in 0.2s")
+                 '(:text "back after the reset" :stop-reason stop))
+  (let ((pai-rate-limit-margin 0)
+        (waits nil) (retries 0))
+    (pai-ui-test--with-buffer buf dir
+      (with-current-buffer buf
+        (cl-letf (((symbol-function 'pai-ext-emit)
+                   (let ((orig (symbol-function 'pai-ext-emit)))
+                     (lambda (type ctx &rest props)
+                       (pcase type
+                         ('rate-limit-wait (push props waits))
+                         ('rate-limit-retry (cl-incf retries)))
+                       (apply orig type ctx props)))))
+          (pai-ui-test--type-and-send "hi there")
+          ;; waiting, not finished
+          (should pai--active)
+          (should (string-match-p "rate limited, retrying at" pai--status))
+          (should (string-match-p "Rate limited by faux" (buffer-string)))
+          (should (plist-get (car waits) :known))
+          (should-not (seq-find (lambda (m) (eq (plist-get m :stop-reason) 'error))
+                                pai--context-messages))
+          (pai-ui-test--wait-idle 5)
+          (should (= retries 1))
+          (should (string-match-p "back after the reset" (buffer-string)))
+          (should-not (seq-find (lambda (m) (eq (plist-get m :stop-reason) 'error))
+                                (plist-get pai-faux-last-context :messages)))
+          (should-not pai--active)
+          (should (= (pai-rate-limit-state-attempts pai--rate-limit) 0)))))))
+
+(ert-deftest pai-ui-rate-limit-wait-stops-on-interrupt ()
+  (pai-faux-reset)
+  (pai-faux-push '(:error "HTTP 429: rate_limit_error")
+                 '(:text "NOT REACHED" :stop-reason stop))
+  (let ((pai-rate-limit-backoff-initial 0.2))
+    (pai-ui-test--with-buffer buf dir
+      (with-current-buffer buf
+        (pai-ui-test--type-and-send "hi there")
+        (should pai--active)
+        (should (pai-rate-limit-waiting-p pai--rate-limit))
+        (pai-interrupt)
+        (should-not pai--active)
+        (should-not (pai-rate-limit-waiting-p pai--rate-limit))
+        (let ((end (+ (float-time) 0.4)))
+          (while (< (float-time) end) (accept-process-output nil 0.02)))
+        (should-not (string-match-p "NOT REACHED" (buffer-string)))
+        (should (string-match-p "— interrupted —" (buffer-string)))))))
+
+(ert-deftest pai-ui-rate-limit-retry-off-ends-the-run ()
+  (pai-faux-reset)
+  (pai-faux-push '(:error "HTTP 429: rate_limit_error"))
+  (let ((pai-rate-limit-retry nil))
+    (pai-ui-test--with-buffer buf dir
+      (with-current-buffer buf
+        (pai-ui-test--type-and-send "hi there")
+        (pai-ui-test--wait-idle)
+        (should-not pai--active)
+        (should-not (string-match-p "Rate limited by" (buffer-string)))))))
+
 (defun pai-ui-test--persisted-turns (n)
   "Append N user/assistant turns to both the live context and the session."
   (dotimes (_ n)

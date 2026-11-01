@@ -38,6 +38,17 @@ only runtime requirement beyond Emacs 29.1+ is `curl` (for streaming HTTP).
   between runs and on-demand via `/compact`. A transcript larger than the
   summarizing (`compact`) model's context window is summarized in parts, each
   folded into the summary of the parts before it.
+- **Rate limits**: a turn rejected because a provider's rate or usage limit is
+  spent (HTTP 429, overloaded, `RESOURCE_EXHAUSTED`, ...) does not end the run.
+  The session waits until the limit resets -- read from `retry-after` /
+  exhausted `*-reset` headers such as Claude Pro/Max's
+  `anthropic-ratelimit-unified-reset`, or from the error text ("try again in
+  6m0s"), else exponential backoff up to 10 minutes between tries -- then
+  sends the same turn again, as often as it takes. Leave the machine running
+  and work resumes when the window reopens; `C-c C-c` stops waiting.
+  `pai-rate-limit-retry` turns it off or caps the total wait. Subagent
+  sessions (interactive and headless) wait the same way, and are not
+  idle-closed or timed out meanwhile.
 - **Sessions as a tree**: append-only JSONL with entry ids/parentId; `/new`,
   `/resume`, `/fork`, `/clone`, `/tree`, `/name`, plus Markdown/HTML `/export`.
 - **Layered settings** (`~/.pai/settings.json` + project `.pai/settings.json`),
@@ -351,7 +362,9 @@ An extension registers via a factory that receives the API object:
 ```
 
 Events include `agent-start`, `turn-start`, `message-start`, `message-update`,
-`message-end`, `tool-execution-start/update/end`, `turn-end`, `agent-end`, plus
+`message-end`, `tool-execution-start/update/end`, `turn-end`, `agent-end`,
+`rate-limit-wait` (`:seconds :until :attempt :known :message`) and
+`rate-limit-retry`, plus
 reducing hooks `context`, `tool-call`, `tool-result`, `before-agent-start`,
 `input`, `compact` (take over `/compact` and auto-compaction; see
 `pai-ext-run-compact`) and `pre-compact` (shrink the context before an automatic

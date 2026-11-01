@@ -25,6 +25,7 @@
 (require 'pai-config)
 (require 'pai-models)
 (require 'pai-http)
+(require 'pai-rate-limit)
 (require 'pai-stream)
 
 (defvar pai--providers (make-hash-table :test 'equal)
@@ -157,10 +158,27 @@ so a turn only encodes what changed."
                  cache)
         (nreverse pieces)))))
 
+(defun pai-provider--with-retry-at (event retry-at)
+  "Return the stream EVENT with RETRY-AT set on its messages.
+RETRY-AT is the epoch time a rate limit lifts (see `pai-rate-limit')."
+  (let ((ev (copy-sequence event)))
+    (dolist (key '(:message :partial) ev)
+      (when-let ((m (plist-get ev key)))
+        (setq ev (plist-put ev key (append m (list :retry-at retry-at))))))))
+
 (defun pai-provider--http-stream (provider model context options emit)
   "Run the HTTP streaming path for PROVIDER in the originating buffer.
-Discard deferred parser callbacks if that buffer has been killed."
+Discard deferred parser callbacks if that buffer has been killed.  When
+an error response announces when a rate limit lifts (`retry-after',
+exhausted `*-reset' headers), the failed message carries it as
+`:retry-at' (epoch seconds)."
   (let* ((origin-buffer (current-buffer))
+         (retry-at nil)
+         (emit (let ((emit emit))
+                 (lambda (ev)
+                   (funcall emit (if (and retry-at (eq (plist-get ev :type) 'error))
+                                     (pai-provider--with-retry-at ev retry-at)
+                                   ev)))))
          (req (funcall (plist-get provider :build-request) model context options))
          (parser (funcall (plist-get provider :make-parser) model emit))
          (on-frame (plist-get parser :on-frame))
@@ -180,10 +198,11 @@ Discard deferred parser callbacks if that buffer has been killed."
                  (when (buffer-live-p origin-buffer)
                    (with-current-buffer origin-buffer
                      (funcall on-frame frame))))
-     :on-error (lambda (msg)
+     :on-error (lambda (msg &optional info)
                  (when (buffer-live-p origin-buffer)
                    (with-current-buffer origin-buffer
-                     (setq errored t)
+                     (setq errored t
+                           retry-at (pai-rate-limit-reset-time (plist-get info :headers)))
                      ;; Let the parser finalize as an error, keeping any
                      ;; partial assistant content streamed so far.
                      (if on-error

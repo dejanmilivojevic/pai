@@ -129,7 +129,11 @@ resume.  Tools and hooks can register cleanup with `pai-agent-on-abort`.
 run; `(funcall resume (list :messages NEW))` streams the turn again with NEW
 (the failed message stays out of the context), `(funcall resume)` ends the
 run with the error.  The UI uses it for pi's compact-and-retry on context
-overflow.
+overflow, and to wait out rate limits (`pai-rate-limit.el`): the failed
+message carries `:retry-at` (epoch seconds, from `retry-after`/exhausted
+`*-reset` response headers, which `pai-http` hands to a two-argument
+`:on-error`), and `pai-rate-limit-recover-function` builds the same hook for
+runs without a UI (headless subagents).
 
 ## 5. Tool contract (pai-tools.el)
 
