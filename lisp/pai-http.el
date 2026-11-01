@@ -10,8 +10,11 @@
 ;; `pai-http-stream' performs one request.  On a 2xx response it invokes
 ;; :on-frame for every SSE frame (a plist `(:event NAME :data STRING)').  On a
 ;; non-2xx response or a transport failure it accumulates the body and invokes
-;; :on-error with a descriptive string.  :on-close always runs last with the
-;; process exit code.  It returns the process object; kill it to abort.
+;; :on-error with a descriptive string -- and, when it accepts a second
+;; argument, a plist (:status N :headers ALIST) with the response's headers
+;; (lower-case names), e.g. for rate-limit reset times.  :on-close always
+;; runs last with the process exit code.  It returns the process object;
+;; kill it to abort.
 ;;
 ;; This module is transport-only: it knows nothing about providers or the
 ;; message model.
@@ -25,17 +28,24 @@
 (cl-defstruct (pai-http--state (:constructor pai-http--state-create))
   phase           ; `headers' or `body'
   status          ; integer HTTP status once known
+  headers         ; alist (lower-case NAME . VALUE) of the final response
   (buffer "")     ; unparsed input accumulated so far
   (error-body "") ; body accumulated when status is an error
   on-frame on-error on-close
   done)           ; non-nil once terminated
 
 (defun pai-http--emit-error (st msg)
-  "Invoke ST's on-error with MSG once."
+  "Invoke ST's on-error with MSG once.
+An on-error function taking two arguments also gets the response info
+\(:status N :headers ALIST)."
   (unless (pai-http--state-done st)
     (setf (pai-http--state-done st) t)
-    (when (pai-http--state-on-error st)
-      (funcall (pai-http--state-on-error st) msg))))
+    (when-let ((fn (pai-http--state-on-error st)))
+      (let ((max (cdr (func-arity fn))))
+        (if (or (eq max 'many) (and (numberp max) (>= max 2)))
+            (funcall fn msg (list :status (pai-http--state-status st)
+                                  :headers (pai-http--state-headers st)))
+          (funcall fn msg))))))
 
 (defun pai-http--parse-sse-block (block)
   "Parse a single SSE BLOCK (text between blank lines) into a frame plist.
@@ -89,10 +99,15 @@ Advance to the `body' phase once a final (non-1xx) status header block ends."
          ;; Status line.
          ((string-match "\\`HTTP/[0-9.]+ +\\([0-9]+\\)" line)
           (setf (pai-http--state-status st)
-                (string-to-number (match-string 1 line)))
+                (string-to-number (match-string 1 line))
+                (pai-http--state-headers st) nil)
           (setq buf rest))
-         ;; Other header line: ignore.
-         (t (setq buf rest)))))
+         ;; Other header line: keep it (the last block's are the response's).
+         (t
+          (when (string-match "\\`\\([^: \t]+\\):[ \t]*\\(.*?\\)[ \t\r]*\\'" line)
+            (push (cons (downcase (match-string 1 line)) (match-string 2 line))
+                  (pai-http--state-headers st)))
+          (setq buf rest)))))
     (setf (pai-http--state-buffer st) buf)))
 
 (defun pai-http--filter (st chunk)

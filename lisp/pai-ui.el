@@ -34,6 +34,7 @@
 (require 'pai-commands)
 (require 'pai-markdown)
 (require 'pai-compaction)
+(require 'pai-rate-limit)
 (require 'pai-activity)
 (require 'pai-compose)
 (require 'pai-refs)
@@ -98,6 +99,9 @@ context that cannot shrink does not trigger a summary at every turn.")
 (defvar-local pai--overflow-retried nil
   "Non-nil once a context overflow was compacted and retried in this run.
 Like pi, overflow recovery is attempted once until a turn succeeds.")
+
+(defvar-local pai--rate-limit nil
+  "This buffer's `pai-rate-limit-state': retries waiting out provider limits.")
 
 (defvar-local pai--status "idle" "Short status string for the header line.")
 (defvar-local pai--assistant-open nil "Non-nil while an assistant block is being rendered.")
@@ -340,12 +344,14 @@ prompt is re-pinned to the bottom of the window."
     ('turn-end
      (mapc #'pai--commit-message (plist-get event :tool-results))
      (unless (memq (plist-get (plist-get event :message) :stop-reason) '(error aborted))
-       (setq pai--overflow-retried nil))
+       (setq pai--overflow-retried nil)
+       (pai-rate-limit-reset pai--rate-limit))
      (pai--schedule-usage-refresh))
     ('agent-end
      ;; Normally everything was committed as it completed; this catches the rest.
      (mapc #'pai--commit-message (plist-get event :messages))
      (setq pai--run-committed nil)
+     (pai-rate-limit-cancel pai--rate-limit)
      (setq pai--active nil pai--run nil)
      (pai--set-status "idle")
      (setq pai--working-message nil)
@@ -1246,6 +1252,54 @@ with the compacted context.  Return non-nil when the run was paused."
 
 (defun pai--recover-error (message resume)
   "Recover from the failed assistant MESSAGE of a run, then RESUME it.
+A context overflow compacts and retries (see `pai--recover-overflow'); a
+rate or usage limit waits until it lifts and retries (see
+`pai--recover-rate-limit').  Return non-nil when recovery started."
+  (or (pai--recover-overflow message resume)
+      (pai--recover-rate-limit message resume)))
+
+(defun pai--rate-limit-error-line (message)
+  "Return MESSAGE's error text cut to one short line."
+  (let ((err (string-trim (or (plist-get message :error-message) ""))))
+    (truncate-string-to-width (car (split-string err "\n")) 160 nil nil "…")))
+
+(defun pai--recover-rate-limit (message resume)
+  "Wait until the rate limit that failed MESSAGE lifts, then RESUME the run.
+The failed message leaves the live context (the session keeps it) and the
+same turn is streamed again once the provider's window reopens -- however
+long that takes (see `pai-rate-limit-retry').  Extensions hear
+`rate-limit-wait' (:seconds :until :attempt :known :message) when the wait
+starts and `rate-limit-retry' when the turn goes out again.  Return
+non-nil when a retry was scheduled."
+  (unless pai--rate-limit (setq pai--rate-limit (pai-rate-limit-state-create)))
+  (let ((buf (current-buffer)))
+    (pai-rate-limit-recover
+     pai--rate-limit message
+     (lambda ()
+       (when (and (buffer-live-p buf) (buffer-local-value 'pai--active buf))
+         (with-current-buffer buf
+           (pai--render-note "Rate limit wait over: retrying the turn.")
+           (pai--set-status "working…")
+           (pai-ext-emit 'rate-limit-retry (pai--ext-context))
+           (funcall resume (list :messages pai--context-messages)))))
+     :on-wait
+     (lambda (info)
+       (setq pai--context-messages (remq message pai--context-messages))
+       (let ((at (pai-rate-limit-format-time (plist-get info :until)))
+             (dur (pai-rate-limit-format-duration (plist-get info :seconds))))
+         (pai--render-note
+          (format "Rate limited by %s: %s\nWaiting %s (%s, until %s), then retrying -- attempt %d.  C-c C-c stops waiting."
+                  (or (plist-get message :provider) "the provider")
+                  (pai--rate-limit-error-line message)
+                  dur
+                  (if (plist-get info :known) "until the limit resets" "backing off")
+                  at (plist-get info :attempt))
+          'pai-error-face)
+         (pai--set-status (format "rate limited, retrying at %s" at)))
+       (apply #'pai-ext-emit 'rate-limit-wait (pai--ext-context) info)))))
+
+(defun pai--recover-overflow (message resume)
+  "Recover from a context overflow that failed MESSAGE, then RESUME the run.
 Port of pi's overflow recovery: when the provider rejected the prompt as too
 long, drop the failed message from the live context (the session keeps it),
 compact, and retry the turn -- once, until a turn succeeds again.  Return
@@ -1920,6 +1974,7 @@ IMAGES, a list of image blocks, are sent with it."
   (pai--maybe-compact)
   (setq pai--active t
         pai--overflow-retried nil)
+  (pai-rate-limit-reset pai--rate-limit)
   (setq pai--run
         (pai-agent-run (list (pai-user-message
                               (pai--user-content (pai--expand-mentions text) images)))
